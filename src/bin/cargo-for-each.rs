@@ -224,27 +224,39 @@ pub struct Config {
 impl Config {
     /// adds a workspace to the config if it is not already present
     pub fn add_workspace(&mut self, workspace: Workspace) {
-        if !self
+        if self
             .workspaces
             .iter()
             .any(|w| w.manifest_dir == workspace.manifest_dir)
         {
+            tracing::debug!(
+                "Workspace at {} already exists, not adding.",
+                workspace.manifest_dir.display()
+            );
+        } else {
+            tracing::debug!(
+                "Adding new workspace at {}",
+                workspace.manifest_dir.display()
+            );
             self.workspaces.push(workspace);
         }
     }
 
     /// adds a crate to the config, ignoring the new one if one with the same manifest directory already exists
     pub fn add_crate(&mut self, krate: Crate) {
-        // If a crate with the same manifest_dir already exists, do nothing (ignore the new one).
         if self
             .crates
             .iter()
             .any(|c| c.manifest_dir == krate.manifest_dir)
         {
-            return;
+            tracing::debug!(
+                "Crate at {} already exists, not adding.",
+                krate.manifest_dir.display()
+            );
+        } else {
+            tracing::debug!("Adding new crate at {}", krate.manifest_dir.display());
+            self.crates.push(krate);
         }
-        // If it doesn't exist, add the new crate.
-        self.crates.push(krate);
     }
 
     /// Load the config file
@@ -465,14 +477,30 @@ async fn refresh_command() -> Result<(), crate::Error> {
     let mut config = Config::load()?;
 
     // 1. Remove workspaces that no longer exist.
-    config
+    let (retained_workspaces, removed_workspaces): (Vec<_>, Vec<_>) = config
         .workspaces
-        .retain(|w| w.manifest_dir.join("Cargo.toml").is_file());
+        .drain(..)
+        .partition(|w| w.manifest_dir.join("Cargo.toml").is_file());
+    for r in &removed_workspaces {
+        tracing::debug!(
+            "Removing workspace at {} because Cargo.toml is gone.",
+            r.manifest_dir.display()
+        );
+    }
+    config.workspaces = retained_workspaces;
 
     // 2. Remove crates that no longer exist.
-    config
+    let (retained_crates, removed_crates): (Vec<_>, Vec<_>) = config
         .crates
-        .retain(|c| c.manifest_dir.join("Cargo.toml").is_file());
+        .drain(..)
+        .partition(|c| c.manifest_dir.join("Cargo.toml").is_file());
+    for r in &removed_crates {
+        tracing::debug!(
+            "Removing crate at {} because Cargo.toml is gone.",
+            r.manifest_dir.display()
+        );
+    }
+    config.crates = retained_crates;
 
     // 3. For all existing workspaces, discover and add new member crates.
     //    We don't need to update existing crates found here, as the next step will do it.
@@ -515,7 +543,16 @@ async fn refresh_command() -> Result<(), crate::Error> {
         // We need the package object to determine the crate type.
         // Using get_package_by_manifest_path is correct for single crates/workspace members.
         if let Ok(package) = cargo_metadata.get_package_by_manifest_path(&manifest_path) {
-            krate.crate_types = CrateType::from_package(package);
+            let new_crate_types = CrateType::from_package(package);
+            if krate.crate_types != new_crate_types {
+                tracing::debug!(
+                    "Updating crate_types for {} from {:?} to {:?}",
+                    krate.manifest_dir.display(),
+                    krate.crate_types,
+                    new_crate_types
+                );
+                krate.crate_types = new_crate_types;
+            }
         } else {
             tracing::warn!(
                 "Could not find package for manifest path {} during refresh.",
