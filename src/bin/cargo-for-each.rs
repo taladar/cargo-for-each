@@ -1,6 +1,8 @@
 #![doc = include_str!("../../README.md")]
 
-use tracing::{Instrument as _, instrument};
+use std::collections::BTreeSet;
+
+use tracing::instrument;
 use tracing_subscriber::{
     EnvFilter, Layer as _, Registry, filter::LevelFilter, layer::SubscriberExt as _,
     util::SubscriberInitExt as _,
@@ -47,48 +49,245 @@ pub enum Error {
     /// error generating shell completion
     #[error("error generating shell completion: {0}")]
     GenerateShellCompletionError(#[source] std::io::Error),
+    /// error determining user config dir
+    #[error("error determining user config dir")]
+    CouldNotDetermineUserConfigDir,
+    /// error reading config file
+    #[error("error reading config file: {0}")]
+    CouldNotReadConfigFile(#[source] std::io::Error),
+    /// error parsing config file
+    #[error("error parsing config file: {0}")]
+    CouldNotParseConfigFile(#[source] toml::de::Error),
+    /// error serializing config file
+    #[error("error serializing config file: {0}")]
+    CouldNotSerializeConfigFile(#[source] toml::ser::Error),
+    /// could not create parent directories for config file
+    #[error("could not create parent directories for config file: {0}")]
+    CouldNotCreateConfigFileParentDirs(#[source] std::io::Error),
+    /// error writing config file
+    #[error("error writing config file: {0}")]
+    CouldNotWriteConfigFile(#[source] std::io::Error),
+    /// error running cargo-metadata
+    #[error("error running cargo-metadata for {0}: {1}")]
+    CargoMetadataError(std::path::PathBuf, #[source] cargo_metadata::Error),
+    /// error turning a relative manifest path into an absolute one
+    #[error("error turning the relative manifest path {0} into an absolute one: {1}")]
+    CouldNotDetermineAbsoluteManifestPath(std::path::PathBuf, #[source] std::io::Error),
+    /// error turning a absolute manifest path into a canonical one
+    #[error("error turning the absolute manifest path {0} into a canonical one: {1}")]
+    CouldNotDetermineCanonicalManifestPath(std::path::PathBuf, #[source] std::io::Error),
+    /// the given manifest path has no parent directory
+    #[error("the given manifest path {0} has no parent directory")]
+    ManifestPathHasNoParentDir(std::path::PathBuf),
+    /// we called cargo metadata on a directory with a Cargo.toml
+    /// but the output did not contain a package with the manifest_path
+    /// pointing to that Cargo.toml
+    #[error(
+        "found no package with manifest_path matching local Cargo.toml in cargo metadata output: {0}"
+    )]
+    FoundNoPackageInCargoMetadataWithCurrentManifestPath(std::path::PathBuf),
+    /// metadata did not include a package with the given package id
+    #[error("cargo metadata did not include a package with the package id {0}")]
+    FoundNoPackageInCargoMetadataWithPackageId(cargo_metadata::PackageId),
 }
 
-/// parse a `time::OffsetDateTime` as a clap parameter
-///
-/// # Errors
-///
-/// fails if parsing the OffsetDateTime fails
-fn parse_offset_date_time(s: &str) -> Result<time::OffsetDateTime, time::error::Parse> {
-    time::OffsetDateTime::parse(
-        s,
-        time::macros::format_description!(
-            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour sign:mandatory]:[offset_minute]:[offset_second]"
-        ),
-    )
+/// an extension trait on Cargo Metadata that allows easy retrieval
+/// of a few pieces of information we need regularly
+pub trait CargoMetadataExt {
+    /// allows retrieval of a package by the manifest_path of its Cargo.toml
+    ///
+    /// this is usually required to get our own package in a workspace Metadata
+    /// object that includes multiple packages
+    ///
+    /// # Errors
+    ///
+    /// fails if there is no package like that
+    fn get_package_by_manifest_path(
+        &self,
+        manifest_path: &std::path::Path,
+    ) -> Result<&cargo_metadata::Package, Error>;
+
+    /// allows retrieval of a package by the package id
+    ///
+    /// this is usually required to retrieve the package object
+    /// for package ids mentioned in e.g. workspace members
+    ///
+    /// # Errors
+    ///
+    /// fails if there is no package like that
+    fn get_package_by_id(
+        &self,
+        package_id: &cargo_metadata::PackageId,
+    ) -> Result<&cargo_metadata::Package, Error>;
 }
 
-/// Parameters for foo subcommand
+impl CargoMetadataExt for cargo_metadata::Metadata {
+    fn get_package_by_manifest_path(
+        &self,
+        manifest_path: &std::path::Path,
+    ) -> Result<&cargo_metadata::Package, Error> {
+        let Some(package) = self
+            .packages
+            .iter()
+            .find(|p| p.manifest_path == manifest_path)
+        else {
+            return Err(Error::FoundNoPackageInCargoMetadataWithCurrentManifestPath(
+                manifest_path.to_owned(),
+            ));
+        };
+        Ok(package)
+    }
+
+    fn get_package_by_id(
+        &self,
+        package_id: &cargo_metadata::PackageId,
+    ) -> Result<&cargo_metadata::Package, Error> {
+        let Some(package) = self.packages.iter().find(|p| p.id == *package_id) else {
+            return Err(Error::FoundNoPackageInCargoMetadataWithPackageId(
+                package_id.to_owned(),
+            ));
+        };
+        Ok(package)
+    }
+}
+
+/// an extension trait on Cargo Metadata Packages that allows easy retrieval of a
+/// few pieces of information we need regularly
+pub trait CargoPackageExt {
+    /// allows checking if this package has at least one target of the specified kind
+    #[must_use]
+    fn has_target(&self, target_kind: &cargo_metadata::TargetKind) -> bool;
+}
+
+impl CargoPackageExt for cargo_metadata::Package {
+    fn has_target(&self, target_kind: &cargo_metadata::TargetKind) -> bool {
+        self.targets.iter().any(|t| t.kind.contains(target_kind))
+    }
+}
+
+/// represents a Rust workspace
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Workspace {
+    /// the directory that contains the workspace Cargo.toml file
+    manifest_dir: std::path::PathBuf,
+}
+
+/// represents the type of Rust crate
+#[derive(
+    Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum CrateType {
+    /// a binary crate
+    Bin,
+    /// a library crate
+    Lib,
+    /// a proc-macro crate
+    ProcMacro,
+}
+
+impl CrateType {
+    /// determine the set of `CrateType` for a given package
+    #[must_use]
+    pub fn from_package(package: &cargo_metadata::Package) -> BTreeSet<Self> {
+        let mut crate_types = BTreeSet::new();
+        if package.has_target(&cargo_metadata::TargetKind::Bin) {
+            crate_types.insert(Self::Bin);
+        }
+        if package.has_target(&cargo_metadata::TargetKind::Lib) {
+            crate_types.insert(Self::Lib);
+        }
+        if package.has_target(&cargo_metadata::TargetKind::ProcMacro) {
+            crate_types.insert(Self::ProcMacro);
+        }
+        crate_types
+    }
+}
+
+/// represents a Rust crate
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Crate {
+    /// the directory that contains the crate Cargo.toml file
+    manifest_dir: std::path::PathBuf,
+    /// the types of this crate (only bin and lib can be combined so this should have at most two members)
+    crate_types: std::collections::BTreeSet<CrateType>,
+}
+
+/// represents the cargo-for-each configuration file
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Config {
+    /// represents all the workspaces we know about
+    workspaces: Vec<Workspace>,
+    /// presents all the crates we know about
+    crates: Vec<Crate>,
+}
+
+impl Config {
+    /// Load the config file
+    fn load() -> Result<Self, Error> {
+        let config_file_path = config_file_path()?;
+        if fs_err::exists(&config_file_path).map_err(Error::CouldNotReadConfigFile)? {
+            let file_content =
+                fs_err::read_to_string(&config_file_path).map_err(Error::CouldNotReadConfigFile)?;
+            toml::from_str(&file_content).map_err(Error::CouldNotParseConfigFile)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    /// Save the config file
+    fn save(&self) -> Result<(), Error> {
+        let config_file_path = config_file_path()?;
+        if let Some(config_dir_path) = config_file_path.parent() {
+            fs_err::create_dir_all(config_dir_path)
+                .map_err(Error::CouldNotCreateConfigFileParentDirs)?;
+        }
+        fs_err::write(
+            &config_file_path,
+            toml::to_string(self).map_err(Error::CouldNotSerializeConfigFile)?,
+        )
+        .map_err(Error::CouldNotWriteConfigFile)
+    }
+}
+
+/// returns the config file path
+fn config_file_path() -> Result<std::path::PathBuf, Error> {
+    Ok(dirs::config_dir()
+        .ok_or(Error::CouldNotDetermineUserConfigDir)?
+        .join("cargo-for-each/cargo-for-each.toml"))
+}
+
+/// The type of object to list
 #[derive(clap::Parser, Debug, Clone)]
-pub struct FooParameters {
-    /// filename parameter for foo
+pub enum ListType {
+    /// list workspaces
+    Workspaces,
+    /// list crates
+    Crates,
+}
+
+/// Parameters for list subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct ListParameters {
+    /// the type of object to list
+    #[clap(subcommand)]
+    pub list_type: ListType,
+}
+
+/// Parameters for add subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct AddParameters {
+    /// the manifest file to add, if it refers to a workspace manifest all crates in the workspace are added too
     #[clap(long)]
-    pub input_file: std::path::PathBuf,
-}
-
-/// Parameters for bar subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub struct BarParameters {
-    /// time parameter for bar
-    #[clap(long, help_heading = "Bar time", value_name = "YYYY-MM-DD HH:MM:SS +00:00:00", value_parser = parse_offset_date_time)]
-    bar_time: time::OffsetDateTime,
-    /// duration parameter for bar
-    #[clap(long, help_heading = "Bar duration", default_value = "1s")]
-    bar_duration: humantime::Duration,
+    pub manifest_path: std::path::PathBuf,
 }
 
 /// which subcommand to call
 #[derive(clap::Parser, Debug)]
 pub enum Command {
-    /// Call foo subcommand
-    Foo(FooParameters),
-    /// Call bar subcommand
-    Bar(BarParameters),
+    /// Call list subcommand
+    List(ListParameters),
+    /// Call add subcommand
+    Add(AddParameters),
     /// Generate man page
     GenerateManpage {
         /// target dir for man page generation
@@ -119,41 +318,113 @@ struct Options {
     command: Command,
 }
 
-/// implementation of the foo subcommand
+/// implementation of the list subcommand
 ///
 /// # Errors
 ///
-/// fails if the implementation of foo fails
+/// fails if the implementation of list fails
 #[instrument]
-async fn foo_command(foo_parameters: FooParameters) -> Result<(), crate::Error> {
-    // implementation of foo subcommand
-
-    let foo_subtask_a_span = tracing::info_span!(
-        "perform subtask a",
-        subtask_a_intermediate_result = tracing::field::Empty
-    );
-    let handle = tokio::task::spawn(
-        async move {
-            tracing::info!("Starting foo subtask a");
-            tracing::Span::current().record("subtask_a_intermediate_result", 27);
-            tracing::info!(field_on_event = 38, "Continuing foo subtask a");
+async fn list_command(list_parameters: ListParameters) -> Result<(), crate::Error> {
+    #[expect(clippy::print_stderr, reason = "This is part of the UI, not logging")]
+    let Ok(config) = Config::load() else {
+        eprintln!("No config file found, nothing to list");
+        return Ok(());
+    };
+    #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
+    match list_parameters.list_type {
+        ListType::Workspaces => {
+            for workspace in config.workspaces {
+                println!("{}", workspace.manifest_dir.display());
+            }
         }
-        .instrument(foo_subtask_a_span),
-    );
-
-    handle.await?;
-
+        ListType::Crates => {
+            for crat in config.crates {
+                println!("{} ({:?})", crat.manifest_dir.display(), crat.crate_types);
+            }
+        }
+    }
     Ok(())
 }
 
-/// implementation of the bar subcommand
+/// implementation of the add subcommand
 ///
 /// # Errors
 ///
-/// fails if the implementation of bar fails
+/// fails if the implementation of add fails
 #[instrument]
-async fn bar_command(bar_parameters: BarParameters) -> Result<(), crate::Error> {
-    // implementation of bar subcommand
+async fn add_command(add_parameters: AddParameters) -> Result<(), crate::Error> {
+    let mut config = Config::load()?;
+    let manifest_path =
+        std::path::absolute(add_parameters.manifest_path.clone()).map_err(|err| {
+            Error::CouldNotDetermineAbsoluteManifestPath(add_parameters.manifest_path, err)
+        })?;
+    let manifest_path = fs_err::canonicalize(manifest_path.clone())
+        .map_err(|err| Error::CouldNotDetermineCanonicalManifestPath(manifest_path, err))?;
+    let Some(manifest_dir) = manifest_path.parent() else {
+        return Err(Error::ManifestPathHasNoParentDir(manifest_path));
+    };
+    let manifest_dir = manifest_dir.to_path_buf();
+    let cargo_metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(manifest_path.clone())
+        .exec()
+        .map_err(|err| Error::CargoMetadataError(manifest_path.clone(), err))?;
+    let workspace_root = cargo_metadata.workspace_root.to_owned().into_std_path_buf();
+    tracing::debug!("Manifest dir: {}", manifest_dir.display());
+    tracing::debug!("Workspace root: {}", workspace_root.display());
+    if workspace_root == manifest_dir {
+        // either standalone crate or workspace
+        if let [package_id] = cargo_metadata.workspace_members.as_slice()
+            && let package = cargo_metadata.get_package_by_id(package_id)?
+            && package.manifest_path == manifest_path
+        {
+            tracing::debug!("Identified Cargo.toml as standalone crate");
+            // the single package in the workspace lives in the directory
+            // we called cargo metadata on so we are dealing with a
+            // standalone crate
+            //
+            // if it was a workspace root Cargo.toml the manifest path
+            // should not appear in any packages
+            //
+            // if it was the Cargo.toml of a lone member in a workspace the
+            // workspace root should be in a parent directory
+            let crate_types = CrateType::from_package(package);
+            config.crates.push(Crate {
+                manifest_dir,
+                crate_types,
+            });
+        } else {
+            tracing::debug!("Identified Cargo.toml as workspace");
+            config.workspaces.push(Workspace { manifest_dir });
+            for package_id in cargo_metadata.workspace_members.clone() {
+                let package = cargo_metadata.get_package_by_id(&package_id)?;
+                let manifest_path = package.manifest_path.to_owned().into_std_path_buf();
+                let Some(manifest_dir) = manifest_path.parent() else {
+                    return Err(Error::ManifestPathHasNoParentDir(manifest_path));
+                };
+                let manifest_dir = manifest_dir.to_path_buf();
+                let crate_types = CrateType::from_package(package);
+                config.crates.push(Crate {
+                    manifest_dir,
+                    crate_types,
+                });
+            }
+        }
+    } else {
+        tracing::debug!("Identified Cargo.toml as crate inside a workspace");
+        // crate inside workspace
+        if let [package_id] = cargo_metadata.workspace_members.as_slice()
+            && let package = cargo_metadata.get_package_by_id(package_id)?
+            && package.manifest_path == manifest_path
+        {
+            let crate_types = CrateType::from_package(package);
+            config.crates.push(Crate {
+                manifest_dir,
+                crate_types,
+            });
+        }
+    }
+    config.save()?;
+
     Ok(())
 }
 
@@ -170,13 +441,11 @@ async fn do_stuff() -> Result<(), crate::Error> {
     // main code either goes here or into the individual subcommands
 
     match options.command {
-        Command::Foo(foo_parameters) => {
-            // might need extra parameters from options shared by subcommands
-            foo_command(foo_parameters).await?;
+        Command::List(list_parameters) => {
+            list_command(list_parameters).await?;
         }
-        Command::Bar(bar_parameters) => {
-            // might need extra parameters from options shared by subcommands
-            bar_command(bar_parameters).await?;
+        Command::Add(add_parameters) => {
+            add_command(add_parameters).await?;
         }
         Command::GenerateManpage { output_dir } => {
             // generate man pages
