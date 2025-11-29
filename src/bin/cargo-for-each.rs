@@ -1,6 +1,7 @@
 #![doc = include_str!("../../README.md")]
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _; // Required for write! macro
 
 use tracing::instrument;
 use tracing_subscriber::{
@@ -152,6 +153,9 @@ pub enum Error {
     /// The specified command was not found in PATH
     #[error("command not found: {0}")]
     CommandNotFound(String),
+    /// error formatting a string
+    #[error("error formatting a string: {0}")]
+    FmtError(#[from] std::fmt::Error),
 }
 
 /// an extension trait on Cargo Metadata that allows easy retrieval
@@ -237,7 +241,16 @@ pub struct Workspace {
 
 /// represents the type of Rust crate
 #[derive(
-    Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
 )]
 pub enum CrateType {
     /// a binary crate
@@ -356,13 +369,21 @@ fn config_file_path() -> Result<std::path::PathBuf, Error> {
         .join("cargo-for-each/cargo-for-each.toml"))
 }
 
+/// Parameters for listing crates
+#[derive(clap::Parser, Debug, Clone)]
+pub struct CrateListParameters {
+    /// only list crates of this type
+    #[clap(long)]
+    pub r#type: Option<CrateType>,
+}
+
 /// The type of object to list
 #[derive(clap::Parser, Debug, Clone)]
 pub enum ListType {
     /// list workspaces
     Workspaces,
     /// list crates
-    Crates,
+    Crates(CrateListParameters),
 }
 
 /// Parameters for list subcommand
@@ -392,13 +413,25 @@ pub struct ExecSubcommand {
     pub args: Vec<String>,
 }
 
+/// Parameters for executing commands on crates
+#[derive(clap::Parser, Debug, Clone)]
+pub struct CrateExecParameters {
+    /// only execute on crates of this type
+    #[clap(long)]
+    pub r#type: Option<CrateType>,
+
+    /// The command to execute
+    #[clap(flatten)]
+    pub exec_subcommand: ExecSubcommand,
+}
+
 /// The type of object to execute a command on
 #[derive(clap::Parser, Debug, Clone)]
 pub enum ExecType {
     /// Execute a command in each workspace directory
     Workspaces(ExecSubcommand),
     /// Execute a command in each crate directory
-    Crates(ExecSubcommand),
+    Crates(CrateExecParameters),
 }
 
 /// Parameters for exec subcommand
@@ -469,8 +502,13 @@ async fn list_command(list_parameters: ListParameters) -> Result<(), crate::Erro
                 println!("{}", workspace.manifest_dir.display());
             }
         }
-        ListType::Crates => {
+        ListType::Crates(params) => {
             for krate in config.crates {
+                if let Some(crate_type) = &params.r#type
+                    && !krate.crate_types.contains(crate_type)
+                {
+                    continue;
+                }
                 println!("{} ({:?})", krate.manifest_dir.display(), krate.crate_types);
             }
         }
@@ -669,7 +707,7 @@ async fn exec_command(exec_parameters: ExecParameters) -> Result<(), crate::Erro
 
     let (exec_type_str, dirs, command, args) = match exec_parameters.exec_type {
         ExecType::Workspaces(subcommand) => (
-            "workspaces",
+            String::from("workspaces"),
             config
                 .workspaces
                 .into_iter()
@@ -678,16 +716,31 @@ async fn exec_command(exec_parameters: ExecParameters) -> Result<(), crate::Erro
             subcommand.command,
             subcommand.args,
         ),
-        ExecType::Crates(subcommand) => (
-            "crates",
-            config
+        ExecType::Crates(crate_params) => {
+            let filtered_crates = config
                 .crates
                 .into_iter()
+                .filter(|krate| {
+                    if let Some(t) = &crate_params.r#type {
+                        krate.crate_types.contains(t)
+                    } else {
+                        true
+                    }
+                })
                 .map(|c| c.manifest_dir)
-                .collect::<Vec<_>>(),
-            subcommand.command,
-            subcommand.args,
-        ),
+                .collect::<Vec<_>>();
+
+            let mut description = String::from("crates");
+            if let Some(crate_type) = &crate_params.r#type {
+                write!(&mut description, " of type {crate_type:?}")?;
+            }
+            (
+                description,
+                filtered_crates,
+                crate_params.exec_subcommand.command,
+                crate_params.exec_subcommand.args,
+            )
+        }
     };
 
     tracing::debug!(
