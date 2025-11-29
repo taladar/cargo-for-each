@@ -8,6 +8,55 @@ use tracing_subscriber::{
     util::SubscriberInitExt as _,
 };
 
+/// checks if the given path is an executable file
+///
+/// on unix this checks for the executable bit, on windows it checks
+/// for valid extensions and on other platforms it just checks for
+/// the presence of a file
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs_err::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// checks if the given path is an executable file
+///
+/// on unix this checks for the executable bit, on windows it checks
+/// for valid extensions and on other platforms it just checks for
+/// the presence of a file
+#[cfg(windows)]
+fn is_executable(path: &std::path::Path) -> bool {
+    // On Windows, executability is determined by file extension.
+    // We check against PATHEXT environment variable.
+    if path.extension().is_some() && path.is_file() {
+        return true;
+    }
+    if let Some(pathext) = std::env::var_os("PATHEXT") {
+        let pathexts = pathext.to_string_lossy();
+        for ext in pathexts.split(';').filter(|s| !s.is_empty()) {
+            let mut path_with_ext = path.as_os_str().to_owned();
+            path_with_ext.push(ext);
+            if std::path::Path::new(&path_with_ext).is_file() {
+                return true;
+            }
+        }
+    }
+    path.is_file()
+}
+
+/// checks if the given path is an executable file
+///
+/// on unix this checks for the executable bit, on windows it checks
+/// for valid extensions and on other platforms it just checks for
+/// the presence of a file
+#[cfg(all(not(unix), not(windows)))]
+fn is_executable(path: &std::path::Path) -> bool {
+    // Fallback for non-unix, non-windows systems.
+    path.is_file()
+}
+
 /// Error enum for the application
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -89,6 +138,20 @@ pub enum Error {
     /// metadata did not include a package with the given package id
     #[error("cargo metadata did not include a package with the package id {0}")]
     FoundNoPackageInCargoMetadataWithPackageId(cargo_metadata::PackageId),
+    /// error executing a command
+    #[error("error executing command `{command:?}` in `{manifest_dir}`: {source}")]
+    CommandExecutionError {
+        /// The directory in which the command was attempted to be executed.
+        manifest_dir: std::path::PathBuf,
+        /// The command and its arguments that were attempted to be executed.
+        command: Vec<String>,
+        /// The underlying I/O error that occurred.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The specified command was not found in PATH
+    #[error("command not found: {0}")]
+    CommandNotFound(String),
 }
 
 /// an extension trait on Cargo Metadata that allows easy retrieval
@@ -318,6 +381,34 @@ pub struct AddParameters {
     pub manifest_path: std::path::PathBuf,
 }
 
+/// Parameters for exec subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct ExecSubcommand {
+    /// The command to execute.
+    #[clap(required = true)]
+    pub command: String,
+    /// The arguments for the command.
+    #[clap(last = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
+}
+
+/// The type of object to execute a command on
+#[derive(clap::Parser, Debug, Clone)]
+pub enum ExecType {
+    /// Execute a command in each workspace directory
+    Workspaces(ExecSubcommand),
+    /// Execute a command in each crate directory
+    Crates(ExecSubcommand),
+}
+
+/// Parameters for exec subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct ExecParameters {
+    /// The type of object to execute on
+    #[clap(subcommand)]
+    pub exec_type: ExecType,
+}
+
 /// which subcommand to call
 #[derive(clap::Parser, Debug)]
 pub enum Command {
@@ -327,6 +418,8 @@ pub enum Command {
     Add(AddParameters),
     /// refresh the config, removing old entries and adding new ones
     Refresh,
+    /// Execute a command in each configured directory
+    Exec(ExecParameters),
     /// Generate man page
     GenerateManpage {
         /// target dir for man page generation
@@ -565,6 +658,104 @@ async fn refresh_command() -> Result<(), crate::Error> {
     Ok(())
 }
 
+/// implementation of the exec subcommand
+///
+/// # Errors
+///
+/// fails if the implementation of exec fails
+#[instrument]
+async fn exec_command(exec_parameters: ExecParameters) -> Result<(), crate::Error> {
+    let config = Config::load()?;
+
+    let (exec_type_str, dirs, command, args) = match exec_parameters.exec_type {
+        ExecType::Workspaces(subcommand) => (
+            "workspaces",
+            config
+                .workspaces
+                .into_iter()
+                .map(|w| w.manifest_dir)
+                .collect::<Vec<_>>(),
+            subcommand.command,
+            subcommand.args,
+        ),
+        ExecType::Crates(subcommand) => (
+            "crates",
+            config
+                .crates
+                .into_iter()
+                .map(|c| c.manifest_dir)
+                .collect::<Vec<_>>(),
+            subcommand.command,
+            subcommand.args,
+        ),
+    };
+
+    tracing::debug!(
+        "Executing command `{} {:?}` for all {}",
+        command,
+        args,
+        exec_type_str
+    );
+
+    // Check if command exists and is executable before iterating
+    let command_path = std::path::Path::new(&command);
+    let command_is_executable = if command_path.is_absolute() {
+        is_executable(command_path)
+    } else {
+        std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths).find(|p| is_executable(&p.join(&command)))
+            })
+            .is_some()
+    };
+
+    if !command_is_executable {
+        return Err(Error::CommandNotFound(command));
+    }
+
+    for dir in dirs {
+        tracing::debug!("Executing `{} {:?}` in {}", command, args, dir.display());
+        let mut child = tokio::process::Command::new(&command)
+            .args(&args)
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|e| Error::CommandExecutionError {
+                manifest_dir: dir.clone(),
+                command: vec![command.clone()]
+                    .into_iter()
+                    .chain(args.clone().into_iter())
+                    .collect(),
+                source: e,
+            })?;
+
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| Error::CommandExecutionError {
+                manifest_dir: dir.clone(),
+                command: vec![command.clone()]
+                    .into_iter()
+                    .chain(args.clone().into_iter())
+                    .collect(),
+                source: e,
+            })?;
+
+        if !status.success() {
+            tracing::error!(
+                "Command `{} {:?}` failed in `{}` with status {}",
+                command,
+                args,
+                dir.display(),
+                status
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// The main behaviour of the binary should go here
 ///
 /// # Errors
@@ -586,6 +777,9 @@ async fn do_stuff() -> Result<(), crate::Error> {
         }
         Command::Refresh => {
             refresh_command().await?;
+        }
+        Command::Exec(exec_parameters) => {
+            exec_command(exec_parameters).await?;
         }
         Command::GenerateManpage { output_dir } => {
             // generate man pages
