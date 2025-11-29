@@ -222,6 +222,31 @@ pub struct Config {
 }
 
 impl Config {
+    /// adds a workspace to the config if it is not already present
+    pub fn add_workspace(&mut self, workspace: Workspace) {
+        if !self
+            .workspaces
+            .iter()
+            .any(|w| w.manifest_dir == workspace.manifest_dir)
+        {
+            self.workspaces.push(workspace);
+        }
+    }
+
+    /// adds a crate to the config, ignoring the new one if one with the same manifest directory already exists
+    pub fn add_crate(&mut self, krate: Crate) {
+        // If a crate with the same manifest_dir already exists, do nothing (ignore the new one).
+        if self
+            .crates
+            .iter()
+            .any(|c| c.manifest_dir == krate.manifest_dir)
+        {
+            return;
+        }
+        // If it doesn't exist, add the new crate.
+        self.crates.push(krate);
+    }
+
     /// Load the config file
     fn load() -> Result<Self, Error> {
         let config_file_path = config_file_path()?;
@@ -338,8 +363,8 @@ async fn list_command(list_parameters: ListParameters) -> Result<(), crate::Erro
             }
         }
         ListType::Crates => {
-            for crat in config.crates {
-                println!("{} ({:?})", crat.manifest_dir.display(), crat.crate_types);
+            for krate in config.crates {
+                println!("{} ({:?})", krate.manifest_dir.display(), krate.crate_types);
             }
         }
     }
@@ -388,13 +413,13 @@ async fn add_command(add_parameters: AddParameters) -> Result<(), crate::Error> 
             // if it was the Cargo.toml of a lone member in a workspace the
             // workspace root should be in a parent directory
             let crate_types = CrateType::from_package(package);
-            config.crates.push(Crate {
+            config.add_crate(Crate {
                 manifest_dir,
                 crate_types,
             });
         } else {
             tracing::debug!("Identified Cargo.toml as workspace");
-            config.workspaces.push(Workspace { manifest_dir });
+            config.add_workspace(Workspace { manifest_dir });
             for package_id in cargo_metadata.workspace_members.clone() {
                 let package = cargo_metadata.get_package_by_id(&package_id)?;
                 let manifest_path = package.manifest_path.to_owned().into_std_path_buf();
@@ -403,7 +428,7 @@ async fn add_command(add_parameters: AddParameters) -> Result<(), crate::Error> 
                 };
                 let manifest_dir = manifest_dir.to_path_buf();
                 let crate_types = CrateType::from_package(package);
-                config.crates.push(Crate {
+                config.add_crate(Crate {
                     manifest_dir,
                     crate_types,
                 });
@@ -417,7 +442,7 @@ async fn add_command(add_parameters: AddParameters) -> Result<(), crate::Error> 
             && package.manifest_path == manifest_path
         {
             let crate_types = CrateType::from_package(package);
-            config.crates.push(Crate {
+            config.add_crate(Crate {
                 manifest_dir,
                 crate_types,
             });
