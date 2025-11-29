@@ -313,6 +313,8 @@ pub enum Command {
     List(ListParameters),
     /// Call add subcommand
     Add(AddParameters),
+    /// refresh the config, removing old entries and adding new ones
+    Refresh,
     /// Generate man page
     GenerateManpage {
         /// target dir for man page generation
@@ -453,6 +455,79 @@ async fn add_command(add_parameters: AddParameters) -> Result<(), crate::Error> 
     Ok(())
 }
 
+/// implementation of the refresh subcommand
+///
+/// # Errors
+///
+/// fails if the implementation of refresh fails
+#[instrument]
+async fn refresh_command() -> Result<(), crate::Error> {
+    let mut config = Config::load()?;
+
+    // 1. Remove workspaces that no longer exist.
+    config
+        .workspaces
+        .retain(|w| w.manifest_dir.join("Cargo.toml").is_file());
+
+    // 2. Remove crates that no longer exist.
+    config
+        .crates
+        .retain(|c| c.manifest_dir.join("Cargo.toml").is_file());
+
+    // 3. For all existing workspaces, discover and add new member crates.
+    //    We don't need to update existing crates found here, as the next step will do it.
+    let workspaces_to_scan = config.workspaces.clone();
+    for workspace in &workspaces_to_scan {
+        let manifest_path = workspace.manifest_dir.join("Cargo.toml");
+        let cargo_metadata = cargo_metadata::MetadataCommand::new()
+            .manifest_path(&manifest_path)
+            .exec()
+            .map_err(|err| Error::CargoMetadataError(manifest_path, err))?;
+
+        for package_id in &cargo_metadata.workspace_members {
+            let package = cargo_metadata.get_package_by_id(package_id)?;
+            let pkg_manifest_path = package.manifest_path.to_owned().into_std_path_buf();
+            if let Some(manifest_dir) = pkg_manifest_path.parent() {
+                let manifest_dir = manifest_dir.to_path_buf();
+
+                // Only add if it doesn't exist. `add_crate` does this.
+                if !config.crates.iter().any(|c| c.manifest_dir == manifest_dir) {
+                    let crate_types = CrateType::from_package(package);
+                    config.add_crate(Crate {
+                        manifest_dir,
+                        crate_types,
+                    });
+                }
+            }
+        }
+    }
+
+    // 4. Update crate_types for all existing crates.
+    for krate in &mut config.crates {
+        let manifest_path = krate.manifest_dir.join("Cargo.toml");
+
+        let cargo_metadata = cargo_metadata::MetadataCommand::new()
+            .manifest_path(&manifest_path)
+            .no_deps()
+            .exec()
+            .map_err(|err| Error::CargoMetadataError(manifest_path.clone(), err))?;
+
+        // We need the package object to determine the crate type.
+        // Using get_package_by_manifest_path is correct for single crates/workspace members.
+        if let Ok(package) = cargo_metadata.get_package_by_manifest_path(&manifest_path) {
+            krate.crate_types = CrateType::from_package(package);
+        } else {
+            tracing::warn!(
+                "Could not find package for manifest path {} during refresh.",
+                manifest_path.display()
+            );
+        }
+    }
+
+    config.save()?;
+    Ok(())
+}
+
 /// The main behaviour of the binary should go here
 ///
 /// # Errors
@@ -471,6 +546,9 @@ async fn do_stuff() -> Result<(), crate::Error> {
         }
         Command::Add(add_parameters) => {
             add_command(add_parameters).await?;
+        }
+        Command::Refresh => {
+            refresh_command().await?;
         }
         Command::GenerateManpage { output_dir } => {
             // generate man pages
