@@ -237,6 +237,8 @@ impl CargoPackageExt for cargo_metadata::Package {
 pub struct Workspace {
     /// the directory that contains the workspace Cargo.toml file
     manifest_dir: std::path::PathBuf,
+    /// is this a standalone crate workspace
+    is_standalone: bool,
 }
 
 /// represents the type of Rust crate
@@ -284,8 +286,10 @@ impl CrateType {
 pub struct Crate {
     /// the directory that contains the crate Cargo.toml file
     manifest_dir: std::path::PathBuf,
+    /// the directory that contains the workspace Cargo.toml file for this crate
+    workspace_manifest_dir: std::path::PathBuf,
     /// the types of this crate (only bin and lib can be combined so this should have at most two members)
-    crate_types: std::collections::BTreeSet<CrateType>,
+    types: std::collections::BTreeSet<CrateType>,
 }
 
 /// represents the cargo-for-each configuration file
@@ -499,17 +503,34 @@ async fn list_command(list_parameters: ListParameters) -> Result<(), crate::Erro
     match list_parameters.list_type {
         ListType::Workspaces => {
             for workspace in config.workspaces {
-                println!("{}", workspace.manifest_dir.display());
+                println!(
+                    "{} (standalone: {})",
+                    workspace.manifest_dir.display(),
+                    workspace.is_standalone
+                );
             }
         }
         ListType::Crates(params) => {
             for krate in config.crates {
                 if let Some(crate_type) = &params.r#type
-                    && !krate.crate_types.contains(crate_type)
+                    && !krate.types.contains(crate_type)
                 {
                     continue;
                 }
-                println!("{} ({:?})", krate.manifest_dir.display(), krate.crate_types);
+                if krate.manifest_dir == krate.workspace_manifest_dir {
+                    println!(
+                        "{} (types: {:?})",
+                        krate.manifest_dir.display(),
+                        krate.types
+                    );
+                } else {
+                    println!(
+                        "{} (workspace: {}, types: {:?})",
+                        krate.manifest_dir.display(),
+                        krate.workspace_manifest_dir.display(),
+                        krate.types
+                    );
+                }
             }
         }
     }
@@ -530,69 +551,74 @@ async fn add_command(add_parameters: AddParameters) -> Result<(), crate::Error> 
         })?;
     let manifest_path = fs_err::canonicalize(manifest_path.clone())
         .map_err(|err| Error::CouldNotDetermineCanonicalManifestPath(manifest_path, err))?;
-    let Some(manifest_dir) = manifest_path.parent() else {
-        return Err(Error::ManifestPathHasNoParentDir(manifest_path));
-    };
-    let manifest_dir = manifest_dir.to_path_buf();
-    let cargo_metadata = cargo_metadata::MetadataCommand::new()
-        .manifest_path(manifest_path.clone())
+
+    // first call to metadata to find the workspace root
+    let initial_metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(&manifest_path)
         .exec()
-        .map_err(|err| Error::CargoMetadataError(manifest_path.clone(), err))?;
-    let workspace_root = cargo_metadata.workspace_root.to_owned().into_std_path_buf();
-    tracing::debug!("Manifest dir: {}", manifest_dir.display());
-    tracing::debug!("Workspace root: {}", workspace_root.display());
-    if workspace_root == manifest_dir {
-        // either standalone crate or workspace
-        if let [package_id] = cargo_metadata.workspace_members.as_slice()
-            && let package = cargo_metadata.get_package_by_id(package_id)?
-            && package.manifest_path == manifest_path
-        {
-            tracing::debug!("Identified Cargo.toml as standalone crate");
-            // the single package in the workspace lives in the directory
-            // we called cargo metadata on so we are dealing with a
-            // standalone crate
-            //
-            // if it was a workspace root Cargo.toml the manifest path
-            // should not appear in any packages
-            //
-            // if it was the Cargo.toml of a lone member in a workspace the
-            // workspace root should be in a parent directory
-            let crate_types = CrateType::from_package(package);
-            config.add_crate(Crate {
-                manifest_dir,
-                crate_types,
-            });
-        } else {
-            tracing::debug!("Identified Cargo.toml as workspace");
-            config.add_workspace(Workspace { manifest_dir });
-            for package_id in cargo_metadata.workspace_members.clone() {
-                let package = cargo_metadata.get_package_by_id(&package_id)?;
-                let manifest_path = package.manifest_path.to_owned().into_std_path_buf();
-                let Some(manifest_dir) = manifest_path.parent() else {
-                    return Err(Error::ManifestPathHasNoParentDir(manifest_path));
-                };
-                let manifest_dir = manifest_dir.to_path_buf();
-                let crate_types = CrateType::from_package(package);
-                config.add_crate(Crate {
-                    manifest_dir,
-                    crate_types,
-                });
-            }
-        }
+        .map_err(|err| Error::CargoMetadataError(manifest_path.clone(), err))?; // manifest_path here is already std::path::PathBuf
+    let workspace_manifest_path_camino = initial_metadata.workspace_root.join("Cargo.toml");
+
+    let Some(workspace_manifest_dir_camino) = workspace_manifest_path_camino.parent() else {
+        return Err(Error::ManifestPathHasNoParentDir(
+            workspace_manifest_path_camino.into_std_path_buf(),
+        ));
+    };
+    let workspace_manifest_dir_camino = workspace_manifest_dir_camino.to_path_buf();
+
+    // second call to metadata to get all packages in the workspace
+    let workspace_metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(&workspace_manifest_path_camino)
+        .exec()
+        .map_err(|err| {
+            Error::CargoMetadataError(
+                workspace_manifest_path_camino.clone().into_std_path_buf(),
+                err,
+            )
+        })?;
+
+    let is_standalone = if let [package_id] = workspace_metadata.workspace_members.as_slice() {
+        let package = workspace_metadata.get_package_by_id(package_id)?;
+        package.manifest_path == workspace_manifest_path_camino
     } else {
-        tracing::debug!("Identified Cargo.toml as crate inside a workspace");
-        // crate inside workspace
-        if let [package_id] = cargo_metadata.workspace_members.as_slice()
-            && let package = cargo_metadata.get_package_by_id(package_id)?
-            && package.manifest_path == manifest_path
-        {
+        false
+    };
+
+    if is_standalone {
+        tracing::debug!("Identified Cargo.toml as standalone crate");
+        let package = workspace_metadata
+            .get_package_by_manifest_path(&workspace_manifest_path_camino.into_std_path_buf())?; // Convert for comparison
+        let crate_types = CrateType::from_package(package);
+        config.add_workspace(Workspace {
+            manifest_dir: workspace_manifest_dir_camino.clone().into_std_path_buf(),
+            is_standalone: true,
+        });
+        config.add_crate(Crate {
+            manifest_dir: workspace_manifest_dir_camino.clone().into_std_path_buf(),
+            workspace_manifest_dir: workspace_manifest_dir_camino.into_std_path_buf(),
+            types: crate_types,
+        });
+    } else {
+        tracing::debug!("Identified Cargo.toml as workspace");
+        config.add_workspace(Workspace {
+            manifest_dir: workspace_manifest_dir_camino.clone().into_std_path_buf(),
+            is_standalone: false,
+        });
+        for package_id in workspace_metadata.workspace_members.clone() {
+            let package = workspace_metadata.get_package_by_id(&package_id)?;
+            let package_manifest_path = package.manifest_path.to_owned().into_std_path_buf();
+            let Some(package_manifest_dir) = package_manifest_path.parent() else {
+                return Err(Error::ManifestPathHasNoParentDir(package_manifest_path));
+            };
             let crate_types = CrateType::from_package(package);
             config.add_crate(Crate {
-                manifest_dir,
-                crate_types,
+                manifest_dir: package_manifest_dir.to_path_buf(),
+                workspace_manifest_dir: workspace_manifest_dir_camino.clone().into_std_path_buf(),
+                types: crate_types,
             });
         }
     }
+
     config.save()?;
 
     Ok(())
@@ -654,7 +680,8 @@ async fn refresh_command() -> Result<(), crate::Error> {
                     let crate_types = CrateType::from_package(package);
                     config.add_crate(Crate {
                         manifest_dir,
-                        crate_types,
+                        workspace_manifest_dir: workspace.manifest_dir.clone(),
+                        types: crate_types,
                     });
                 }
             }
@@ -675,14 +702,14 @@ async fn refresh_command() -> Result<(), crate::Error> {
         // Using get_package_by_manifest_path is correct for single crates/workspace members.
         if let Ok(package) = cargo_metadata.get_package_by_manifest_path(&manifest_path) {
             let new_crate_types = CrateType::from_package(package);
-            if krate.crate_types != new_crate_types {
+            if krate.types != new_crate_types {
                 tracing::debug!(
-                    "Updating crate_types for {} from {:?} to {:?}",
+                    "Updating types for {} from {:?} to {:?}",
                     krate.manifest_dir.display(),
-                    krate.crate_types,
+                    krate.types,
                     new_crate_types
                 );
-                krate.crate_types = new_crate_types;
+                krate.types = new_crate_types;
             }
         } else {
             tracing::warn!(
@@ -722,7 +749,7 @@ async fn exec_command(exec_parameters: ExecParameters) -> Result<(), crate::Erro
                 .into_iter()
                 .filter(|krate| {
                     if let Some(t) = &crate_params.r#type {
-                        krate.crate_types.contains(t)
+                        krate.types.contains(t)
                     } else {
                         true
                     }
