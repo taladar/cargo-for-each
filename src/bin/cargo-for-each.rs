@@ -379,13 +379,24 @@ pub struct CrateListParameters {
     /// only list crates of this type
     #[clap(long)]
     pub r#type: Option<CrateType>,
+    /// only list crates that are standalone or not
+    #[clap(long)]
+    pub standalone: Option<bool>,
+}
+
+/// Parameters for listing workspaces
+#[derive(clap::Parser, Debug, Clone, Default)]
+pub struct WorkspaceListParameters {
+    /// only list multi-crate workspaces
+    #[clap(long)]
+    pub no_standalone: bool,
 }
 
 /// The type of object to list
 #[derive(clap::Parser, Debug, Clone)]
 pub enum ListType {
     /// list workspaces
-    Workspaces,
+    Workspaces(WorkspaceListParameters),
     /// list crates
     Crates(CrateListParameters),
 }
@@ -424,6 +435,22 @@ pub struct CrateExecParameters {
     #[clap(long)]
     pub r#type: Option<CrateType>,
 
+    /// only execute on crates that are standalone or not
+    #[clap(long)]
+    pub standalone: Option<bool>,
+
+    /// The command to execute
+    #[clap(flatten)]
+    pub exec_subcommand: ExecSubcommand,
+}
+
+/// Parameters for executing commands on workspaces
+#[derive(clap::Parser, Debug, Clone)]
+pub struct WorkspaceExecParameters {
+    /// only execute on multi-crate workspaces
+    #[clap(long)]
+    pub no_standalone: bool,
+
     /// The command to execute
     #[clap(flatten)]
     pub exec_subcommand: ExecSubcommand,
@@ -433,7 +460,7 @@ pub struct CrateExecParameters {
 #[derive(clap::Parser, Debug, Clone)]
 pub enum ExecType {
     /// Execute a command in each workspace directory
-    Workspaces(ExecSubcommand),
+    Workspaces(WorkspaceExecParameters),
     /// Execute a command in each crate directory
     Crates(CrateExecParameters),
 }
@@ -501,8 +528,11 @@ async fn list_command(list_parameters: ListParameters) -> Result<(), crate::Erro
     };
     #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
     match list_parameters.list_type {
-        ListType::Workspaces => {
+        ListType::Workspaces(params) => {
             for workspace in config.workspaces {
+                if params.no_standalone && workspace.is_standalone {
+                    continue;
+                }
                 println!(
                     "{} (standalone: {})",
                     workspace.manifest_dir.display(),
@@ -511,9 +541,22 @@ async fn list_command(list_parameters: ListParameters) -> Result<(), crate::Erro
             }
         }
         ListType::Crates(params) => {
+            let workspace_standalone_map: std::collections::HashMap<_, _> = config
+                .workspaces
+                .iter()
+                .map(|w| (w.manifest_dir.clone(), w.is_standalone))
+                .collect();
+
             for krate in config.crates {
                 if let Some(crate_type) = &params.r#type
                     && !krate.types.contains(crate_type)
+                {
+                    continue;
+                }
+                if let Some(standalone) = params.standalone
+                    && workspace_standalone_map
+                        .get(&krate.workspace_manifest_dir)
+                        .is_none_or(|&is_standalone| is_standalone != standalone)
                 {
                     continue;
                 }
@@ -733,26 +776,49 @@ async fn exec_command(exec_parameters: ExecParameters) -> Result<(), crate::Erro
     let config = Config::load()?;
 
     let (exec_type_str, dirs, command, args) = match exec_parameters.exec_type {
-        ExecType::Workspaces(subcommand) => (
-            String::from("workspaces"),
-            config
+        ExecType::Workspaces(params) => {
+            let filtered_workspaces = config
                 .workspaces
                 .into_iter()
+                .filter(|w| !params.no_standalone || !w.is_standalone)
                 .map(|w| w.manifest_dir)
-                .collect::<Vec<_>>(),
-            subcommand.command,
-            subcommand.args,
-        ),
+                .collect::<Vec<_>>();
+
+            let mut description = String::from("workspaces");
+            if params.no_standalone {
+                write!(&mut description, " that are not standalone")?;
+            }
+
+            (
+                description,
+                filtered_workspaces,
+                params.exec_subcommand.command,
+                params.exec_subcommand.args,
+            )
+        }
         ExecType::Crates(crate_params) => {
+            let workspace_standalone_map: std::collections::HashMap<_, _> = config
+                .workspaces
+                .iter()
+                .map(|w| (w.manifest_dir.clone(), w.is_standalone))
+                .collect();
             let filtered_crates = config
                 .crates
                 .into_iter()
                 .filter(|krate| {
-                    if let Some(t) = &crate_params.r#type {
-                        krate.types.contains(t)
-                    } else {
-                        true
+                    if let Some(t) = &crate_params.r#type
+                        && !krate.types.contains(t)
+                    {
+                        return false;
                     }
+                    if let Some(standalone) = crate_params.standalone
+                        && workspace_standalone_map
+                            .get(&krate.workspace_manifest_dir)
+                            .is_none_or(|&is_standalone| is_standalone != standalone)
+                    {
+                        return false;
+                    }
+                    true
                 })
                 .map(|c| c.manifest_dir)
                 .collect::<Vec<_>>();
@@ -760,6 +826,9 @@ async fn exec_command(exec_parameters: ExecParameters) -> Result<(), crate::Erro
             let mut description = String::from("crates");
             if let Some(crate_type) = &crate_params.r#type {
                 write!(&mut description, " of type {crate_type:?}")?;
+            }
+            if let Some(standalone) = crate_params.standalone {
+                write!(&mut description, " with standalone={standalone}",)?;
             }
             (
                 description,
