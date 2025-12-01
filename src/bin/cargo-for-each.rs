@@ -126,9 +126,33 @@ pub enum Error {
     /// error writing target set file
     #[error("error writing target set file: {0}")]
     CouldNotWriteTargetSetFile(#[source] std::io::Error),
+    /// error deleting target set file
+    #[error("error deleting target set file: {0}")]
+    CouldNotDeleteTargetSetFile(#[source] std::io::Error),
     /// error reading target sets dir
     #[error("error reading target sets dir: {0}")]
     CouldNotReadTargetSetsDir(#[source] std::io::Error),
+    /// error serializing plan file
+    #[error("error serializing plan file: {0}")]
+    CouldNotSerializePlanFile(#[source] toml::ser::Error),
+    /// could not create parent directories for plan file
+    #[error("could not create parent directories for plan file: {0}")]
+    CouldNotCreatePlanFileParentDirs(#[source] std::io::Error),
+    /// error writing plan file
+    #[error("error writing plan file: {0}")]
+    CouldNotWritePlanFile(#[source] std::io::Error),
+    /// error deleting plan file
+    #[error("error deleting plan file: {0}")]
+    CouldNotDeletePlanFile(#[source] std::io::Error),
+    /// error reading plan file
+    #[error("error reading plan file: {0}")]
+    CouldNotReadPlanFile(#[source] std::io::Error),
+    /// error parsing plan file
+    #[error("error parsing plan file: {0}")]
+    CouldNotParsePlanFile(#[source] toml::de::Error),
+    /// plan step is out of bounds
+    #[error("plan step {0} is out of bounds for plan with {1} steps (valid range is 1 to {1})")]
+    PlanStepOutOfBounds(usize, usize),
     /// error running cargo-metadata
     #[error("error running cargo-metadata for {0}: {1}")]
     CargoMetadataError(std::path::PathBuf, #[source] cargo_metadata::Error),
@@ -304,6 +328,22 @@ pub struct Crate {
     types: std::collections::BTreeSet<CrateType>,
 }
 
+/// represents a single step in a plan
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Step {
+    /// the command to execute
+    pub command: String,
+    /// the arguments for the command
+    pub args: Vec<String>,
+}
+
+/// represents a plan
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Plan {
+    /// the steps of the plan
+    pub steps: Vec<Step>,
+}
+
 /// represents the cargo-for-each configuration file
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Config {
@@ -395,6 +435,36 @@ fn target_sets_dir_path() -> Result<std::path::PathBuf, Error> {
     Ok(config_dir_path()?.join("target-sets"))
 }
 
+/// returns the plans dir path
+fn plans_dir_path() -> Result<std::path::PathBuf, Error> {
+    Ok(config_dir_path()?.join("plans"))
+}
+
+/// loads a plan from a file
+fn load_plan(name: &str) -> Result<Plan, Error> {
+    let plan_path = plans_dir_path()?.join(format!("{name}.toml"));
+    if plan_path.exists() {
+        let file_content =
+            fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
+        toml::from_str(&file_content).map_err(Error::CouldNotParsePlanFile)
+    } else {
+        Ok(Plan::default())
+    }
+}
+
+/// saves a plan to a file
+fn save_plan(name: &str, plan: &Plan) -> Result<(), Error> {
+    let plan_path = plans_dir_path()?.join(format!("{name}.toml"));
+    if let Some(plan_dir_path) = plan_path.parent() {
+        fs_err::create_dir_all(plan_dir_path).map_err(Error::CouldNotCreatePlanFileParentDirs)?;
+    }
+    fs_err::write(
+        &plan_path,
+        toml::to_string(plan).map_err(Error::CouldNotSerializePlanFile)?,
+    )
+    .map_err(Error::CouldNotWritePlanFile)
+}
+
 /// implementation of the target-set subcommand
 ///
 /// # Errors
@@ -402,7 +472,9 @@ fn target_sets_dir_path() -> Result<std::path::PathBuf, Error> {
 /// fails if the implementation of target-set fails
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-async fn target_set_command(target_set_parameters: TargetSetParameters) -> Result<(), crate::Error> {
+async fn target_set_command(
+    target_set_parameters: TargetSetParameters,
+) -> Result<(), crate::Error> {
     match target_set_parameters.command {
         TargetSetCommand::Create(params) => {
             let target_set = match params.target_set_type {
@@ -420,12 +492,18 @@ async fn target_set_command(target_set_parameters: TargetSetParameters) -> Resul
             )
             .map_err(Error::CouldNotWriteTargetSetFile)?;
         }
+        TargetSetCommand::Delete(params) => {
+            let target_set_path = target_sets_dir_path()?.join(format!("{}.toml", params.name));
+            fs_err::remove_file(target_set_path).map_err(Error::CouldNotDeleteTargetSetFile)?;
+        }
         TargetSetCommand::List => {
             let target_sets_dir = target_sets_dir_path()?;
             if !target_sets_dir.exists() {
                 return Ok(());
             }
-            for entry in fs_err::read_dir(target_sets_dir).map_err(Error::CouldNotReadTargetSetsDir)? {
+            for entry in
+                fs_err::read_dir(target_sets_dir).map_err(Error::CouldNotReadTargetSetsDir)?
+            {
                 let entry = entry.map_err(Error::CouldNotReadTargetSetsDir)?;
                 let path = entry.path();
                 if path.is_file()
@@ -434,8 +512,110 @@ async fn target_set_command(target_set_parameters: TargetSetParameters) -> Resul
                     && let Some(name) = path.file_stem()
                 {
                     println!("{}", name.to_string_lossy());
-                    let content = fs_err::read_to_string(&path).map_err(Error::CouldNotReadConfigFile)?;
+                    let content =
+                        fs_err::read_to_string(&path).map_err(Error::CouldNotReadConfigFile)?;
                     println!("{content}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// implementation of the plan subcommand
+///
+/// # Errors
+///
+/// fails if the implementation of plan fails
+#[instrument]
+#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
+async fn plan_step_command(plan_step_parameters: PlanStepParameters) -> Result<(), crate::Error> {
+    match plan_step_parameters.command {
+        PlanStepCommand::Add(params) => {
+            let mut plan = load_plan(&params.name)?;
+            plan.steps.push(Step {
+                command: params.command,
+                args: params.args,
+            });
+            save_plan(&params.name, &plan)?;
+        }
+        PlanStepCommand::Insert(params) => {
+            let mut plan = load_plan(&params.name)?;
+            if params.position > plan.steps.len().saturating_add(1) || params.position == 0 {
+                return Err(Error::PlanStepOutOfBounds(
+                    params.position,
+                    plan.steps.len(),
+                ));
+            }
+            plan.steps.insert(
+                params.position.saturating_sub(1),
+                Step {
+                    command: params.command,
+                    args: params.args,
+                },
+            );
+            save_plan(&params.name, &plan)?;
+        }
+        PlanStepCommand::Rm(params) => {
+            let mut plan = load_plan(&params.name)?;
+            if params.position > plan.steps.len() || params.position == 0 {
+                return Err(Error::PlanStepOutOfBounds(
+                    params.position,
+                    plan.steps.len(),
+                ));
+            }
+            plan.steps.remove(params.position.saturating_sub(1));
+            save_plan(&params.name, &plan)?;
+        }
+        PlanStepCommand::List(params) => {
+            let plan = load_plan(&params.name)?;
+            for (i, step) in plan.steps.iter().enumerate() {
+                println!(
+                    "{}: {} {}",
+                    i.saturating_add(1),
+                    step.command,
+                    step.args.join(" ")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// implementation of the plan subcommand
+///
+/// # Errors
+///
+/// fails if the implementation of plan fails
+#[instrument]
+#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
+async fn plan_command(plan_parameters: PlanParameters) -> Result<(), crate::Error> {
+    match plan_parameters.command {
+        PlanCommand::Create(params) => {
+            let plan = Plan::default();
+            save_plan(&params.name, &plan)?;
+        }
+        PlanCommand::Delete(params) => {
+            let plan_path = plans_dir_path()?.join(format!("{}.toml", params.name));
+            fs_err::remove_file(plan_path).map_err(Error::CouldNotDeletePlanFile)?;
+        }
+        PlanCommand::Step(params) => {
+            plan_step_command(params).await?;
+        }
+        PlanCommand::List => {
+            let plans_dir = plans_dir_path()?;
+            if !plans_dir.exists() {
+                return Ok(());
+            }
+            for entry in fs_err::read_dir(plans_dir).map_err(Error::CouldNotReadTargetSetsDir)? {
+                let entry = entry.map_err(Error::CouldNotReadTargetSetsDir)?;
+                let path = entry.path();
+                if path.is_file()
+                    && let Some(extension) = path.extension()
+                    && extension == "toml"
+                    && let Some(name) = path.file_stem()
+                {
+                    println!("{}", name.to_string_lossy());
                 }
             }
         }
@@ -508,11 +688,21 @@ pub struct CreateTargetSetParameters {
     pub target_set_type: TargetSetType,
 }
 
+/// Parameters for deleting a target set
+#[derive(clap::Parser, Debug, Clone)]
+pub struct DeleteTargetSetParameters {
+    /// the name of the target set
+    #[clap(long)]
+    pub name: String,
+}
+
 /// The `target-set` subcommand
 #[derive(clap::Parser, Debug, Clone)]
 pub enum TargetSetCommand {
     /// Create a new target set
     Create(CreateTargetSetParameters),
+    /// Delete a target set
+    Delete(DeleteTargetSetParameters),
     /// List existing target sets
     List,
 }
@@ -523,6 +713,114 @@ pub struct TargetSetParameters {
     /// the `target-set` subcommand to run
     #[clap(subcommand)]
     pub command: TargetSetCommand,
+}
+
+/// Parameters for creating a new plan
+#[derive(clap::Parser, Debug, Clone)]
+pub struct CreatePlanParameters {
+    /// the name of the plan
+    #[clap(long)]
+    pub name: String,
+}
+
+/// Parameters for adding a step to a plan
+#[derive(clap::Parser, Debug, Clone)]
+pub struct AddStepParameters {
+    /// the name of the plan
+    #[clap(long)]
+    pub name: String,
+    /// The command to execute.
+    #[clap(required = true)]
+    pub command: String,
+    /// The arguments for the command.
+    #[clap(last = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
+}
+
+/// Parameters for inserting a step into a plan
+#[derive(clap::Parser, Debug, Clone)]
+pub struct InsertStepParameters {
+    /// the name of the plan
+    #[clap(long)]
+    pub name: String,
+    /// the 1-based position to insert the step at (e.g., 1 to insert before the first step, N to insert before the Nth step)
+    #[clap(long)]
+    pub position: usize,
+    /// The command to execute.
+    #[clap(required = true)]
+    pub command: String,
+    /// The arguments for the command.
+    #[clap(last = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
+}
+
+/// Parameters for removing a step from a plan
+#[derive(clap::Parser, Debug, Clone)]
+pub struct RmStepParameters {
+    /// the name of the plan
+    #[clap(long)]
+    pub name: String,
+    /// the position of the step to delete
+    #[clap(long)]
+    pub position: usize,
+}
+
+/// Parameters for deleting a plan
+#[derive(clap::Parser, Debug, Clone)]
+pub struct DeletePlanParameters {
+    /// the name of the plan
+    #[clap(long)]
+    pub name: String,
+}
+
+/// Parameters for listing the steps of a plan
+#[derive(clap::Parser, Debug, Clone)]
+pub struct ListStepsParameters {
+    /// the name of the plan
+    #[clap(long)]
+    pub name: String,
+}
+
+/// The `plan step` subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub enum PlanStepCommand {
+    /// Add a step to a plan
+    Add(AddStepParameters),
+    /// Insert a step into a plan
+    Insert(InsertStepParameters),
+    /// Remove a step from a plan
+    Rm(RmStepParameters),
+    /// List the steps of a plan
+    List(ListStepsParameters),
+}
+
+/// Parameters for plan step subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct PlanStepParameters {
+    /// the `plan step` subcommand to run
+    #[clap(subcommand)]
+    pub command: PlanStepCommand,
+}
+
+/// The `plan` subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub enum PlanCommand {
+    /// Create a new plan
+    Create(CreatePlanParameters),
+    /// Delete a plan
+    Delete(DeletePlanParameters),
+    /// Manage plan steps
+    Step(PlanStepParameters),
+    /// List all plans
+    List,
+}
+
+/// Parameters for plan subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct PlanParameters {
+    /// the `plan` subcommand to run
+    #[clap(subcommand)]
+    pub command: PlanCommand,
 }
 
 /// Parameters for add subcommand
@@ -598,6 +896,8 @@ pub enum Command {
     Add(AddParameters),
     /// create a new target set
     TargetSet(TargetSetParameters),
+    /// manage plans
+    Plan(PlanParameters),
     /// refresh the config, removing old entries and adding new ones
     Refresh,
     /// Execute a command in each configured directory
@@ -1044,6 +1344,9 @@ async fn do_stuff() -> Result<(), crate::Error> {
         }
         Command::TargetSet(target_set_parameters) => {
             target_set_command(target_set_parameters).await?;
+        }
+        Command::Plan(plan_parameters) => {
+            plan_command(plan_parameters).await?;
         }
         Command::Refresh => {
             refresh_command().await?;
