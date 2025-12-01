@@ -1,7 +1,15 @@
 #![doc = include_str!("../../README.md")]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fmt::Write as _; // Required for write! macro
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+use cargo_for_each::error::Error;
+use cargo_for_each::plans::{PlanParameters, plan_command};
+use cargo_for_each::target_sets::{TargetSetParameters, target_set_command};
+use cargo_for_each::targets::{CargoMetadataExt as _, CrateType};
+use cargo_for_each::tasks::{TaskParameters, task_command};
+use cargo_for_each::{Crate, Workspace};
 
 use tracing::instrument;
 use tracing_subscriber::{
@@ -15,7 +23,7 @@ use tracing_subscriber::{
 /// for valid extensions and on other platforms it just checks for
 /// the presence of a file
 #[cfg(unix)]
-fn is_executable(path: &std::path::Path) -> bool {
+fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     fs_err::metadata(path)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -28,7 +36,7 @@ fn is_executable(path: &std::path::Path) -> bool {
 /// for valid extensions and on other platforms it just checks for
 /// the presence of a file
 #[cfg(windows)]
-fn is_executable(path: &std::path::Path) -> bool {
+fn is_executable(path: &Path) -> bool {
     // On Windows, executability is determined by file extension.
     // We check against PATHEXT environment variable.
     if path.extension().is_some() && path.is_file() {
@@ -39,7 +47,7 @@ fn is_executable(path: &std::path::Path) -> bool {
         for ext in pathexts.split(';').filter(|s| !s.is_empty()) {
             let mut path_with_ext = path.as_os_str().to_owned();
             path_with_ext.push(ext);
-            if std::path::Path::new(&path_with_ext).is_file() {
+            if Path::new(&path_with_ext).is_file() {
                 return true;
             }
         }
@@ -53,858 +61,9 @@ fn is_executable(path: &std::path::Path) -> bool {
 /// for valid extensions and on other platforms it just checks for
 /// the presence of a file
 #[cfg(all(not(unix), not(windows)))]
-fn is_executable(path: &std::path::Path) -> bool {
+fn is_executable(path: &Path) -> bool {
     // Fallback for non-unix, non-windows systems.
     path.is_file()
-}
-
-/// Error enum for the application
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    /// error reading environment variable
-    #[error("error when retrieving environment variable: {0}")]
-    EnvVarError(
-        #[source]
-        #[from]
-        std::env::VarError,
-    ),
-    /// error in clap
-    #[error("error in CLI option parsing: {0}")]
-    ClapError(
-        #[source]
-        #[from]
-        clap::Error,
-    ),
-    /// error parsing log filter
-    #[error("error parsing log filter: {0}")]
-    LogFilterParseError(
-        #[source]
-        #[from]
-        tracing_subscriber::filter::ParseError,
-    ),
-    /// error joining task
-    #[error("error joining task: {0}")]
-    JoinError(
-        #[source]
-        #[from]
-        tokio::task::JoinError,
-    ),
-    /// error constructing tracing-journald layer
-    #[cfg(target_os = "linux")]
-    #[error("error constructing tracing-journald layer: {0}")]
-    TracingJournaldError(#[source] std::io::Error),
-    /// error generating man pages
-    #[error("error generating man pages: {0}")]
-    GenerateManpageError(#[source] std::io::Error),
-    /// error generating shell completion
-    #[error("error generating shell completion: {0}")]
-    GenerateShellCompletionError(#[source] std::io::Error),
-    /// error determining user config dir
-    #[error("error determining user config dir")]
-    CouldNotDetermineUserConfigDir,
-    /// error reading config file
-    #[error("error reading config file: {0}")]
-    CouldNotReadConfigFile(#[source] std::io::Error),
-    /// could not check target set existence
-    #[error("could not check target set existence for {0}: {1}")]
-    CouldNotCheckTargetSetExistence(std::path::PathBuf, #[source] std::io::Error),
-    /// error parsing config file
-    #[error("error parsing config file: {0}")]
-    CouldNotParseConfigFile(#[source] toml::de::Error),
-    /// error serializing config file
-    #[error("error serializing config file: {0}")]
-    CouldNotSerializeConfigFile(#[source] toml::ser::Error),
-    /// error serializing target set file
-    #[error("error serializing target set file: {0}")]
-    CouldNotSerializeTargetSetFile(#[source] toml::ser::Error),
-    /// could not create parent directories for config file
-    #[error("could not create parent directories for config file: {0}")]
-    CouldNotCreateConfigFileParentDirs(#[source] std::io::Error),
-    /// could not create parent directories for target set file
-    #[error("could not create parent directories for target set file: {0}")]
-    CouldNotCreateTargetSetFileParentDirs(#[source] std::io::Error),
-    /// error writing config file
-    #[error("error writing config file: {0}")]
-    CouldNotWriteConfigFile(#[source] std::io::Error),
-    /// error writing target set file
-    #[error("error writing target set file: {0}")]
-    CouldNotWriteTargetSetFile(#[source] std::io::Error),
-    /// error removing target set file
-    #[error("error removing target set file: {0}")]
-    CouldNotRemoveTargetSetFile(#[source] std::io::Error),
-    /// error reading target sets dir
-    #[error("error reading target sets dir: {0}")]
-    CouldNotReadTargetSetsDir(#[source] std::io::Error),
-    /// error serializing plan file
-    #[error("error serializing plan file: {0}")]
-    CouldNotSerializePlanFile(#[source] toml::ser::Error),
-    /// could not create parent directories for plan file
-    #[error("could not create parent directories for plan file: {0}")]
-    CouldNotCreatePlanFileParentDirs(#[source] std::io::Error),
-    /// error writing plan file
-    #[error("error writing plan file: {0}")]
-    CouldNotWritePlanFile(#[source] std::io::Error),
-    /// error removing plan file
-    #[error("error removing plan file: {0}")]
-    CouldNotRemovePlanFile(#[source] std::io::Error),
-    /// error reading plan file
-    #[error("error reading plan file: {0}")]
-    CouldNotReadPlanFile(#[source] std::io::Error),
-    /// error parsing plan file
-    #[error("error parsing plan file: {0}")]
-    CouldNotParsePlanFile(#[source] toml::de::Error),
-    /// plan step is out of bounds
-    #[error("plan step {0} is out of bounds for plan with {1} steps (valid range is 1 to {1})")]
-    PlanStepOutOfBounds(usize, usize),
-    /// the specified task was not found
-    #[error("the specified task {0} was not found")]
-    TaskNotFound(String),
-    /// the specified plan was not found
-    #[error("the specified plan {0} was not found")]
-    PlanNotFound(String),
-    /// the specified target set was not found
-    #[error("the specified target set {0} was not found")]
-    TargetSetNotFound(String),
-    /// could not create task directory
-    #[error("could not create task directory {0}: {1}")]
-    CouldNotCreateTaskDir(std::path::PathBuf, #[source] std::io::Error),
-    /// could not copy file
-    #[error("could not copy file from {0} to {1}: {2}")]
-    CouldNotCopyFile(
-        std::path::PathBuf,
-        std::path::PathBuf,
-        #[source] std::io::Error,
-    ),
-    /// could not remove task directory
-    #[error("could not remove task directory {0}: {1}")]
-    CouldNotRemoveTaskDir(std::path::PathBuf, #[source] std::io::Error),
-    /// could not read resolved target set file
-    #[error("could not read resolved target set file {0}: {1}")]
-    CouldNotReadResolvedTargetSet(std::path::PathBuf, #[source] std::io::Error),
-    /// could not parse resolved target set file
-    #[error("could not parse resolved target set file {0}: {1}")]
-    CouldNotParseResolvedTargetSet(std::path::PathBuf, #[source] toml::de::Error),
-    /// error serializing resolved target set file
-    #[error("error serializing resolved target set file: {0}")]
-    CouldNotSerializeResolvedTargetSet(#[source] toml::ser::Error),
-    /// could not create parent directories for resolved target set file
-    #[error("could not create parent directories for resolved target set file: {0}")]
-    CouldNotCreateResolvedTargetSetParentDirs(#[source] std::io::Error),
-    /// error writing resolved target set file
-    #[error("error writing resolved target set file: {0}")]
-    CouldNotWriteResolvedTargetSet(#[source] std::io::Error),
-    /// error running cargo-metadata
-    #[error("error running cargo-metadata for {0}: {1}")]
-    CargoMetadataError(std::path::PathBuf, #[source] cargo_metadata::Error),
-    /// error turning a relative manifest path into an absolute one
-    #[error("error turning the relative manifest path {0} into an absolute one: {1}")]
-    CouldNotDetermineAbsoluteManifestPath(std::path::PathBuf, #[source] std::io::Error),
-    /// error turning a absolute manifest path into a canonical one
-    #[error("error turning the absolute manifest path {0} into a canonical one: {1}")]
-    CouldNotDetermineCanonicalManifestPath(std::path::PathBuf, #[source] std::io::Error),
-    /// the given manifest path has no parent directory
-    #[error("the given manifest path {0} has no parent directory")]
-    ManifestPathHasNoParentDir(std::path::PathBuf),
-    /// the target set/plan/task of the given name already exists
-    #[error("{0} already exists")]
-    AlreadyExists(String),
-    /// we called cargo metadata on a directory with a Cargo.toml
-    /// but the output did not contain a package with the manifest_path
-    /// pointing to that Cargo.toml
-    #[error(
-        "found no package with manifest_path matching local Cargo.toml in cargo metadata output: {0}"
-    )]
-    FoundNoPackageInCargoMetadataWithCurrentManifestPath(std::path::PathBuf),
-    /// we called cargo metadata for a given manifest_path
-    /// but the output did not contain a package with the manifest_path
-    /// pointing to that Cargo.toml
-    #[error("found no package with manifest_path matching {0} in cargo metadata output")]
-    FoundNoPackageInCargoMetadataWithGivenManifestPath(std::path::PathBuf),
-    /// metadata did not include a package with the given package id
-    #[error("cargo metadata did not include a package with the package id {0}")]
-    FoundNoPackageInCargoMetadataWithPackageId(cargo_metadata::PackageId),
-    /// error executing a command
-    #[error("error executing command `{command:?}` in `{manifest_dir}`: {source}")]
-    CommandExecutionError {
-        /// The directory in which the command was attempted to be executed.
-        manifest_dir: std::path::PathBuf,
-        /// The command and its arguments that were attempted to be executed.
-        command: Vec<String>,
-        /// The underlying I/O error that occurred.
-        #[source]
-        source: std::io::Error,
-    },
-    /// The specified command was not found in PATH
-    #[error("command not found: {0}")]
-    CommandNotFound(String),
-    /// error formatting a string
-    #[error("error formatting a string: {0}")]
-    FmtError(#[from] std::fmt::Error),
-}
-
-/// an extension trait on Cargo Metadata that allows easy retrieval
-/// of a few pieces of information we need regularly
-pub trait CargoMetadataExt {
-    /// allows retrieval of a package by the manifest_path of its Cargo.toml
-    ///
-    /// this is usually required to get our own package in a workspace Metadata
-    /// object that includes multiple packages
-    ///
-    /// # Errors
-    ///
-    /// fails if there is no package like that
-    fn get_package_by_manifest_path(
-        &self,
-        manifest_path: &std::path::Path,
-    ) -> Result<&cargo_metadata::Package, Error>;
-
-    /// allows retrieval of a package by the package id
-    ///
-    /// this is usually required to retrieve the package object
-    /// for package ids mentioned in e.g. workspace members
-    ///
-    /// # Errors
-    ///
-    /// fails if there is no package like that
-    fn get_package_by_id(
-        &self,
-        package_id: &cargo_metadata::PackageId,
-    ) -> Result<&cargo_metadata::Package, Error>;
-}
-
-impl CargoMetadataExt for cargo_metadata::Metadata {
-    fn get_package_by_manifest_path(
-        &self,
-        manifest_path: &std::path::Path,
-    ) -> Result<&cargo_metadata::Package, Error> {
-        let Some(package) = self
-            .packages
-            .iter()
-            .find(|p| p.manifest_path == manifest_path)
-        else {
-            return Err(Error::FoundNoPackageInCargoMetadataWithCurrentManifestPath(
-                manifest_path.to_owned(),
-            ));
-        };
-        Ok(package)
-    }
-
-    fn get_package_by_id(
-        &self,
-        package_id: &cargo_metadata::PackageId,
-    ) -> Result<&cargo_metadata::Package, Error> {
-        let Some(package) = self.packages.iter().find(|p| p.id == *package_id) else {
-            return Err(Error::FoundNoPackageInCargoMetadataWithPackageId(
-                package_id.to_owned(),
-            ));
-        };
-        Ok(package)
-    }
-}
-
-/// an extension trait on Cargo Metadata Packages that allows easy retrieval of a
-/// few pieces of information we need regularly
-pub trait CargoPackageExt {
-    /// allows checking if this package has at least one target of the specified kind
-    #[must_use]
-    fn has_target(&self, target_kind: &cargo_metadata::TargetKind) -> bool;
-}
-
-impl CargoPackageExt for cargo_metadata::Package {
-    fn has_target(&self, target_kind: &cargo_metadata::TargetKind) -> bool {
-        self.targets.iter().any(|t| t.kind.contains(target_kind))
-    }
-}
-
-/// represents a Rust workspace
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Workspace {
-    /// the directory that contains the workspace Cargo.toml file
-    manifest_dir: std::path::PathBuf,
-    /// is this a standalone crate workspace
-    is_standalone: bool,
-}
-
-/// represents the type of Rust crate
-#[derive(
-    Debug,
-    Clone,
-    Hash,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
-    clap::ValueEnum,
-)]
-pub enum CrateType {
-    /// a binary crate
-    Bin,
-    /// a library crate
-    Lib,
-    /// a proc-macro crate
-    ProcMacro,
-}
-
-impl CrateType {
-    /// determine the set of `CrateType` for a given package
-    #[must_use]
-    pub fn from_package(package: &cargo_metadata::Package) -> BTreeSet<Self> {
-        let mut crate_types = BTreeSet::new();
-        if package.has_target(&cargo_metadata::TargetKind::Bin) {
-            crate_types.insert(Self::Bin);
-        }
-        if package.has_target(&cargo_metadata::TargetKind::Lib) {
-            crate_types.insert(Self::Lib);
-        }
-        if package.has_target(&cargo_metadata::TargetKind::ProcMacro) {
-            crate_types.insert(Self::ProcMacro);
-        }
-        crate_types
-    }
-}
-
-/// represents a Rust crate
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Crate {
-    /// the directory that contains the crate Cargo.toml file
-    manifest_dir: std::path::PathBuf,
-    /// the directory that contains the workspace Cargo.toml file for this crate
-    workspace_manifest_dir: std::path::PathBuf,
-    /// the types of this crate (only bin and lib can be combined so this should have at most two members)
-    types: std::collections::BTreeSet<CrateType>,
-}
-
-/// represents a single step in a plan
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Step {
-    /// the command to execute
-    pub command: String,
-    /// the arguments for the command
-    pub args: Vec<String>,
-}
-
-/// represents a plan
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct Plan {
-    /// the steps of the plan
-    pub steps: Vec<Step>,
-}
-
-/// represents a target within a resolved target set
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Target {
-    /// the manifest directory of the target
-    pub manifest_dir: std::path::PathBuf,
-    /// the manifest directories of the targets that this target depends on
-    pub dependencies: Vec<std::path::PathBuf>,
-}
-
-/// represents a resolved target set
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ResolvedTargetSet {
-    /// the targets of the resolved target set
-    pub targets: Vec<Target>,
-}
-
-/// represents the cargo-for-each configuration file
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct Config {
-    /// represents all the workspaces we know about
-    workspaces: Vec<Workspace>,
-    /// presents all the crates we know about
-    crates: Vec<Crate>,
-}
-
-impl Config {
-    /// adds a workspace to the config if it is not already present
-    pub fn add_workspace(&mut self, workspace: Workspace) {
-        if self
-            .workspaces
-            .iter()
-            .any(|w| w.manifest_dir == workspace.manifest_dir)
-        {
-            tracing::debug!(
-                "Workspace at {} already exists, not adding.",
-                workspace.manifest_dir.display()
-            );
-        } else {
-            tracing::debug!(
-                "Adding new workspace at {}",
-                workspace.manifest_dir.display()
-            );
-            self.workspaces.push(workspace);
-        }
-    }
-
-    /// adds a crate to the config, ignoring the new one if one with the same manifest directory already exists
-    pub fn add_crate(&mut self, krate: Crate) {
-        if self
-            .crates
-            .iter()
-            .any(|c| c.manifest_dir == krate.manifest_dir)
-        {
-            tracing::debug!(
-                "Crate at {} already exists, not adding.",
-                krate.manifest_dir.display()
-            );
-        } else {
-            tracing::debug!("Adding new crate at {}", krate.manifest_dir.display());
-            self.crates.push(krate);
-        }
-    }
-
-    /// Load the config file
-    fn load() -> Result<Self, Error> {
-        let config_file_path = config_file()?;
-        if fs_err::exists(&config_file_path).map_err(Error::CouldNotReadConfigFile)? {
-            let file_content =
-                fs_err::read_to_string(&config_file_path).map_err(Error::CouldNotReadConfigFile)?;
-            toml::from_str(&file_content).map_err(Error::CouldNotParseConfigFile)
-        } else {
-            Ok(Self::default())
-        }
-    }
-
-    /// Save the config file
-    fn save(&self) -> Result<(), Error> {
-        let config_file_path = config_file()?;
-        if let Some(config_dir_path) = config_file_path.parent() {
-            fs_err::create_dir_all(config_dir_path)
-                .map_err(Error::CouldNotCreateConfigFileParentDirs)?;
-        }
-        fs_err::write(
-            &config_file_path,
-            toml::to_string(self).map_err(Error::CouldNotSerializeConfigFile)?,
-        )
-        .map_err(Error::CouldNotWriteConfigFile)
-    }
-}
-
-/// returns the config dir path
-fn config_dir_path() -> Result<std::path::PathBuf, Error> {
-    Ok(dirs::config_dir()
-        .ok_or(Error::CouldNotDetermineUserConfigDir)?
-        .join("cargo-for-each"))
-}
-
-/// returns the config file path
-fn config_file() -> Result<std::path::PathBuf, Error> {
-    Ok(config_dir_path()?.join("cargo-for-each.toml"))
-}
-
-/// returns the target sets dir path
-fn target_sets_dir_path() -> Result<std::path::PathBuf, Error> {
-    Ok(config_dir_path()?.join("target-sets"))
-}
-
-/// returns the plans dir path
-fn plans_dir_path() -> Result<std::path::PathBuf, Error> {
-    Ok(config_dir_path()?.join("plans"))
-}
-
-/// returns the tasks dir path
-fn tasks_dir_path() -> Result<std::path::PathBuf, Error> {
-    Ok(config_dir_path()?.join("tasks"))
-}
-
-/// returns the path to a specific task directory
-fn task_dir_path(name: &str) -> Result<std::path::PathBuf, Error> {
-    Ok(tasks_dir_path()?.join(name))
-}
-
-/// loads a plan from a file
-fn load_plan(name: &str) -> Result<Plan, Error> {
-    let plan_path = plans_dir_path()?.join(format!("{name}.toml"));
-    if plan_path.exists() {
-        let file_content =
-            fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
-        toml::from_str(&file_content).map_err(Error::CouldNotParsePlanFile)
-    } else {
-        Ok(Plan::default())
-    }
-}
-
-/// saves a plan to a file
-fn save_plan(name: &str, plan: &Plan) -> Result<(), Error> {
-    let plan_path = plans_dir_path()?.join(format!("{name}.toml"));
-    if plan_path.exists() {
-        return Err(Error::AlreadyExists(format!("plan {name}")));
-    }
-    if let Some(plan_dir_path) = plan_path.parent() {
-        fs_err::create_dir_all(plan_dir_path).map_err(Error::CouldNotCreatePlanFileParentDirs)?;
-    }
-    fs_err::write(
-        &plan_path,
-        toml::to_string(plan).map_err(Error::CouldNotSerializePlanFile)?,
-    )
-    .map_err(Error::CouldNotWritePlanFile)
-}
-
-/// loads a target set from a file
-fn load_target_set(name: &str) -> Result<TargetSet, Error> {
-    let target_set_path = target_sets_dir_path()?.join(format!("{name}.toml"));
-    if fs_err::exists(&target_set_path)
-        .map_err(|e| Error::CouldNotCheckTargetSetExistence(target_set_path.clone(), e))?
-    {
-        let file_content =
-            fs_err::read_to_string(&target_set_path).map_err(Error::CouldNotReadConfigFile)?;
-        toml::from_str(&file_content).map_err(Error::CouldNotParseConfigFile)
-    } else {
-        Err(Error::TargetSetNotFound(name.to_string()))
-    }
-}
-
-/// resolves a target set to a list of manifest directories
-fn resolve_target_set(target_set: &TargetSet, config: &Config) -> Result<ResolvedTargetSet, Error> {
-    let initial_manifest_dirs: Vec<std::path::PathBuf> = match target_set {
-        TargetSet::Workspaces(params) => config
-            .workspaces
-            .iter()
-            .filter(|w| !params.no_standalone || !w.is_standalone)
-            .map(|w| w.manifest_dir.clone())
-            .collect(),
-        TargetSet::Crates(params) => {
-            let workspace_standalone_map: HashMap<_, _> = config
-                .workspaces
-                .iter()
-                .map(|w| (w.manifest_dir.clone(), w.is_standalone))
-                .collect();
-            config
-                .crates
-                .iter()
-                .filter(|krate| {
-                    if let Some(t) = &params.r#type
-                        && !krate.types.contains(t)
-                    {
-                        return false;
-                    }
-                    if let Some(standalone) = params.standalone
-                        && workspace_standalone_map
-                            .get(&krate.workspace_manifest_dir)
-                            .is_none_or(|&is_standalone| is_standalone != standalone)
-                    {
-                        return false;
-                    }
-                    true
-                })
-                .map(|c| c.manifest_dir.clone())
-                .collect()
-        }
-    };
-
-    let target_manifest_paths_set: HashSet<std::path::PathBuf> =
-        initial_manifest_dirs.iter().cloned().collect();
-
-    // Collect all packages from all initial_manifest_dirs into a single map
-    let mut all_packages: HashMap<cargo_metadata::PackageId, cargo_metadata::Package> =
-        HashMap::new();
-    let mut package_name_to_id: HashMap<String, cargo_metadata::PackageId> = HashMap::new();
-
-    for manifest_dir in &initial_manifest_dirs {
-        let metadata = cargo_metadata::MetadataCommand::new()
-            .manifest_path(manifest_dir.join("Cargo.toml"))
-            .exec()
-            .map_err(|e| Error::CargoMetadataError(manifest_dir.clone(), e))?;
-
-        for package in metadata.packages {
-            all_packages.insert(package.id.clone(), package.clone());
-            package_name_to_id.insert(package.name.to_string(), package.id.clone());
-        }
-    }
-
-    let mut targets: Vec<Target> = Vec::new();
-
-    for manifest_dir in &initial_manifest_dirs {
-        // Find the package corresponding to the current manifest_dir
-        let current_package_id = package_name_to_id
-            .iter()
-            .find_map(|(_name, id)| {
-                let package = all_packages.get(id)?;
-                // Compare canonicalized paths to avoid issues with different path representations
-                let package_manifest_dir = package
-                    .manifest_path
-                    .parent()
-                    .ok_or_else(|| {
-                        Error::ManifestPathHasNoParentDir(
-                            package.manifest_path.clone().into_std_path_buf(),
-                        )
-                    })
-                    .ok()?; // Use ok() to turn into Option for find_map
-                let canonical_package_manifest_dir =
-                    fs_err::canonicalize(package_manifest_dir).ok()?; // Use ok()
-
-                let canonical_manifest_dir = fs_err::canonicalize(manifest_dir.clone()).ok()?; // Use ok()
-
-                if canonical_package_manifest_dir == canonical_manifest_dir {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                Error::FoundNoPackageInCargoMetadataWithGivenManifestPath(manifest_dir.clone())
-            })?;
-
-        let current_package = all_packages.get(&current_package_id).ok_or_else(|| {
-            Error::FoundNoPackageInCargoMetadataWithGivenManifestPath(manifest_dir.clone())
-        })?; // Should not happen if current_package_id was found
-
-        let mut dependencies: Vec<std::path::PathBuf> = Vec::new();
-
-        for dep in &current_package.dependencies {
-            if let Some(dep_package_id) = package_name_to_id.get(&dep.name)
-                && let Some(dep_package) = all_packages.get(dep_package_id)
-            {
-                let dep_manifest_path = dep_package
-                    .manifest_path
-                    .parent()
-                    .ok_or_else(|| {
-                        Error::ManifestPathHasNoParentDir(
-                            dep_package.manifest_path.clone().into_std_path_buf(),
-                        )
-                    })?
-                    .canonicalize()
-                    .map_err(|e| {
-                        Error::CouldNotDetermineCanonicalManifestPath(
-                            dep_package.manifest_path.clone().into_std_path_buf(),
-                            e,
-                        )
-                    })?;
-
-                if target_manifest_paths_set.contains(&dep_manifest_path) {
-                    dependencies.push(dep_manifest_path);
-                }
-            }
-        }
-        targets.push(Target {
-            manifest_dir: manifest_dir.clone(),
-            dependencies,
-        });
-    }
-
-    Ok(ResolvedTargetSet { targets })
-}
-
-/// implementation of the task create subcommand
-///
-/// # Errors
-///
-/// fails if the implementation of task create fails
-#[instrument]
-async fn task_create_command(params: CreateTaskParameters) -> Result<(), crate::Error> {
-    // 1. Validate plan and target-set existence.
-    let plan_file_path = plans_dir_path()?.join(format!("{}.toml", params.plan));
-    if !plan_file_path.exists() {
-        return Err(Error::PlanNotFound(params.plan));
-    }
-
-    let target_set_file_path = target_sets_dir_path()?.join(format!("{}.toml", params.target_set));
-    if !target_set_file_path.exists() {
-        return Err(Error::TargetSetNotFound(params.target_set));
-    }
-
-    // 2. Load the Config
-    let config = Config::load()?;
-
-    // 3. Load the TargetSet.
-    let target_set = load_target_set(&params.target_set)?;
-
-    // 4. Resolve the TargetSet.
-    let resolved_target_set = resolve_target_set(&target_set, &config)?;
-
-    // 5. Create the task directory.
-    let task_dir = task_dir_path(&params.name)?;
-    if task_dir.exists() {
-        return Err(Error::AlreadyExists(format!("task {}", params.name)));
-    }
-    fs_err::create_dir_all(&task_dir)
-        .map_err(|e| Error::CouldNotCreateTaskDir(task_dir.clone(), e))?;
-
-    // 6. Copy plan and target-set files.
-    fs_err::copy(&plan_file_path, task_dir.join("plan.toml")).map_err(|e| {
-        Error::CouldNotCopyFile(plan_file_path.clone(), task_dir.join("plan.toml"), e)
-    })?;
-
-    fs_err::copy(&target_set_file_path, task_dir.join("target-set.toml")).map_err(|e| {
-        Error::CouldNotCopyFile(
-            target_set_file_path.clone(),
-            task_dir.join("target-set.toml"),
-            e,
-        )
-    })?;
-
-    // 7. Save the resolved target set to `resolved-target-set.toml`.
-    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
-    fs_err::write(
-        &resolved_target_set_path,
-        toml::to_string(&resolved_target_set).map_err(Error::CouldNotSerializeResolvedTargetSet)?,
-    )
-    .map_err(Error::CouldNotWriteResolvedTargetSet)?;
-
-    Ok(())
-}
-
-/// implementation of the target-set subcommand
-///
-/// # Errors
-///
-/// fails if the implementation of target-set fails
-#[instrument]
-#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-async fn target_set_command(
-    target_set_parameters: TargetSetParameters,
-) -> Result<(), crate::Error> {
-    match target_set_parameters.command {
-        TargetSetCommand::Create(params) => {
-            let target_set = match params.target_set_type {
-                TargetSetType::Crates(params) => TargetSet::Crates(params),
-                TargetSetType::Workspaces(params) => TargetSet::Workspaces(params),
-            };
-            let target_set_path = target_sets_dir_path()?.join(format!("{}.toml", params.name));
-            if target_set_path.exists() {
-                return Err(Error::AlreadyExists(format!("target set {}", params.name)));
-            }
-            if let Some(target_set_dir_path) = target_set_path.parent() {
-                fs_err::create_dir_all(target_set_dir_path)
-                    .map_err(Error::CouldNotCreateTargetSetFileParentDirs)?;
-            }
-            fs_err::write(
-                &target_set_path,
-                toml::to_string(&target_set).map_err(Error::CouldNotSerializeTargetSetFile)?,
-            )
-            .map_err(Error::CouldNotWriteTargetSetFile)?;
-        }
-        TargetSetCommand::Remove(params) => {
-            let target_set_path = target_sets_dir_path()?.join(format!("{}.toml", params.name));
-            fs_err::remove_file(target_set_path).map_err(Error::CouldNotRemoveTargetSetFile)?;
-        }
-        TargetSetCommand::List => {
-            let target_sets_dir = target_sets_dir_path()?;
-            if !target_sets_dir.exists() {
-                return Ok(());
-            }
-            for entry in
-                fs_err::read_dir(target_sets_dir).map_err(Error::CouldNotReadTargetSetsDir)?
-            {
-                let entry = entry.map_err(Error::CouldNotReadTargetSetsDir)?;
-                let path = entry.path();
-                if path.is_file()
-                    && let Some(extension) = path.extension()
-                    && extension == "toml"
-                    && let Some(name) = path.file_stem()
-                {
-                    println!("{}", name.to_string_lossy());
-                    let content =
-                        fs_err::read_to_string(&path).map_err(Error::CouldNotReadConfigFile)?;
-                    println!("{content}");
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// implementation of the plan subcommand
-///
-/// # Errors
-///
-/// fails if the implementation of plan fails
-#[instrument]
-#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-async fn plan_step_command(plan_step_parameters: PlanStepParameters) -> Result<(), crate::Error> {
-    match plan_step_parameters.command {
-        PlanStepCommand::Add(params) => {
-            let mut plan = load_plan(&params.name)?;
-            plan.steps.push(Step {
-                command: params.command,
-                args: params.args,
-            });
-            save_plan(&params.name, &plan)?;
-        }
-        PlanStepCommand::Insert(params) => {
-            let mut plan = load_plan(&params.name)?;
-            if params.position > plan.steps.len().saturating_add(1) || params.position == 0 {
-                return Err(Error::PlanStepOutOfBounds(
-                    params.position,
-                    plan.steps.len(),
-                ));
-            }
-            plan.steps.insert(
-                params.position.saturating_sub(1),
-                Step {
-                    command: params.command,
-                    args: params.args,
-                },
-            );
-            save_plan(&params.name, &plan)?;
-        }
-        PlanStepCommand::Remove(params) => {
-            let mut plan = load_plan(&params.name)?;
-            if params.position > plan.steps.len() || params.position == 0 {
-                return Err(Error::PlanStepOutOfBounds(
-                    params.position,
-                    plan.steps.len(),
-                ));
-            }
-            plan.steps.remove(params.position.saturating_sub(1));
-            save_plan(&params.name, &plan)?;
-        }
-        PlanStepCommand::List(params) => {
-            let plan = load_plan(&params.name)?;
-            for (i, step) in plan.steps.iter().enumerate() {
-                println!(
-                    "{}: {} {}",
-                    i.saturating_add(1),
-                    step.command,
-                    step.args.join(" ")
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-/// implementation of the plan subcommand
-///
-/// # Errors
-///
-/// fails if the implementation of plan fails
-#[instrument]
-#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-async fn plan_command(plan_parameters: PlanParameters) -> Result<(), crate::Error> {
-    match plan_parameters.command {
-        PlanCommand::Create(params) => {
-            let plan = Plan::default();
-            save_plan(&params.name, &plan)?;
-        }
-        PlanCommand::Delete(params) => {
-            let plan_path = plans_dir_path()?.join(format!("{}.toml", params.name));
-            fs_err::remove_file(plan_path).map_err(Error::CouldNotRemovePlanFile)?;
-        }
-        PlanCommand::Step(params) => {
-            plan_step_command(params).await?;
-        }
-        PlanCommand::List => {
-            let plans_dir = plans_dir_path()?;
-            if !plans_dir.exists() {
-                return Ok(());
-            }
-            for entry in fs_err::read_dir(plans_dir).map_err(Error::CouldNotReadTargetSetsDir)? {
-                let entry = entry.map_err(Error::CouldNotReadTargetSetsDir)?;
-                let path = entry.path();
-                if path.is_file()
-                    && let Some(extension) = path.extension()
-                    && extension == "toml"
-                    && let Some(name) = path.file_stem()
-                {
-                    println!("{}", name.to_string_lossy());
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Parameters for listing crates
@@ -943,215 +102,12 @@ pub struct ListParameters {
     pub list_type: ListType,
 }
 
-/// an enum that describes a set of targets
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum TargetSet {
-    /// a set of crates
-    Crates(CrateListParameters),
-    /// a set of workspaces
-    Workspaces(WorkspaceListParameters),
-}
-
-/// The type of target set to create
-#[derive(clap::Parser, Debug, Clone)]
-pub enum TargetSetType {
-    /// a set of workspaces
-    Workspaces(WorkspaceListParameters),
-    /// a set of crates
-    Crates(CrateListParameters),
-}
-
-/// Parameters for target-set subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub struct CreateTargetSetParameters {
-    /// the name of the target set
-    #[clap(long)]
-    pub name: String,
-    /// the type of target set to create
-    #[clap(subcommand)]
-    pub target_set_type: TargetSetType,
-}
-
-/// Parameters for deleting a target set
-#[derive(clap::Parser, Debug, Clone)]
-pub struct RemoveTargetSetParameters {
-    /// the name of the target set
-    #[clap(long)]
-    pub name: String,
-}
-
-/// The `target-set` subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub enum TargetSetCommand {
-    /// Create a new target set
-    Create(CreateTargetSetParameters),
-    /// Remove a target set
-    Remove(RemoveTargetSetParameters),
-    /// List existing target sets
-    List,
-}
-
-/// Parameters for target-set subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub struct TargetSetParameters {
-    /// the `target-set` subcommand to run
-    #[clap(subcommand)]
-    pub command: TargetSetCommand,
-}
-
-/// Parameters for creating a new plan
-#[derive(clap::Parser, Debug, Clone)]
-pub struct CreatePlanParameters {
-    /// the name of the plan
-    #[clap(long)]
-    pub name: String,
-}
-
-/// Parameters for adding a step to a plan
-#[derive(clap::Parser, Debug, Clone)]
-pub struct AddStepParameters {
-    /// the name of the plan
-    #[clap(long)]
-    pub name: String,
-    /// The command to execute.
-    #[clap(required = true)]
-    pub command: String,
-    /// The arguments for the command.
-    #[clap(last = true, allow_hyphen_values = true)]
-    pub args: Vec<String>,
-}
-
-/// Parameters for inserting a step into a plan
-#[derive(clap::Parser, Debug, Clone)]
-pub struct InsertStepParameters {
-    /// the name of the plan
-    #[clap(long)]
-    pub name: String,
-    /// the 1-based position to insert the step at (e.g., 1 to insert before the first step, N to insert before the Nth step)
-    #[clap(long)]
-    pub position: usize,
-    /// The command to execute.
-    #[clap(required = true)]
-    pub command: String,
-    /// The arguments for the command.
-    #[clap(last = true, allow_hyphen_values = true)]
-    pub args: Vec<String>,
-}
-
-/// Parameters for removing a step from a plan
-#[derive(clap::Parser, Debug, Clone)]
-pub struct RemoveStepParameters {
-    /// the name of the plan
-    #[clap(long)]
-    pub name: String,
-    /// the position of the step to delete
-    #[clap(long)]
-    pub position: usize,
-}
-
-/// Parameters for deleting a plan
-#[derive(clap::Parser, Debug, Clone)]
-pub struct DeletePlanParameters {
-    /// the name of the plan
-    #[clap(long)]
-    pub name: String,
-}
-
-/// Parameters for listing the steps of a plan
-#[derive(clap::Parser, Debug, Clone)]
-pub struct ListStepsParameters {
-    /// the name of the plan
-    #[clap(long)]
-    pub name: String,
-}
-
-/// The `plan step` subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub enum PlanStepCommand {
-    /// Add a step to a plan
-    Add(AddStepParameters),
-    /// Insert a step into a plan
-    Insert(InsertStepParameters),
-    /// Remove a step from a plan
-    Remove(RemoveStepParameters),
-    /// List the steps of a plan
-    List(ListStepsParameters),
-}
-
-/// Parameters for plan step subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub struct PlanStepParameters {
-    /// the `plan step` subcommand to run
-    #[clap(subcommand)]
-    pub command: PlanStepCommand,
-}
-
-/// The `plan` subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub enum PlanCommand {
-    /// Create a new plan
-    Create(CreatePlanParameters),
-    /// Delete a plan
-    Delete(DeletePlanParameters),
-    /// Manage plan steps
-    Step(PlanStepParameters),
-    /// List all plans
-    List,
-}
-
-/// Parameters for plan subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub struct PlanParameters {
-    /// the `plan` subcommand to run
-    #[clap(subcommand)]
-    pub command: PlanCommand,
-}
-
-/// Parameters for creating a new task
-#[derive(clap::Parser, Debug, Clone)]
-pub struct CreateTaskParameters {
-    /// the name of the task
-    #[clap(long)]
-    pub name: String,
-    /// the name of the plan to use for the task
-    #[clap(long)]
-    pub plan: String,
-    /// the name of the target set to use for the task
-    #[clap(long)]
-    pub target_set: String,
-}
-
-/// The `task` subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub enum TaskCommand {
-    /// Create a new task
-    Create(CreateTaskParameters),
-    /// Remove a task
-    Remove(RemoveTaskParameters),
-}
-
-/// Parameters for removing a task
-#[derive(clap::Parser, Debug, Clone)]
-pub struct RemoveTaskParameters {
-    /// the name of the task
-    #[clap(long)]
-    pub name: String,
-}
-
-/// Parameters for task subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub struct TaskParameters {
-    /// the `task` subcommand to run
-    #[clap(subcommand)]
-    pub command: TaskCommand,
-}
-
 /// Parameters for add subcommand
 #[derive(clap::Parser, Debug, Clone)]
 pub struct AddParameters {
     /// the manifest file to add, if it refers to a workspace manifest all crates in the workspace are added too
     #[clap(long)]
-    pub manifest_path: std::path::PathBuf,
+    pub manifest_path: PathBuf,
 }
 
 /// Parameters for exec subcommand
@@ -1231,13 +187,13 @@ pub enum Command {
     GenerateManpage {
         /// target dir for man page generation
         #[clap(long)]
-        output_dir: std::path::PathBuf,
+        output_dir: PathBuf,
     },
     /// Generate shell completion
     GenerateShellCompletion {
         /// output file for shell completion generation
         #[clap(long)]
-        output_file: std::path::PathBuf,
+        output_file: PathBuf,
         /// which shell
         #[clap(long)]
         shell: clap_complete::aot::Shell,
@@ -1263,9 +219,9 @@ struct Options {
 ///
 /// fails if the implementation of list fails
 #[instrument]
-async fn list_command(list_parameters: ListParameters) -> Result<(), crate::Error> {
+async fn list_command(list_parameters: ListParameters) -> Result<(), Error> {
     #[expect(clippy::print_stderr, reason = "This is part of the UI, not logging")]
-    let Ok(config) = Config::load() else {
+    let Ok(config) = cargo_for_each::Config::load() else {
         eprintln!("No config file found, nothing to list");
         return Ok(());
     };
@@ -1284,7 +240,7 @@ async fn list_command(list_parameters: ListParameters) -> Result<(), crate::Erro
             }
         }
         ListType::Crates(params) => {
-            let workspace_standalone_map: std::collections::HashMap<_, _> = config
+            let workspace_standalone_map: HashMap<_, _> = config
                 .workspaces
                 .iter()
                 .map(|w| (w.manifest_dir.clone(), w.is_standalone))
@@ -1329,8 +285,8 @@ async fn list_command(list_parameters: ListParameters) -> Result<(), crate::Erro
 ///
 /// fails if the implementation of add fails
 #[instrument]
-async fn add_command(add_parameters: AddParameters) -> Result<(), crate::Error> {
-    let mut config = Config::load()?;
+async fn add_command(add_parameters: AddParameters) -> Result<(), Error> {
+    let mut config = cargo_for_each::Config::load()?;
     let manifest_path =
         std::path::absolute(add_parameters.manifest_path.clone()).map_err(|err| {
             Error::CouldNotDetermineAbsoluteManifestPath(add_parameters.manifest_path, err)
@@ -1416,8 +372,8 @@ async fn add_command(add_parameters: AddParameters) -> Result<(), crate::Error> 
 ///
 /// fails if the implementation of refresh fails
 #[instrument]
-async fn refresh_command() -> Result<(), crate::Error> {
-    let mut config = Config::load()?;
+async fn refresh_command() -> Result<(), Error> {
+    let mut config = cargo_for_each::Config::load()?;
 
     // 1. Remove workspaces that no longer exist.
     let (retained_workspaces, removed_workspaces): (Vec<_>, Vec<_>) = config
@@ -1515,8 +471,8 @@ async fn refresh_command() -> Result<(), crate::Error> {
 ///
 /// fails if the implementation of exec fails
 #[instrument]
-async fn exec_command(exec_parameters: ExecParameters) -> Result<(), crate::Error> {
-    let config = Config::load()?;
+async fn exec_command(exec_parameters: ExecParameters) -> Result<(), Error> {
+    let config = cargo_for_each::Config::load()?;
 
     let (exec_type_str, dirs, command, args) = match exec_parameters.exec_type {
         ExecType::Workspaces(params) => {
@@ -1540,7 +496,7 @@ async fn exec_command(exec_parameters: ExecParameters) -> Result<(), crate::Erro
             )
         }
         ExecType::Crates(crate_params) => {
-            let workspace_standalone_map: std::collections::HashMap<_, _> = config
+            let workspace_standalone_map: HashMap<_, _> = config
                 .workspaces
                 .iter()
                 .map(|w| (w.manifest_dir.clone(), w.is_standalone))
@@ -1590,7 +546,7 @@ async fn exec_command(exec_parameters: ExecParameters) -> Result<(), crate::Erro
     );
 
     // Check if command exists and is executable before iterating
-    let command_path = std::path::Path::new(&command);
+    let command_path = Path::new(&command);
     let command_is_executable = if command_path.is_absolute() {
         is_executable(command_path)
     } else {
@@ -1648,33 +604,13 @@ async fn exec_command(exec_parameters: ExecParameters) -> Result<(), crate::Erro
     Ok(())
 }
 
-/// implementation of the task subcommand
-///
-/// # Errors
-///
-/// fails if the implementation of task fails
-#[instrument]
-async fn task_command(task_parameters: TaskParameters) -> Result<(), crate::Error> {
-    match task_parameters.command {
-        TaskCommand::Create(params) => {
-            task_create_command(params).await?;
-        }
-        TaskCommand::Remove(params) => {
-            let task_dir = task_dir_path(&params.name)?;
-            fs_err::remove_dir_all(&task_dir)
-                .map_err(|e| Error::CouldNotRemoveTaskDir(task_dir.clone(), e))?;
-        }
-    }
-    Ok(())
-}
-
 /// The main behaviour of the binary should go here
 ///
 /// # Errors
 ///
 /// fails if the main behavior of the application fails
 #[instrument]
-async fn do_stuff() -> Result<(), crate::Error> {
+async fn do_stuff() -> Result<(), Error> {
     let options = <Options as clap::Parser>::parse();
     tracing::debug!("{:#?}", options);
 
@@ -1705,11 +641,11 @@ async fn do_stuff() -> Result<(), crate::Error> {
         Command::GenerateManpage { output_dir } => {
             // generate man pages
             clap_mangen::generate_to(<Options as clap::CommandFactory>::command(), output_dir)
-                .map_err(crate::Error::GenerateManpageError)?;
+                .map_err(Error::GenerateManpageError)?;
         }
         Command::GenerateShellCompletion { output_file, shell } => {
-            let mut f = std::fs::File::create(output_file)
-                .map_err(crate::Error::GenerateShellCompletionError)?;
+            let mut f =
+                std::fs::File::create(output_file).map_err(Error::GenerateShellCompletionError)?;
             let mut c = <Options as clap::CommandFactory>::command();
             clap_complete::generate(shell, &mut c, "cargo-for-each", &mut f);
         }
@@ -1757,7 +693,7 @@ async fn main() -> Result<(), Error> {
     #[cfg(target_os = "linux")]
     let registry = registry.with(
         tracing_journald::layer()
-            .map_err(crate::Error::TracingJournaldError)?
+            .map_err(Error::TracingJournaldError)?
             .with_filter(journald_env_filter),
     );
     registry.init();
