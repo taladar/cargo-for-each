@@ -111,12 +111,24 @@ pub enum Error {
     /// error serializing config file
     #[error("error serializing config file: {0}")]
     CouldNotSerializeConfigFile(#[source] toml::ser::Error),
+    /// error serializing target set file
+    #[error("error serializing target set file: {0}")]
+    CouldNotSerializeTargetSetFile(#[source] toml::ser::Error),
     /// could not create parent directories for config file
     #[error("could not create parent directories for config file: {0}")]
     CouldNotCreateConfigFileParentDirs(#[source] std::io::Error),
+    /// could not create parent directories for target set file
+    #[error("could not create parent directories for target set file: {0}")]
+    CouldNotCreateTargetSetFileParentDirs(#[source] std::io::Error),
     /// error writing config file
     #[error("error writing config file: {0}")]
     CouldNotWriteConfigFile(#[source] std::io::Error),
+    /// error writing target set file
+    #[error("error writing target set file: {0}")]
+    CouldNotWriteTargetSetFile(#[source] std::io::Error),
+    /// error reading target sets dir
+    #[error("error reading target sets dir: {0}")]
+    CouldNotReadTargetSetsDir(#[source] std::io::Error),
     /// error running cargo-metadata
     #[error("error running cargo-metadata for {0}: {1}")]
     CargoMetadataError(std::path::PathBuf, #[source] cargo_metadata::Error),
@@ -341,7 +353,7 @@ impl Config {
 
     /// Load the config file
     fn load() -> Result<Self, Error> {
-        let config_file_path = config_file_path()?;
+        let config_file_path = config_file()?;
         if fs_err::exists(&config_file_path).map_err(Error::CouldNotReadConfigFile)? {
             let file_content =
                 fs_err::read_to_string(&config_file_path).map_err(Error::CouldNotReadConfigFile)?;
@@ -353,7 +365,7 @@ impl Config {
 
     /// Save the config file
     fn save(&self) -> Result<(), Error> {
-        let config_file_path = config_file_path()?;
+        let config_file_path = config_file()?;
         if let Some(config_dir_path) = config_file_path.parent() {
             fs_err::create_dir_all(config_dir_path)
                 .map_err(Error::CouldNotCreateConfigFileParentDirs)?;
@@ -366,15 +378,73 @@ impl Config {
     }
 }
 
-/// returns the config file path
-fn config_file_path() -> Result<std::path::PathBuf, Error> {
+/// returns the config dir path
+fn config_dir_path() -> Result<std::path::PathBuf, Error> {
     Ok(dirs::config_dir()
         .ok_or(Error::CouldNotDetermineUserConfigDir)?
-        .join("cargo-for-each/cargo-for-each.toml"))
+        .join("cargo-for-each"))
+}
+
+/// returns the config file path
+fn config_file() -> Result<std::path::PathBuf, Error> {
+    Ok(config_dir_path()?.join("cargo-for-each.toml"))
+}
+
+/// returns the target sets dir path
+fn target_sets_dir_path() -> Result<std::path::PathBuf, Error> {
+    Ok(config_dir_path()?.join("target-sets"))
+}
+
+/// implementation of the target-set subcommand
+///
+/// # Errors
+///
+/// fails if the implementation of target-set fails
+#[instrument]
+#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
+async fn target_set_command(target_set_parameters: TargetSetParameters) -> Result<(), crate::Error> {
+    match target_set_parameters.command {
+        TargetSetCommand::Create(params) => {
+            let target_set = match params.target_set_type {
+                TargetSetType::Crates(params) => TargetSet::Crates(params),
+                TargetSetType::Workspaces(params) => TargetSet::Workspaces(params),
+            };
+            let target_set_path = target_sets_dir_path()?.join(format!("{}.toml", params.name));
+            if let Some(target_set_dir_path) = target_set_path.parent() {
+                fs_err::create_dir_all(target_set_dir_path)
+                    .map_err(Error::CouldNotCreateTargetSetFileParentDirs)?;
+            }
+            fs_err::write(
+                &target_set_path,
+                toml::to_string(&target_set).map_err(Error::CouldNotSerializeTargetSetFile)?,
+            )
+            .map_err(Error::CouldNotWriteTargetSetFile)?;
+        }
+        TargetSetCommand::List => {
+            let target_sets_dir = target_sets_dir_path()?;
+            if !target_sets_dir.exists() {
+                return Ok(());
+            }
+            for entry in fs_err::read_dir(target_sets_dir).map_err(Error::CouldNotReadTargetSetsDir)? {
+                let entry = entry.map_err(Error::CouldNotReadTargetSetsDir)?;
+                let path = entry.path();
+                if path.is_file()
+                    && let Some(extension) = path.extension()
+                    && extension == "toml"
+                    && let Some(name) = path.file_stem()
+                {
+                    println!("{}", name.to_string_lossy());
+                    let content = fs_err::read_to_string(&path).map_err(Error::CouldNotReadConfigFile)?;
+                    println!("{content}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parameters for listing crates
-#[derive(clap::Parser, Debug, Clone)]
+#[derive(clap::Parser, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CrateListParameters {
     /// only list crates of this type
     #[clap(long)]
@@ -385,7 +455,7 @@ pub struct CrateListParameters {
 }
 
 /// Parameters for listing workspaces
-#[derive(clap::Parser, Debug, Clone, Default)]
+#[derive(clap::Parser, Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceListParameters {
     /// only list multi-crate workspaces
     #[clap(long)]
@@ -407,6 +477,52 @@ pub struct ListParameters {
     /// the type of object to list
     #[clap(subcommand)]
     pub list_type: ListType,
+}
+
+/// an enum that describes a set of targets
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum TargetSet {
+    /// a set of crates
+    Crates(CrateListParameters),
+    /// a set of workspaces
+    Workspaces(WorkspaceListParameters),
+}
+
+/// The type of target set to create
+#[derive(clap::Parser, Debug, Clone)]
+pub enum TargetSetType {
+    /// a set of workspaces
+    Workspaces(WorkspaceListParameters),
+    /// a set of crates
+    Crates(CrateListParameters),
+}
+
+/// Parameters for target-set subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct CreateTargetSetParameters {
+    /// the name of the target set
+    #[clap(long)]
+    pub name: String,
+    /// the type of target set to create
+    #[clap(subcommand)]
+    pub target_set_type: TargetSetType,
+}
+
+/// The `target-set` subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub enum TargetSetCommand {
+    /// Create a new target set
+    Create(CreateTargetSetParameters),
+    /// List existing target sets
+    List,
+}
+
+/// Parameters for target-set subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct TargetSetParameters {
+    /// the `target-set` subcommand to run
+    #[clap(subcommand)]
+    pub command: TargetSetCommand,
 }
 
 /// Parameters for add subcommand
@@ -480,6 +596,8 @@ pub enum Command {
     List(ListParameters),
     /// Call add subcommand
     Add(AddParameters),
+    /// create a new target set
+    TargetSet(TargetSetParameters),
     /// refresh the config, removing old entries and adding new ones
     Refresh,
     /// Execute a command in each configured directory
@@ -923,6 +1041,9 @@ async fn do_stuff() -> Result<(), crate::Error> {
         }
         Command::Add(add_parameters) => {
             add_command(add_parameters).await?;
+        }
+        Command::TargetSet(target_set_parameters) => {
+            target_set_command(target_set_parameters).await?;
         }
         Command::Refresh => {
             refresh_command().await?;
