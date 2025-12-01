@@ -105,6 +105,9 @@ pub enum Error {
     /// error reading config file
     #[error("error reading config file: {0}")]
     CouldNotReadConfigFile(#[source] std::io::Error),
+    /// could not check target set existence
+    #[error("could not check target set existence for {0}: {1}")]
+    CouldNotCheckTargetSetExistence(std::path::PathBuf, #[source] std::io::Error),
     /// error parsing config file
     #[error("error parsing config file: {0}")]
     CouldNotParseConfigFile(#[source] toml::de::Error),
@@ -126,9 +129,9 @@ pub enum Error {
     /// error writing target set file
     #[error("error writing target set file: {0}")]
     CouldNotWriteTargetSetFile(#[source] std::io::Error),
-    /// error deleting target set file
-    #[error("error deleting target set file: {0}")]
-    CouldNotDeleteTargetSetFile(#[source] std::io::Error),
+    /// error removing target set file
+    #[error("error removing target set file: {0}")]
+    CouldNotRemoveTargetSetFile(#[source] std::io::Error),
     /// error reading target sets dir
     #[error("error reading target sets dir: {0}")]
     CouldNotReadTargetSetsDir(#[source] std::io::Error),
@@ -141,9 +144,9 @@ pub enum Error {
     /// error writing plan file
     #[error("error writing plan file: {0}")]
     CouldNotWritePlanFile(#[source] std::io::Error),
-    /// error deleting plan file
-    #[error("error deleting plan file: {0}")]
-    CouldNotDeletePlanFile(#[source] std::io::Error),
+    /// error removing plan file
+    #[error("error removing plan file: {0}")]
+    CouldNotRemovePlanFile(#[source] std::io::Error),
     /// error reading plan file
     #[error("error reading plan file: {0}")]
     CouldNotReadPlanFile(#[source] std::io::Error),
@@ -153,6 +156,43 @@ pub enum Error {
     /// plan step is out of bounds
     #[error("plan step {0} is out of bounds for plan with {1} steps (valid range is 1 to {1})")]
     PlanStepOutOfBounds(usize, usize),
+    /// the specified task was not found
+    #[error("the specified task {0} was not found")]
+    TaskNotFound(String),
+    /// the specified plan was not found
+    #[error("the specified plan {0} was not found")]
+    PlanNotFound(String),
+    /// the specified target set was not found
+    #[error("the specified target set {0} was not found")]
+    TargetSetNotFound(String),
+    /// could not create task directory
+    #[error("could not create task directory {0}: {1}")]
+    CouldNotCreateTaskDir(std::path::PathBuf, #[source] std::io::Error),
+    /// could not copy file
+    #[error("could not copy file from {0} to {1}: {2}")]
+    CouldNotCopyFile(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        #[source] std::io::Error,
+    ),
+    /// could not remove task directory
+    #[error("could not remove task directory {0}: {1}")]
+    CouldNotRemoveTaskDir(std::path::PathBuf, #[source] std::io::Error),
+    /// could not read resolved target set file
+    #[error("could not read resolved target set file {0}: {1}")]
+    CouldNotReadResolvedTargetSet(std::path::PathBuf, #[source] std::io::Error),
+    /// could not parse resolved target set file
+    #[error("could not parse resolved target set file {0}: {1}")]
+    CouldNotParseResolvedTargetSet(std::path::PathBuf, #[source] toml::de::Error),
+    /// error serializing resolved target set file
+    #[error("error serializing resolved target set file: {0}")]
+    CouldNotSerializeResolvedTargetSet(#[source] toml::ser::Error),
+    /// could not create parent directories for resolved target set file
+    #[error("could not create parent directories for resolved target set file: {0}")]
+    CouldNotCreateResolvedTargetSetParentDirs(#[source] std::io::Error),
+    /// error writing resolved target set file
+    #[error("error writing resolved target set file: {0}")]
+    CouldNotWriteResolvedTargetSet(#[source] std::io::Error),
     /// error running cargo-metadata
     #[error("error running cargo-metadata for {0}: {1}")]
     CargoMetadataError(std::path::PathBuf, #[source] cargo_metadata::Error),
@@ -344,6 +384,13 @@ pub struct Plan {
     pub steps: Vec<Step>,
 }
 
+/// represents a resolved target set
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedTargetSet {
+    /// the manifest directories of the resolved target set
+    pub manifest_dirs: Vec<std::path::PathBuf>,
+}
+
 /// represents the cargo-for-each configuration file
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Config {
@@ -440,6 +487,16 @@ fn plans_dir_path() -> Result<std::path::PathBuf, Error> {
     Ok(config_dir_path()?.join("plans"))
 }
 
+/// returns the tasks dir path
+fn tasks_dir_path() -> Result<std::path::PathBuf, Error> {
+    Ok(config_dir_path()?.join("tasks"))
+}
+
+/// returns the path to a specific task directory
+fn task_dir_path(name: &str) -> Result<std::path::PathBuf, Error> {
+    Ok(tasks_dir_path()?.join(name))
+}
+
 /// loads a plan from a file
 fn load_plan(name: &str) -> Result<Plan, Error> {
     let plan_path = plans_dir_path()?.join(format!("{name}.toml"));
@@ -463,6 +520,121 @@ fn save_plan(name: &str, plan: &Plan) -> Result<(), Error> {
         toml::to_string(plan).map_err(Error::CouldNotSerializePlanFile)?,
     )
     .map_err(Error::CouldNotWritePlanFile)
+}
+
+/// loads a target set from a file
+fn load_target_set(name: &str) -> Result<TargetSet, Error> {
+    let target_set_path = target_sets_dir_path()?.join(format!("{name}.toml"));
+    if fs_err::exists(&target_set_path)
+        .map_err(|e| Error::CouldNotCheckTargetSetExistence(target_set_path.clone(), e))?
+    {
+        let file_content =
+            fs_err::read_to_string(&target_set_path).map_err(Error::CouldNotReadConfigFile)?;
+        toml::from_str(&file_content).map_err(Error::CouldNotParseConfigFile)
+    } else {
+        Err(Error::TargetSetNotFound(name.to_string()))
+    }
+}
+
+/// resolves a target set to a list of manifest directories
+fn resolve_target_set(
+    target_set: &TargetSet,
+    config: &Config,
+) -> Result<Vec<std::path::PathBuf>, Error> {
+    match target_set {
+        TargetSet::Workspaces(params) => Ok(config
+            .workspaces
+            .iter()
+            .filter(|w| !params.no_standalone || !w.is_standalone)
+            .map(|w| w.manifest_dir.clone())
+            .collect::<Vec<_>>()),
+        TargetSet::Crates(params) => {
+            let workspace_standalone_map: std::collections::HashMap<_, _> = config
+                .workspaces
+                .iter()
+                .map(|w| (w.manifest_dir.clone(), w.is_standalone))
+                .collect();
+            Ok(config
+                .crates
+                .iter()
+                .filter(|krate| {
+                    if let Some(t) = &params.r#type
+                        && !krate.types.contains(t)
+                    {
+                        return false;
+                    }
+                    if let Some(standalone) = params.standalone
+                        && workspace_standalone_map
+                            .get(&krate.workspace_manifest_dir)
+                            .is_none_or(|&is_standalone| is_standalone != standalone)
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .map(|c| c.manifest_dir.clone())
+                .collect::<Vec<_>>())
+        }
+    }
+}
+
+/// implementation of the task create subcommand
+///
+/// # Errors
+///
+/// fails if the implementation of task create fails
+#[instrument]
+async fn task_create_command(params: CreateTaskParameters) -> Result<(), crate::Error> {
+    // 1. Validate plan and target-set existence.
+    let plan_file_path = plans_dir_path()?.join(format!("{}.toml", params.plan));
+    if !plan_file_path.exists() {
+        return Err(Error::PlanNotFound(params.plan));
+    }
+
+    let target_set_file_path = target_sets_dir_path()?.join(format!("{}.toml", params.target_set));
+    if !target_set_file_path.exists() {
+        return Err(Error::TargetSetNotFound(params.target_set));
+    }
+
+    // 2. Load the Config
+    let config = Config::load()?;
+
+    // 3. Load the TargetSet.
+    let target_set = load_target_set(&params.target_set)?;
+
+    // 4. Resolve the TargetSet.
+    let resolved_manifest_dirs = resolve_target_set(&target_set, &config)?;
+
+    // 5. Create the task directory.
+    let task_dir = task_dir_path(&params.name)?;
+    fs_err::create_dir_all(&task_dir)
+        .map_err(|e| Error::CouldNotCreateTaskDir(task_dir.clone(), e))?;
+
+    // 6. Copy plan and target-set files.
+    fs_err::copy(&plan_file_path, task_dir.join("plan.toml")).map_err(|e| {
+        Error::CouldNotCopyFile(plan_file_path.clone(), task_dir.join("plan.toml"), e)
+    })?;
+
+    fs_err::copy(&target_set_file_path, task_dir.join("target-set.toml")).map_err(|e| {
+        Error::CouldNotCopyFile(
+            target_set_file_path.clone(),
+            task_dir.join("target-set.toml"),
+            e,
+        )
+    })?;
+
+    // 7. Save the resolved target set to `resolved-target-set.toml`.
+    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
+    let resolved_target_set = ResolvedTargetSet {
+        manifest_dirs: resolved_manifest_dirs,
+    };
+    fs_err::write(
+        &resolved_target_set_path,
+        toml::to_string(&resolved_target_set).map_err(Error::CouldNotSerializeResolvedTargetSet)?,
+    )
+    .map_err(Error::CouldNotWriteResolvedTargetSet)?;
+
+    Ok(())
 }
 
 /// implementation of the target-set subcommand
@@ -492,9 +664,9 @@ async fn target_set_command(
             )
             .map_err(Error::CouldNotWriteTargetSetFile)?;
         }
-        TargetSetCommand::Delete(params) => {
+        TargetSetCommand::Remove(params) => {
             let target_set_path = target_sets_dir_path()?.join(format!("{}.toml", params.name));
-            fs_err::remove_file(target_set_path).map_err(Error::CouldNotDeleteTargetSetFile)?;
+            fs_err::remove_file(target_set_path).map_err(Error::CouldNotRemoveTargetSetFile)?;
         }
         TargetSetCommand::List => {
             let target_sets_dir = target_sets_dir_path()?;
@@ -556,7 +728,7 @@ async fn plan_step_command(plan_step_parameters: PlanStepParameters) -> Result<(
             );
             save_plan(&params.name, &plan)?;
         }
-        PlanStepCommand::Rm(params) => {
+        PlanStepCommand::Remove(params) => {
             let mut plan = load_plan(&params.name)?;
             if params.position > plan.steps.len() || params.position == 0 {
                 return Err(Error::PlanStepOutOfBounds(
@@ -597,7 +769,7 @@ async fn plan_command(plan_parameters: PlanParameters) -> Result<(), crate::Erro
         }
         PlanCommand::Delete(params) => {
             let plan_path = plans_dir_path()?.join(format!("{}.toml", params.name));
-            fs_err::remove_file(plan_path).map_err(Error::CouldNotDeletePlanFile)?;
+            fs_err::remove_file(plan_path).map_err(Error::CouldNotRemovePlanFile)?;
         }
         PlanCommand::Step(params) => {
             plan_step_command(params).await?;
@@ -690,7 +862,7 @@ pub struct CreateTargetSetParameters {
 
 /// Parameters for deleting a target set
 #[derive(clap::Parser, Debug, Clone)]
-pub struct DeleteTargetSetParameters {
+pub struct RemoveTargetSetParameters {
     /// the name of the target set
     #[clap(long)]
     pub name: String,
@@ -701,8 +873,8 @@ pub struct DeleteTargetSetParameters {
 pub enum TargetSetCommand {
     /// Create a new target set
     Create(CreateTargetSetParameters),
-    /// Delete a target set
-    Delete(DeleteTargetSetParameters),
+    /// Remove a target set
+    Remove(RemoveTargetSetParameters),
     /// List existing target sets
     List,
 }
@@ -756,7 +928,7 @@ pub struct InsertStepParameters {
 
 /// Parameters for removing a step from a plan
 #[derive(clap::Parser, Debug, Clone)]
-pub struct RmStepParameters {
+pub struct RemoveStepParameters {
     /// the name of the plan
     #[clap(long)]
     pub name: String,
@@ -789,7 +961,7 @@ pub enum PlanStepCommand {
     /// Insert a step into a plan
     Insert(InsertStepParameters),
     /// Remove a step from a plan
-    Rm(RmStepParameters),
+    Remove(RemoveStepParameters),
     /// List the steps of a plan
     List(ListStepsParameters),
 }
@@ -821,6 +993,45 @@ pub struct PlanParameters {
     /// the `plan` subcommand to run
     #[clap(subcommand)]
     pub command: PlanCommand,
+}
+
+/// Parameters for creating a new task
+#[derive(clap::Parser, Debug, Clone)]
+pub struct CreateTaskParameters {
+    /// the name of the task
+    #[clap(long)]
+    pub name: String,
+    /// the name of the plan to use for the task
+    #[clap(long)]
+    pub plan: String,
+    /// the name of the target set to use for the task
+    #[clap(long)]
+    pub target_set: String,
+}
+
+/// The `task` subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub enum TaskCommand {
+    /// Create a new task
+    Create(CreateTaskParameters),
+    /// Remove a task
+    Remove(RemoveTaskParameters),
+}
+
+/// Parameters for removing a task
+#[derive(clap::Parser, Debug, Clone)]
+pub struct RemoveTaskParameters {
+    /// the name of the task
+    #[clap(long)]
+    pub name: String,
+}
+
+/// Parameters for task subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct TaskParameters {
+    /// the `task` subcommand to run
+    #[clap(subcommand)]
+    pub command: TaskCommand,
 }
 
 /// Parameters for add subcommand
@@ -898,6 +1109,8 @@ pub enum Command {
     TargetSet(TargetSetParameters),
     /// manage plans
     Plan(PlanParameters),
+    /// manage tasks
+    Task(TaskParameters),
     /// refresh the config, removing old entries and adding new ones
     Refresh,
     /// Execute a command in each configured directory
@@ -1323,6 +1536,26 @@ async fn exec_command(exec_parameters: ExecParameters) -> Result<(), crate::Erro
     Ok(())
 }
 
+/// implementation of the task subcommand
+///
+/// # Errors
+///
+/// fails if the implementation of task fails
+#[instrument]
+async fn task_command(task_parameters: TaskParameters) -> Result<(), crate::Error> {
+    match task_parameters.command {
+        TaskCommand::Create(params) => {
+            task_create_command(params).await?;
+        }
+        TaskCommand::Remove(params) => {
+            let task_dir = task_dir_path(&params.name)?;
+            fs_err::remove_dir_all(&task_dir)
+                .map_err(|e| Error::CouldNotRemoveTaskDir(task_dir.clone(), e))?;
+        }
+    }
+    Ok(())
+}
+
 /// The main behaviour of the binary should go here
 ///
 /// # Errors
@@ -1347,6 +1580,9 @@ async fn do_stuff() -> Result<(), crate::Error> {
         }
         Command::Plan(plan_parameters) => {
             plan_command(plan_parameters).await?;
+        }
+        Command::Task(task_parameters) => {
+            task_command(task_parameters).await?;
         }
         Command::Refresh => {
             refresh_command().await?;
