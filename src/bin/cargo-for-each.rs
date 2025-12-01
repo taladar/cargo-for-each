@@ -1,6 +1,6 @@
 #![doc = include_str!("../../README.md")]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _; // Required for write! macro
 
 use tracing::instrument;
@@ -205,6 +205,9 @@ pub enum Error {
     /// the given manifest path has no parent directory
     #[error("the given manifest path {0} has no parent directory")]
     ManifestPathHasNoParentDir(std::path::PathBuf),
+    /// the target set/plan/task of the given name already exists
+    #[error("{0} already exists")]
+    AlreadyExists(String),
     /// we called cargo metadata on a directory with a Cargo.toml
     /// but the output did not contain a package with the manifest_path
     /// pointing to that Cargo.toml
@@ -212,6 +215,11 @@ pub enum Error {
         "found no package with manifest_path matching local Cargo.toml in cargo metadata output: {0}"
     )]
     FoundNoPackageInCargoMetadataWithCurrentManifestPath(std::path::PathBuf),
+    /// we called cargo metadata for a given manifest_path
+    /// but the output did not contain a package with the manifest_path
+    /// pointing to that Cargo.toml
+    #[error("found no package with manifest_path matching {0} in cargo metadata output")]
+    FoundNoPackageInCargoMetadataWithGivenManifestPath(std::path::PathBuf),
     /// metadata did not include a package with the given package id
     #[error("cargo metadata did not include a package with the package id {0}")]
     FoundNoPackageInCargoMetadataWithPackageId(cargo_metadata::PackageId),
@@ -384,11 +392,20 @@ pub struct Plan {
     pub steps: Vec<Step>,
 }
 
+/// represents a target within a resolved target set
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Target {
+    /// the manifest directory of the target
+    pub manifest_dir: std::path::PathBuf,
+    /// the manifest directories of the targets that this target depends on
+    pub dependencies: Vec<std::path::PathBuf>,
+}
+
 /// represents a resolved target set
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedTargetSet {
-    /// the manifest directories of the resolved target set
-    pub manifest_dirs: Vec<std::path::PathBuf>,
+    /// the targets of the resolved target set
+    pub targets: Vec<Target>,
 }
 
 /// represents the cargo-for-each configuration file
@@ -512,6 +529,9 @@ fn load_plan(name: &str) -> Result<Plan, Error> {
 /// saves a plan to a file
 fn save_plan(name: &str, plan: &Plan) -> Result<(), Error> {
     let plan_path = plans_dir_path()?.join(format!("{name}.toml"));
+    if plan_path.exists() {
+        return Err(Error::AlreadyExists(format!("plan {name}")));
+    }
     if let Some(plan_dir_path) = plan_path.parent() {
         fs_err::create_dir_all(plan_dir_path).map_err(Error::CouldNotCreatePlanFileParentDirs)?;
     }
@@ -537,24 +557,21 @@ fn load_target_set(name: &str) -> Result<TargetSet, Error> {
 }
 
 /// resolves a target set to a list of manifest directories
-fn resolve_target_set(
-    target_set: &TargetSet,
-    config: &Config,
-) -> Result<Vec<std::path::PathBuf>, Error> {
-    match target_set {
-        TargetSet::Workspaces(params) => Ok(config
+fn resolve_target_set(target_set: &TargetSet, config: &Config) -> Result<ResolvedTargetSet, Error> {
+    let initial_manifest_dirs: Vec<std::path::PathBuf> = match target_set {
+        TargetSet::Workspaces(params) => config
             .workspaces
             .iter()
             .filter(|w| !params.no_standalone || !w.is_standalone)
             .map(|w| w.manifest_dir.clone())
-            .collect::<Vec<_>>()),
+            .collect(),
         TargetSet::Crates(params) => {
-            let workspace_standalone_map: std::collections::HashMap<_, _> = config
+            let workspace_standalone_map: HashMap<_, _> = config
                 .workspaces
                 .iter()
                 .map(|w| (w.manifest_dir.clone(), w.is_standalone))
                 .collect();
-            Ok(config
+            config
                 .crates
                 .iter()
                 .filter(|krate| {
@@ -573,9 +590,101 @@ fn resolve_target_set(
                     true
                 })
                 .map(|c| c.manifest_dir.clone())
-                .collect::<Vec<_>>())
+                .collect()
+        }
+    };
+
+    let target_manifest_paths_set: HashSet<std::path::PathBuf> =
+        initial_manifest_dirs.iter().cloned().collect();
+
+    // Collect all packages from all initial_manifest_dirs into a single map
+    let mut all_packages: HashMap<cargo_metadata::PackageId, cargo_metadata::Package> =
+        HashMap::new();
+    let mut package_name_to_id: HashMap<String, cargo_metadata::PackageId> = HashMap::new();
+
+    for manifest_dir in &initial_manifest_dirs {
+        let metadata = cargo_metadata::MetadataCommand::new()
+            .manifest_path(manifest_dir.join("Cargo.toml"))
+            .exec()
+            .map_err(|e| Error::CargoMetadataError(manifest_dir.clone(), e))?;
+
+        for package in metadata.packages {
+            all_packages.insert(package.id.clone(), package.clone());
+            package_name_to_id.insert(package.name.to_string(), package.id.clone());
         }
     }
+
+    let mut targets: Vec<Target> = Vec::new();
+
+    for manifest_dir in &initial_manifest_dirs {
+        // Find the package corresponding to the current manifest_dir
+        let current_package_id = package_name_to_id
+            .iter()
+            .find_map(|(_name, id)| {
+                let package = all_packages.get(id)?;
+                // Compare canonicalized paths to avoid issues with different path representations
+                let package_manifest_dir = package
+                    .manifest_path
+                    .parent()
+                    .ok_or_else(|| {
+                        Error::ManifestPathHasNoParentDir(
+                            package.manifest_path.clone().into_std_path_buf(),
+                        )
+                    })
+                    .ok()?; // Use ok() to turn into Option for find_map
+                let canonical_package_manifest_dir =
+                    fs_err::canonicalize(package_manifest_dir).ok()?; // Use ok()
+
+                let canonical_manifest_dir = fs_err::canonicalize(manifest_dir.clone()).ok()?; // Use ok()
+
+                if canonical_package_manifest_dir == canonical_manifest_dir {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                Error::FoundNoPackageInCargoMetadataWithGivenManifestPath(manifest_dir.clone())
+            })?;
+
+        let current_package = all_packages.get(&current_package_id).ok_or_else(|| {
+            Error::FoundNoPackageInCargoMetadataWithGivenManifestPath(manifest_dir.clone())
+        })?; // Should not happen if current_package_id was found
+
+        let mut dependencies: Vec<std::path::PathBuf> = Vec::new();
+
+        for dep in &current_package.dependencies {
+            if let Some(dep_package_id) = package_name_to_id.get(&dep.name)
+                && let Some(dep_package) = all_packages.get(dep_package_id)
+            {
+                let dep_manifest_path = dep_package
+                    .manifest_path
+                    .parent()
+                    .ok_or_else(|| {
+                        Error::ManifestPathHasNoParentDir(
+                            dep_package.manifest_path.clone().into_std_path_buf(),
+                        )
+                    })?
+                    .canonicalize()
+                    .map_err(|e| {
+                        Error::CouldNotDetermineCanonicalManifestPath(
+                            dep_package.manifest_path.clone().into_std_path_buf(),
+                            e,
+                        )
+                    })?;
+
+                if target_manifest_paths_set.contains(&dep_manifest_path) {
+                    dependencies.push(dep_manifest_path);
+                }
+            }
+        }
+        targets.push(Target {
+            manifest_dir: manifest_dir.clone(),
+            dependencies,
+        });
+    }
+
+    Ok(ResolvedTargetSet { targets })
 }
 
 /// implementation of the task create subcommand
@@ -603,10 +712,13 @@ async fn task_create_command(params: CreateTaskParameters) -> Result<(), crate::
     let target_set = load_target_set(&params.target_set)?;
 
     // 4. Resolve the TargetSet.
-    let resolved_manifest_dirs = resolve_target_set(&target_set, &config)?;
+    let resolved_target_set = resolve_target_set(&target_set, &config)?;
 
     // 5. Create the task directory.
     let task_dir = task_dir_path(&params.name)?;
+    if task_dir.exists() {
+        return Err(Error::AlreadyExists(format!("task {}", params.name)));
+    }
     fs_err::create_dir_all(&task_dir)
         .map_err(|e| Error::CouldNotCreateTaskDir(task_dir.clone(), e))?;
 
@@ -625,9 +737,6 @@ async fn task_create_command(params: CreateTaskParameters) -> Result<(), crate::
 
     // 7. Save the resolved target set to `resolved-target-set.toml`.
     let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
-    let resolved_target_set = ResolvedTargetSet {
-        manifest_dirs: resolved_manifest_dirs,
-    };
     fs_err::write(
         &resolved_target_set_path,
         toml::to_string(&resolved_target_set).map_err(Error::CouldNotSerializeResolvedTargetSet)?,
@@ -654,6 +763,9 @@ async fn target_set_command(
                 TargetSetType::Workspaces(params) => TargetSet::Workspaces(params),
             };
             let target_set_path = target_sets_dir_path()?.join(format!("{}.toml", params.name));
+            if target_set_path.exists() {
+                return Err(Error::AlreadyExists(format!("target set {}", params.name)));
+            }
             if let Some(target_set_dir_path) = target_set_path.parent() {
                 fs_err::create_dir_all(target_set_dir_path)
                     .map_err(Error::CouldNotCreateTargetSetFileParentDirs)?;
