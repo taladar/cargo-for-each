@@ -196,4 +196,7 @@ pub enum Error {
     /// some steps failed
     #[error("some steps failed")]
     SomeStepsFailed,
+    /// circular dependency or deadlock detected
+    #[error("circular dependency or deadlock detected")]
+    CircularDependency,
 }

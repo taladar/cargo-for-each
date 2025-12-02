@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures::stream::{self, StreamExt as _, TryStreamExt as _};
+use futures::stream::{self, StreamExt as _};
 
 use tracing::instrument;
 
@@ -303,8 +303,11 @@ pub async fn run_single_step(
     Ok(())
 }
 
+use std::collections::HashMap;
+
 use crate::plans::Plan;
 use crate::target_sets::ResolvedTargetSet;
+use crate::targets::Target;
 
 /// Represents the next uncompleted step in a task for a specific target.
 #[derive(Debug)]
@@ -365,9 +368,35 @@ fn is_step_completed(
     }
 }
 
+/// Checks if a given target has completed all steps in a plan.
+fn is_target_completed(task_name: &str, target_idx: usize, plan: &Plan) -> bool {
+    plan.steps.iter().enumerate().all(|(step_idx, step)| {
+        is_step_completed(task_name, target_idx, step_idx.saturating_add(1), step)
+    })
+}
+
+/// Checks if all dependencies of a given target have completed all steps in a plan.
+fn are_target_dependencies_completed(
+    task_name: &str,
+    target: &Target,
+    plan: &Plan,
+    target_map: &HashMap<PathBuf, usize>,
+) -> bool {
+    target.dependencies.iter().all(|dep_path| {
+        if let Some(&dep_target_idx) = target_map.get(dep_path) {
+            is_target_completed(task_name, dep_target_idx, plan)
+        } else {
+            // This case should ideally not happen if the resolved_target_set is consistent.
+            // Assuming that if a dependency isn't in the target map, it's not part of the
+            // current task, so we don't need to check its status.
+            true
+        }
+    })
+}
+
 #[must_use]
 /// Determines the first step that has not already been completed successfully
-/// in the first target that has such a step.
+/// in the first target that has such a step and whose dependencies are all completed.
 ///
 /// Returns the values required to call the `run_single_step()` utility function on it.
 pub fn find_next_step<'a>(
@@ -375,17 +404,26 @@ pub fn find_next_step<'a>(
     plan: &'a Plan,
     resolved_target_set: &'a ResolvedTargetSet,
 ) -> Option<NextStep<'a>> {
+    let target_map: HashMap<PathBuf, usize> = resolved_target_set
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.manifest_dir.clone(), i))
+        .collect();
+
     for (target_idx, target) in resolved_target_set.targets.iter().enumerate() {
-        for (step_idx, step) in plan.steps.iter().enumerate() {
-            // step_number should be 1-based for the state directory path.
-            if !is_step_completed(task_name, target_idx, step_idx.saturating_add(1), step) {
-                return Some(NextStep {
-                    step,
-                    manifest_dir: &target.manifest_dir,
-                    task_name,
-                    step_number: step_idx.saturating_add(1),
-                    target_number: target_idx,
-                });
+        if are_target_dependencies_completed(task_name, target, plan, &target_map) {
+            for (step_idx, step) in plan.steps.iter().enumerate() {
+                let step_number = step_idx.saturating_add(1);
+                if !is_step_completed(task_name, target_idx, step_number, step) {
+                    return Some(NextStep {
+                        step,
+                        manifest_dir: &target.manifest_dir,
+                        task_name,
+                        step_number,
+                        target_number: target_idx,
+                    });
+                }
             }
         }
     }
@@ -452,24 +490,32 @@ pub async fn run_single_target_command(params: RunSingleTargetParameters) -> Res
     let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
         .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
 
-    // Find the first target with at least one incomplete step.
+    let target_map: HashMap<PathBuf, usize> = resolved_target_set
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.manifest_dir.clone(), i))
+        .collect();
+
+    // Find the first target with at least one incomplete step whose dependencies are met.
     let Some((target_idx, target)) =
         resolved_target_set
             .targets
             .iter()
             .enumerate()
-            .find(|(target_idx, _)| {
-                plan.steps.iter().enumerate().any(|(step_idx, step)| {
-                    !is_step_completed(&params.name, *target_idx, step_idx.saturating_add(1), step)
-                })
+            .find(|(target_idx, target)| {
+                !is_target_completed(&params.name, *target_idx, &plan)
+                    && are_target_dependencies_completed(&params.name, target, &plan, &target_map)
             })
     else {
-        println!("All steps for all targets completed successfully.");
+        println!(
+            "All steps for all targets completed successfully or no targets are ready to be processed."
+        );
         return Ok(());
     };
 
     println!(
-        "Found incomplete steps for target {}, running all remaining steps for it.",
+        "Found ready target with incomplete steps: {}, running all remaining steps for it.",
         target.manifest_dir.display()
     );
 
@@ -496,7 +542,6 @@ pub async fn run_single_target_command(params: RunSingleTargetParameters) -> Res
 ///
 /// fails if the implementation of task run all-targets fails
 #[instrument]
-#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
 pub async fn run_all_targets_command(params: RunAllTargetsParameters) -> Result<(), Error> {
     let task_dir = named_dir_path(&params.name)?;
 
@@ -512,65 +557,43 @@ pub async fn run_all_targets_command(params: RunAllTargetsParameters) -> Result<
 
     let jobs = params.jobs.unwrap_or(1);
     let plan = Arc::new(plan);
+    let resolved_target_set = Arc::new(resolved_target_set);
 
-    if params.keep_going {
-        let has_errors = Arc::new(AtomicBool::new(false));
-        stream::iter(resolved_target_set.targets.into_iter().enumerate())
-            .for_each_concurrent(jobs, |(target_idx, target)| {
-                let plan = Arc::clone(&plan);
-                let params = params.clone();
-                let has_errors = Arc::clone(&has_errors);
-                async move {
-                    for (step_idx, step) in plan.steps.iter().enumerate() {
-                        let step_number = step_idx.saturating_add(1);
-                        if !is_step_completed(&params.name, target_idx, step_number, step) {
-                            println!(
-                                "Running step {} for target {}",
-                                step_number,
-                                target.manifest_dir.display()
-                            );
-                            if let Err(e) = run_single_step(
-                                step,
-                                &target.manifest_dir,
-                                &params.name,
-                                step_number,
-                                target_idx,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    "Error running step {} for target {}: {}",
-                                    step_number,
-                                    target.manifest_dir.display(),
-                                    e
-                                );
-                                has_errors.store(true, Ordering::SeqCst);
-                                break; // Stop processing this target
-                            }
-                        }
-                    }
-                }
+    let target_map: Arc<HashMap<PathBuf, usize>> = Arc::new(
+        resolved_target_set
+            .targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.manifest_dir.clone(), i))
+            .collect(),
+    );
+
+    let mut completed_targets = vec![false; resolved_target_set.targets.len()];
+    let has_errors = Arc::new(AtomicBool::new(false));
+
+    loop {
+        let ready_targets: Vec<_> = resolved_target_set
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(target_idx, target)| {
+                completed_targets.get(*target_idx).is_none_or(|&c| !c)
+                    && are_target_dependencies_completed(&params.name, target, &plan, &target_map)
             })
-            .await;
+            .collect();
 
-        if has_errors.load(Ordering::SeqCst) {
-            return Err(Error::SomeStepsFailed);
+        if ready_targets.is_empty() {
+            break;
         }
-    } else {
-        stream::iter(resolved_target_set.targets.into_iter().enumerate())
-            .map(Ok)
-            .try_for_each_concurrent(jobs, |(target_idx, target)| {
+
+        let batch_results = stream::iter(ready_targets)
+            .map(|(target_idx, target)| {
                 let plan = Arc::clone(&plan);
                 let params = params.clone();
                 async move {
                     for (step_idx, step) in plan.steps.iter().enumerate() {
                         let step_number = step_idx.saturating_add(1);
                         if !is_step_completed(&params.name, target_idx, step_number, step) {
-                            println!(
-                                "Running step {} for target {}",
-                                step_number,
-                                target.manifest_dir.display()
-                            );
                             run_single_step(
                                 step,
                                 &target.manifest_dir,
@@ -581,10 +604,38 @@ pub async fn run_all_targets_command(params: RunAllTargetsParameters) -> Result<
                             .await?;
                         }
                     }
-                    Ok::<(), Error>(())
+                    Ok(target_idx)
                 }
             })
-            .await?;
+            .buffer_unordered(jobs)
+            .collect::<Vec<_>>()
+            .await;
+
+        for result in batch_results {
+            match result {
+                Ok(target_idx) => {
+                    if let Some(c) = completed_targets.get_mut(target_idx) {
+                        *c = true;
+                    }
+                }
+                Err(e) => {
+                    if params.keep_going {
+                        tracing::error!("A step failed: {}", e);
+                        has_errors.store(true, Ordering::SeqCst);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    if !completed_targets.iter().all(|&c| c) {
+        return Err(Error::CircularDependency);
+    }
+
+    if has_errors.load(Ordering::SeqCst) {
+        return Err(Error::SomeStepsFailed);
     }
 
     Ok(())
