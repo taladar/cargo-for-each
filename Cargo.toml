@@ -49,6 +49,7 @@ clap_complete = "4.5.61"
 clap_mangen = "0.2.31"
 dirs = "6.0.0"
 fs-err = "3.2.0"
+futures = "0.3.31"
 humantime = "2.3.0"
 log-panics = { version = "2.1.0", features = ["with-backtrace"] }
 serde = { version = "1.0.228", features = ["derive"] }

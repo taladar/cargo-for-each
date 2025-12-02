@@ -15,6 +15,8 @@ pub mod targets;
 pub mod targets_commands;
 /// Implements functionality for managing tasks.
 pub mod tasks;
+/// Implements utility functions.
+pub mod utils;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;

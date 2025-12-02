@@ -1,4 +1,5 @@
 //! This module defines the error types used throughout the `cargo-for-each` library.
+use std::path::PathBuf;
 
 /// Error enum for the application
 #[derive(thiserror::Error, Debug)]
@@ -166,20 +167,33 @@ pub enum Error {
     #[error("cargo metadata did not include a package with the package id {0}")]
     FoundNoPackageInCargoMetadataWithPackageId(cargo_metadata::PackageId),
     /// error executing a command
-    #[error("error executing command `{command:?}` in `{manifest_dir}`: {source}")]
-    CommandExecutionError {
-        /// The directory in which the command was attempted to be executed.
-        manifest_dir: std::path::PathBuf,
-        /// The command and its arguments that were attempted to be executed.
-        command: Vec<String>,
-        /// The underlying I/O error that occurred.
-        #[source]
-        source: std::io::Error,
-    },
+    #[error("error executing command `{0}` in `{1}`: {2}")]
+    CommandExecutionFailed(String, PathBuf, #[source] std::io::Error),
+    /// A command failed to execute
+    #[error("command `{0}` failed in `{1}` with status {2}")]
+    CommandFailed(String, PathBuf, std::process::ExitStatus),
     /// The specified command was not found in PATH
     #[error("command not found: {0}")]
     CommandNotFound(String),
     /// error formatting a string
     #[error("error formatting a string: {0}")]
     FmtError(#[from] std::fmt::Error),
+    /// error determining user state dir
+    #[error("error determining user state dir")]
+    CouldNotDetermineStateDir,
+    /// could not create state directory
+    #[error("could not create state directory {0}: {1}")]
+    CouldNotCreateStateDir(std::path::PathBuf, #[source] std::io::Error),
+    /// error writing state file
+    #[error("error writing state file {0}: {1}")]
+    CouldNotWriteStateFile(std::path::PathBuf, #[source] std::io::Error),
+    /// an IO error occurred
+    #[error("I/O error: {0}")]
+    IoError(#[source] std::io::Error),
+    /// the user did not confirm the manual step
+    #[error("manual step not confirmed")]
+    ManualStepNotConfirmed,
+    /// some steps failed
+    #[error("some steps failed")]
+    SomeStepsFailed,
 }

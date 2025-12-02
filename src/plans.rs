@@ -8,11 +8,22 @@ use clap::Parser;
 
 /// represents a single step in a plan
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Step {
-    /// the command to execute
-    pub command: String,
-    /// the arguments for the command
-    pub args: Vec<String>,
+#[serde(rename_all = "kebab-case")]
+pub enum Step {
+    /// a step that runs a command
+    RunCommand {
+        /// the command to execute
+        command: String,
+        /// the arguments for the command
+        args: Vec<String>,
+    },
+    /// a step that requires manual intervention
+    ManualStep {
+        /// the title of the manual step
+        title: String,
+        /// the instructions for the manual step
+        instructions: String,
+    },
 }
 
 /// represents a plan
@@ -83,12 +94,9 @@ pub struct AddStepParameters {
     /// the name of the plan
     #[clap(long)]
     pub name: String,
-    /// The command to execute.
-    #[clap(required = true)]
-    pub command: String,
-    /// The arguments for the command.
-    #[clap(last = true, allow_hyphen_values = true)]
-    pub args: Vec<String>,
+    /// the type of step to add
+    #[clap(subcommand)]
+    pub step_type: StepTypeParameters,
 }
 
 /// Parameters for inserting a step into a plan
@@ -100,12 +108,29 @@ pub struct InsertStepParameters {
     /// the 1-based position to insert the step at (e.g., 1 to insert before the first step, N to insert before the Nth step)
     #[clap(long)]
     pub position: usize,
-    /// The command to execute.
-    #[clap(required = true)]
-    pub command: String,
-    /// The arguments for the command.
-    #[clap(last = true, allow_hyphen_values = true)]
-    pub args: Vec<String>,
+    /// the type of step to insert
+    #[clap(subcommand)]
+    pub step_type: StepTypeParameters,
+}
+
+/// The type of step to add or insert
+#[derive(Parser, Debug, Clone)]
+pub enum StepTypeParameters {
+    /// a step that runs a command
+    RunCommand {
+        /// the command to execute
+        command: String,
+        /// the arguments for the command
+        #[clap(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// a step that requires manual intervention
+    ManualStep {
+        /// the title of the manual step
+        title: String,
+        /// the instructions for the manual step
+        instructions: String,
+    },
 }
 
 /// Parameters for removing a step from a plan
@@ -229,10 +254,22 @@ pub async fn plan_step_command(plan_step_parameters: PlanStepParameters) -> Resu
     match plan_step_parameters.command {
         PlanStepCommand::Add(params) => {
             let mut plan = load_plan(&params.name)?;
-            plan.steps.push(Step {
-                command: params.command,
-                args: params.args,
-            });
+            let step = match params.step_type {
+                StepTypeParameters::RunCommand { command, args } => {
+                    if !crate::utils::command_is_executable(&command) {
+                        return Err(crate::error::Error::CommandNotFound(command.to_owned()));
+                    }
+                    Step::RunCommand { command, args }
+                }
+                StepTypeParameters::ManualStep {
+                    title,
+                    instructions,
+                } => Step::ManualStep {
+                    title,
+                    instructions,
+                },
+            };
+            plan.steps.push(step);
             save_plan(&params.name, &plan)?;
         }
         PlanStepCommand::Insert(params) => {
@@ -243,13 +280,22 @@ pub async fn plan_step_command(plan_step_parameters: PlanStepParameters) -> Resu
                     plan.steps.len(),
                 ));
             }
-            plan.steps.insert(
-                params.position.saturating_sub(1),
-                Step {
-                    command: params.command,
-                    args: params.args,
+            let step = match params.step_type {
+                StepTypeParameters::RunCommand { command, args } => {
+                    if !crate::utils::command_is_executable(&command) {
+                        return Err(crate::error::Error::CommandNotFound(command.to_owned()));
+                    }
+                    Step::RunCommand { command, args }
+                }
+                StepTypeParameters::ManualStep {
+                    title,
+                    instructions,
+                } => Step::ManualStep {
+                    title,
+                    instructions,
                 },
-            );
+            };
+            plan.steps.insert(params.position.saturating_sub(1), step);
             save_plan(&params.name, &plan)?;
         }
         PlanStepCommand::Remove(params) => {
@@ -266,12 +312,27 @@ pub async fn plan_step_command(plan_step_parameters: PlanStepParameters) -> Resu
         PlanStepCommand::List(params) => {
             let plan = load_plan(&params.name)?;
             for (i, step) in plan.steps.iter().enumerate() {
-                println!(
-                    "{}: {} {}",
-                    i.saturating_add(1),
-                    step.command,
-                    step.args.join(" ")
-                );
+                match step {
+                    Step::RunCommand { command, args } => {
+                        println!(
+                            "{}: RunCommand - {} {}",
+                            i.saturating_add(1),
+                            command,
+                            args.join(" ")
+                        );
+                    }
+                    Step::ManualStep {
+                        title,
+                        instructions,
+                    } => {
+                        println!(
+                            "{}: ManualStep - Title: \"{}\", Instructions: \"{}\"",
+                            i.saturating_add(1),
+                            title,
+                            instructions
+                        );
+                    }
+                }
             }
         }
     }
