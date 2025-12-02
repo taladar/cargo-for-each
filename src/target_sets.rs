@@ -9,7 +9,7 @@ use tracing::instrument;
 // as its methods are used with qualified names.
 
 use crate::error::Error;
-use crate::targets::{CrateType, Target}; // Target and CrateType will be used
+use crate::targets::Target; // Target and CrateType will be used
 use clap::Parser;
 
 /// represents a resolved target set
@@ -19,41 +19,22 @@ pub struct ResolvedTargetSet {
     pub targets: Vec<Target>,
 }
 
-/// Parameters for listing crates
-#[derive(clap::Parser, Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CrateListParameters {
-    /// only list crates of this type
-    #[clap(long)]
-    pub r#type: Option<CrateType>,
-    /// only list crates that are standalone or not
-    #[clap(long)]
-    pub standalone: Option<bool>,
-}
-
-/// Parameters for listing workspaces
-#[derive(clap::Parser, Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct WorkspaceListParameters {
-    /// only list multi-crate workspaces
-    #[clap(long)]
-    pub no_standalone: bool,
-}
-
 /// The type of target set to create
 #[derive(clap::Parser, Debug, Clone)]
 pub enum TargetSetType {
     /// a set of workspaces
-    Workspaces(WorkspaceListParameters),
+    Workspaces(crate::targets::WorkspaceListParameters),
     /// a set of crates
-    Crates(CrateListParameters),
+    Crates(crate::targets::CrateListParameters),
 }
 
 /// an enum that describes a set of targets
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TargetSet {
     /// a set of crates
-    Crates(CrateListParameters),
+    Crates(crate::targets::CrateListParameters),
     /// a set of workspaces
-    Workspaces(WorkspaceListParameters),
+    Workspaces(crate::targets::WorkspaceListParameters),
 }
 
 /// resolves a target set to a list of manifest directories

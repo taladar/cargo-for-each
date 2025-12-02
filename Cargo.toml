@@ -61,9 +61,11 @@ tracing = "0.1.41"
 tracing-appender = "0.2.4"
 tracing-journald = "0.3.2"
 tracing-subscriber = { version = "0.3.20", features = [ "env-filter", "tracing-log" ] }
+tracing-test = "0.2.5"
 
 [dev-dependencies]
 pretty_assertions = { version = "1.4.1" }
+tempfile = "3.23.0"
 
 [profile.release]
 # do not strip debug info from release builds, useful for debugging those, cargo-flamegraph profiling or similar use cases

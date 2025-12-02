@@ -92,6 +92,31 @@ impl Environment {
                 .collect(),
         })
     }
+
+    /// create a mock environment for testing
+    ///
+    /// # Errors
+    ///
+    /// fails if creating the temporary directories fails
+    #[cfg(test)]
+    pub fn mock(temp_dir: &tempfile::TempDir) -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_path = temp_dir.path();
+
+        // Create 'bin', 'config', and 'state' subdirectories
+        let config_dir = temp_path.join("config");
+        let state_dir = temp_path.join("state");
+        let bin_dir = temp_path.join("bin");
+
+        fs_err::create_dir_all(&config_dir)?;
+        fs_err::create_dir_all(&state_dir)?;
+        fs_err::create_dir_all(&bin_dir)?;
+
+        Ok(Self {
+            config_dir,
+            state_dir,
+            paths: vec![bin_dir], // Add the bin_dir to the paths
+        })
+    }
 }
 
 /// the main function of the app
@@ -254,4 +279,41 @@ pub fn config_dir_path(environment: &Environment) -> Result<PathBuf, crate::erro
 /// Returns an error if the config directory path cannot be determined.
 pub fn config_file(environment: &Environment) -> Result<PathBuf, crate::error::Error> {
     Ok(config_dir_path(environment)?.join("cargo-for-each.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::targets::{ListParameters, ListType, TargetParameters, TargetType};
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_target_list() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a temporary directory for the test environment
+        // needs to be done here since it cleans up when it goes
+        // out of scope
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+
+        // Create Options for the "targets list" command
+        let options = Options {
+            command: Command::Target(TargetParameters {
+                target_type: TargetType::List(ListParameters {
+                    list_type: ListType::Workspaces(
+                        crate::targets::WorkspaceListParameters::default(),
+                    ),
+                }),
+            }),
+        };
+
+        // Call run_app and assert it completes successfully
+        let result = run_app(options, environment).await;
+        assert!(
+            result.is_ok(),
+            "run_app failed with error: {:?}",
+            result.err()
+        );
+
+        Ok(())
+    }
 }
