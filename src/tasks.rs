@@ -21,8 +21,8 @@ use clap::Parser;
 /// # Errors
 ///
 /// Returns an error if the config directory path cannot be determined.
-pub fn dir_path() -> Result<PathBuf, Error> {
-    Ok(crate::config_dir_path()?.join("tasks"))
+pub fn dir_path(environment: &crate::Environment) -> Result<PathBuf, Error> {
+    Ok(crate::config_dir_path(environment)?.join("tasks"))
 }
 
 /// returns the path to a specific task directory
@@ -30,8 +30,8 @@ pub fn dir_path() -> Result<PathBuf, Error> {
 /// # Errors
 ///
 /// Returns an error if the tasks directory path cannot be determined.
-pub fn named_dir_path(name: &str) -> Result<PathBuf, Error> {
-    Ok(dir_path()?.join(name))
+pub fn named_dir_path(name: &str, environment: &crate::Environment) -> Result<PathBuf, Error> {
+    Ok(dir_path(environment)?.join(name))
 }
 
 /// Parameters for creating a new task
@@ -130,30 +130,34 @@ pub struct TaskParameters {
 ///
 /// fails if the implementation of task create fails
 #[instrument]
-pub async fn task_create_command(params: CreateTaskParameters) -> Result<(), Error> {
+pub async fn task_create_command(
+    params: CreateTaskParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
     // 1. Validate plan and target-set existence.
-    let plan_file_path = crate::plans::dir_path()?.join(format!("{}.toml", params.plan));
+    let plan_file_path =
+        crate::plans::Plan::dir_path(&environment)?.join(format!("{}.toml", params.plan));
     if !plan_file_path.exists() {
         return Err(Error::PlanNotFound(params.plan));
     }
 
     let target_set_file_path =
-        crate::target_sets::dir_path()?.join(format!("{}.toml", params.target_set));
+        crate::target_sets::dir_path(&environment)?.join(format!("{}.toml", params.target_set));
     if !target_set_file_path.exists() {
         return Err(Error::TargetSetNotFound(params.target_set));
     }
 
     // 2. Load the Config
-    let config = Config::load()?;
+    let config = Config::load(&environment)?;
 
     // 3. Load the TargetSet.
-    let target_set = load_target_set(&params.target_set)?;
+    let target_set = load_target_set(&params.target_set, &environment)?;
 
     // 4. Resolve the TargetSet.
     let resolved_target_set = crate::target_sets::resolve_target_set(&target_set, &config)?;
 
     // 5. Create the task directory.
-    let task_dir = named_dir_path(&params.name)?;
+    let task_dir = named_dir_path(&params.name, &environment)?;
     if task_dir.exists() {
         return Err(Error::AlreadyExists(format!("task {}", params.name)));
     }
@@ -437,8 +441,11 @@ pub fn find_next_step<'a>(
 /// fails if the implementation of task run single-step fails
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-pub async fn run_single_step_command(params: RunSingleStepParameters) -> Result<(), Error> {
-    let task_dir = named_dir_path(&params.name)?;
+pub async fn run_single_step_command(
+    params: RunSingleStepParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    let task_dir = named_dir_path(&params.name, &environment)?;
 
     let plan_path = task_dir.join("plan.toml");
     let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
@@ -477,8 +484,11 @@ pub async fn run_single_step_command(params: RunSingleStepParameters) -> Result<
 /// fails if the implementation of task run single-target fails
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-pub async fn run_single_target_command(params: RunSingleTargetParameters) -> Result<(), Error> {
-    let task_dir = named_dir_path(&params.name)?;
+pub async fn run_single_target_command(
+    params: RunSingleTargetParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    let task_dir = named_dir_path(&params.name, &environment)?;
 
     let plan_path = task_dir.join("plan.toml");
     let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
@@ -542,8 +552,11 @@ pub async fn run_single_target_command(params: RunSingleTargetParameters) -> Res
 ///
 /// fails if the implementation of task run all-targets fails
 #[instrument]
-pub async fn run_all_targets_command(params: RunAllTargetsParameters) -> Result<(), Error> {
-    let task_dir = named_dir_path(&params.name)?;
+pub async fn run_all_targets_command(
+    params: RunAllTargetsParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    let task_dir = named_dir_path(&params.name, &environment)?;
 
     let plan_path = task_dir.join("plan.toml");
     let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
@@ -647,11 +660,14 @@ pub async fn run_all_targets_command(params: RunAllTargetsParameters) -> Result<
 ///
 /// fails if the implementation of task run fails
 #[instrument]
-pub async fn task_run_command(params: TaskRunParameters) -> Result<(), Error> {
+pub async fn task_run_command(
+    params: TaskRunParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
     match params.command {
-        TaskRunCommand::SingleStep(p) => run_single_step_command(p).await,
-        TaskRunCommand::SingleTarget(p) => run_single_target_command(p).await,
-        TaskRunCommand::AllTargets(p) => run_all_targets_command(p).await,
+        TaskRunCommand::SingleStep(p) => run_single_step_command(p, environment).await,
+        TaskRunCommand::SingleTarget(p) => run_single_target_command(p, environment).await,
+        TaskRunCommand::AllTargets(p) => run_all_targets_command(p, environment).await,
     }
 }
 
@@ -661,18 +677,21 @@ pub async fn task_run_command(params: TaskRunParameters) -> Result<(), Error> {
 ///
 /// fails if the implementation of task fails
 #[instrument]
-pub async fn task_command(task_parameters: TaskParameters) -> Result<(), Error> {
+pub async fn task_command(
+    task_parameters: TaskParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
     match task_parameters.command {
         TaskCommand::Create(params) => {
-            task_create_command(params).await?;
+            task_create_command(params, environment).await?;
         }
         TaskCommand::Remove(params) => {
-            let task_dir = named_dir_path(&params.name)?;
+            let task_dir = named_dir_path(&params.name, &environment)?;
             fs_err::remove_dir_all(&task_dir)
                 .map_err(|e| Error::CouldNotRemoveTaskDir(task_dir.clone(), e))?;
         }
         TaskCommand::Run(params) => {
-            task_run_command(params).await?;
+            task_run_command(params, environment).await?;
         }
     }
     Ok(())

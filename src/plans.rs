@@ -33,51 +33,54 @@ pub struct Plan {
     pub steps: Vec<Step>,
 }
 
-/// returns the plans dir path
-///
-/// # Errors
-///
-/// Returns an error if the config directory path cannot be determined.
-pub fn dir_path() -> Result<PathBuf, Error> {
-    Ok(crate::config_dir_path()?.join("plans"))
-}
+impl Plan {
+    /// returns the plans dir path
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config directory path cannot be determined.
+    pub fn dir_path(environment: &crate::Environment) -> Result<PathBuf, Error> {
+        Ok(crate::config_dir_path(environment)?.join("plans"))
+    }
 
-/// loads a plan from a file
-///
-/// # Errors
-///
-/// Returns an error if the plan file cannot be read, parsed, or if the plan is not found.
-pub fn load_plan(name: &str) -> Result<Plan, Error> {
-    let plan_path = dir_path()?.join(format!("{name}.toml"));
-    if plan_path.exists() {
-        let file_content =
-            fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
-        toml::from_str(&file_content).map_err(Error::CouldNotParsePlanFile)
-    } else {
-        Ok(Plan::default())
+    /// loads a plan from a file
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plan file cannot be read, parsed, or if the plan is not found.
+    pub fn load(name: &str, environment: &crate::Environment) -> Result<Self, Error> {
+        let plan_path = Self::dir_path(environment)?.join(format!("{name}.toml"));
+        if plan_path.exists() {
+            let file_content =
+                fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
+            toml::from_str(&file_content).map_err(Error::CouldNotParsePlanFile)
+        } else {
+            Ok(Self::default())
+        }
     }
-}
 
-/// saves a plan to a file
-///
-/// # Errors
-///
-/// Returns an error if the plan of the given name already exists,
-/// if parent directories cannot be created, if the plan cannot be serialized,
-/// or if the plan file cannot be written.
-pub fn save_plan(name: &str, plan: &Plan) -> Result<(), Error> {
-    let plan_path = dir_path()?.join(format!("{name}.toml"));
-    if plan_path.exists() {
-        return Err(Error::AlreadyExists(format!("plan {name}")));
+    /// saves a plan to a file
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plan of the given name already exists,
+    /// if parent directories cannot be created, if the plan cannot be serialized,
+    /// or if the plan file cannot be written.
+    pub fn save(&self, name: &str, environment: &crate::Environment) -> Result<(), Error> {
+        let plan_path = Self::dir_path(environment)?.join(format!("{name}.toml"));
+        if plan_path.exists() {
+            return Err(Error::AlreadyExists(format!("plan {name}")));
+        }
+        if let Some(plan_dir_path) = plan_path.parent() {
+            fs_err::create_dir_all(plan_dir_path)
+                .map_err(Error::CouldNotCreatePlanFileParentDirs)?;
+        }
+        fs_err::write(
+            &plan_path,
+            toml::to_string(self).map_err(Error::CouldNotSerializePlanFile)?,
+        )
+        .map_err(Error::CouldNotWritePlanFile)
     }
-    if let Some(plan_dir_path) = plan_path.parent() {
-        fs_err::create_dir_all(plan_dir_path).map_err(Error::CouldNotCreatePlanFileParentDirs)?;
-    }
-    fs_err::write(
-        &plan_path,
-        toml::to_string(plan).map_err(Error::CouldNotSerializePlanFile)?,
-    )
-    .map_err(Error::CouldNotWritePlanFile)
 }
 
 /// Parameters for creating a new plan
@@ -209,21 +212,24 @@ pub struct PlanParameters {
 /// fails if the implementation of plan fails
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-pub async fn plan_command(plan_parameters: PlanParameters) -> Result<(), Error> {
+pub async fn plan_command(
+    plan_parameters: PlanParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
     match plan_parameters.command {
         PlanCommand::Create(params) => {
             let plan = Plan::default();
-            save_plan(&params.name, &plan)?;
+            plan.save(&params.name, &environment)?;
         }
         PlanCommand::Delete(params) => {
-            let plan_path = dir_path()?.join(format!("{}.toml", params.name));
+            let plan_path = Plan::dir_path(&environment)?.join(format!("{}.toml", params.name));
             fs_err::remove_file(plan_path).map_err(Error::CouldNotRemovePlanFile)?;
         }
         PlanCommand::Step(params) => {
-            plan_step_command(params).await?;
+            plan_step_command(params, environment).await?;
         }
         PlanCommand::List => {
-            let plans_dir = dir_path()?;
+            let plans_dir = Plan::dir_path(&environment)?;
             if !plans_dir.exists() {
                 return Ok(());
             }
@@ -250,10 +256,13 @@ pub async fn plan_command(plan_parameters: PlanParameters) -> Result<(), Error> 
 /// fails if the implementation of plan fails
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-pub async fn plan_step_command(plan_step_parameters: PlanStepParameters) -> Result<(), Error> {
+pub async fn plan_step_command(
+    plan_step_parameters: PlanStepParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
     match plan_step_parameters.command {
         PlanStepCommand::Add(params) => {
-            let mut plan = load_plan(&params.name)?;
+            let mut plan = Plan::load(&params.name, &environment)?;
             let step = match params.step_type {
                 StepTypeParameters::RunCommand { command, args } => {
                     if !crate::utils::command_is_executable(&command) {
@@ -270,10 +279,10 @@ pub async fn plan_step_command(plan_step_parameters: PlanStepParameters) -> Resu
                 },
             };
             plan.steps.push(step);
-            save_plan(&params.name, &plan)?;
+            plan.save(&params.name, &environment)?;
         }
         PlanStepCommand::Insert(params) => {
-            let mut plan = load_plan(&params.name)?;
+            let mut plan = Plan::load(&params.name, &environment)?;
             if params.position > plan.steps.len().saturating_add(1) || params.position == 0 {
                 return Err(Error::PlanStepOutOfBounds(
                     params.position,
@@ -296,10 +305,10 @@ pub async fn plan_step_command(plan_step_parameters: PlanStepParameters) -> Resu
                 },
             };
             plan.steps.insert(params.position.saturating_sub(1), step);
-            save_plan(&params.name, &plan)?;
+            plan.save(&params.name, &environment)?;
         }
         PlanStepCommand::Remove(params) => {
-            let mut plan = load_plan(&params.name)?;
+            let mut plan = Plan::load(&params.name, &environment)?;
             if params.position > plan.steps.len() || params.position == 0 {
                 return Err(Error::PlanStepOutOfBounds(
                     params.position,
@@ -307,10 +316,10 @@ pub async fn plan_step_command(plan_step_parameters: PlanStepParameters) -> Resu
                 ));
             }
             plan.steps.remove(params.position.saturating_sub(1));
-            save_plan(&params.name, &plan)?;
+            plan.save(&params.name, &environment)?;
         }
         PlanStepCommand::List(params) => {
-            let plan = load_plan(&params.name)?;
+            let plan = Plan::load(&params.name, &environment)?;
             for (i, step) in plan.steps.iter().enumerate() {
                 match step {
                     Step::RunCommand { command, args } => {

@@ -11,8 +11,6 @@ pub mod plans;
 pub mod target_sets;
 /// Defines target-related structures and resolution logic.
 pub mod targets;
-/// Implements functionality for managing targets.
-pub mod targets_commands;
 /// Implements functionality for managing tasks.
 pub mod tasks;
 /// Implements utility functions.
@@ -22,6 +20,118 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+/// which subcommand to call
+#[derive(clap::Parser, Debug)]
+pub enum Command {
+    /// Manage workspaces and crates (add, remove, list, refresh).
+    Target(crate::targets::TargetParameters),
+    /// create a new target set
+    TargetSet(crate::target_sets::TargetSetParameters),
+    /// manage plans
+    Plan(crate::plans::PlanParameters),
+    /// manage tasks
+    Task(crate::tasks::TaskParameters),
+
+    /// Generate man page
+    GenerateManpage {
+        /// target dir for man page generation
+        #[clap(long)]
+        output_dir: PathBuf,
+    },
+    /// Generate shell completion
+    GenerateShellCompletion {
+        /// output file for shell completion generation
+        #[clap(long)]
+        output_file: PathBuf,
+        /// which shell
+        #[clap(long)]
+        shell: clap_complete::aot::Shell,
+    },
+}
+
+/// The Clap type for all the commandline parameters
+#[derive(clap::Parser, Debug)]
+#[clap(name = "cargo-for-each",
+       about = clap::crate_description!(),
+       author = clap::crate_authors!(),
+       version = clap::crate_version!(),
+       )]
+pub struct Options {
+    /// which subcommand to use
+    #[clap(subcommand)]
+    command: Command,
+}
+
+/// stores the information we get from environment variables
+/// so we can easily mock them for testing
+#[derive(Debug, Clone)]
+pub struct Environment {
+    /// user config dir (XDG\_CONFIG\_DIR)
+    pub config_dir: std::path::PathBuf,
+    /// user state dir (XDG\_STATE\_DIR)
+    pub state_dir: std::path::PathBuf,
+    /// paths from PATH
+    pub paths: Vec<std::path::PathBuf>,
+}
+
+impl Environment {
+    /// create an environment for production use
+    ///
+    /// # Errors
+    ///
+    /// fails if we can not retrieve the information from the environment
+    pub fn new() -> Result<Self, crate::error::Error> {
+        Ok(Self {
+            config_dir: dirs::config_dir()
+                .ok_or(crate::error::Error::CouldNotDetermineUserConfigDir)?,
+            state_dir: dirs::state_dir().ok_or(crate::error::Error::CouldNotDetermineStateDir)?,
+            paths: std::env::var("PATH")?
+                .split(':')
+                .map(std::path::PathBuf::from)
+                .collect(),
+        })
+    }
+}
+
+/// the main function of the app
+///
+/// # Errors
+///
+/// fails if the main app fails
+pub async fn run_app(
+    options: Options,
+    environment: Environment,
+) -> Result<(), crate::error::Error> {
+    match options.command {
+        Command::Target(target_parameters) => {
+            crate::targets::target_command(target_parameters, environment).await?;
+        }
+        Command::TargetSet(target_set_parameters) => {
+            crate::target_sets::target_set_command(target_set_parameters, environment).await?;
+        }
+        Command::Plan(plan_parameters) => {
+            crate::plans::plan_command(plan_parameters, environment).await?;
+        }
+        Command::Task(task_parameters) => {
+            crate::tasks::task_command(task_parameters, environment).await?;
+        }
+
+        Command::GenerateManpage { output_dir } => {
+            // generate man pages
+            clap_mangen::generate_to(<Options as clap::CommandFactory>::command(), output_dir)
+                .map_err(crate::error::Error::GenerateManpageError)?;
+        }
+        Command::GenerateShellCompletion { output_file, shell } => {
+            let mut f = std::fs::File::create(output_file)
+                .map_err(crate::error::Error::GenerateShellCompletionError)?;
+            let mut c = <Options as clap::CommandFactory>::command();
+            clap_complete::generate(shell, &mut c, "cargo-for-each", &mut f);
+        }
+    }
+
+    Ok(())
+}
 
 /// represents a Rust workspace
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,8 +206,8 @@ impl Config {
     ///
     /// Returns an error if the config file path cannot be determined,
     /// if the file cannot be read, or if its content cannot be parsed.
-    pub fn load() -> Result<Self, crate::error::Error> {
-        let config_file_path = config_file()?;
+    pub fn load(environment: &Environment) -> Result<Self, crate::error::Error> {
+        let config_file_path = config_file(environment)?;
         if fs_err::exists(&config_file_path).map_err(crate::error::Error::CouldNotReadConfigFile)? {
             let file_content = fs_err::read_to_string(&config_file_path)
                 .map_err(crate::error::Error::CouldNotReadConfigFile)?;
@@ -114,8 +224,8 @@ impl Config {
     /// Returns an error if the config file path cannot be determined,
     /// if parent directories cannot be created, if the config cannot be serialized,
     /// or if the config file cannot be written.
-    pub fn save(&self) -> Result<(), crate::error::Error> {
-        let config_file_path = config_file()?;
+    pub fn save(&self, environment: &Environment) -> Result<(), crate::error::Error> {
+        let config_file_path = config_file(environment)?;
         if let Some(config_dir_path) = config_file_path.parent() {
             fs_err::create_dir_all(config_dir_path)
                 .map_err(crate::error::Error::CouldNotCreateConfigFileParentDirs)?;
@@ -133,10 +243,8 @@ impl Config {
 /// # Errors
 ///
 /// Returns an error if the user's config directory cannot be determined.
-pub fn config_dir_path() -> Result<PathBuf, crate::error::Error> {
-    Ok(dirs::config_dir()
-        .ok_or(crate::error::Error::CouldNotDetermineUserConfigDir)?
-        .join("cargo-for-each"))
+pub fn config_dir_path(environment: &Environment) -> Result<PathBuf, crate::error::Error> {
+    Ok(environment.config_dir.join("cargo-for-each"))
 }
 
 /// returns the config file path
@@ -144,6 +252,6 @@ pub fn config_dir_path() -> Result<PathBuf, crate::error::Error> {
 /// # Errors
 ///
 /// Returns an error if the config directory path cannot be determined.
-pub fn config_file() -> Result<PathBuf, crate::error::Error> {
-    Ok(config_dir_path()?.join("cargo-for-each.toml"))
+pub fn config_file(environment: &Environment) -> Result<PathBuf, crate::error::Error> {
+    Ok(config_dir_path(environment)?.join("cargo-for-each.toml"))
 }

@@ -1,108 +1,28 @@
 #![doc = include_str!("../../README.md")]
 
-use std::path::PathBuf;
-
-use cargo_for_each::error::Error;
-use cargo_for_each::plans::{PlanParameters, plan_command};
-use cargo_for_each::target_sets::{TargetSetParameters, target_set_command};
-use cargo_for_each::tasks::{TaskParameters, task_command};
-
-use cargo_for_each::targets_commands::{TargetParameters, target_command};
-
-use tracing::instrument;
 use tracing_subscriber::{
     EnvFilter, Layer as _, Registry, filter::LevelFilter, layer::SubscriberExt as _,
     util::SubscriberInitExt as _,
 };
 
-/// which subcommand to call
-#[derive(clap::Parser, Debug)]
-pub enum Command {
-    /// Manage workspaces and crates (add, remove, list, refresh).
-    Target(TargetParameters),
-    /// create a new target set
-    TargetSet(TargetSetParameters),
-    /// manage plans
-    Plan(PlanParameters),
-    /// manage tasks
-    Task(TaskParameters),
-
-    /// Generate man page
-    GenerateManpage {
-        /// target dir for man page generation
-        #[clap(long)]
-        output_dir: PathBuf,
-    },
-    /// Generate shell completion
-    GenerateShellCompletion {
-        /// output file for shell completion generation
-        #[clap(long)]
-        output_file: PathBuf,
-        /// which shell
-        #[clap(long)]
-        shell: clap_complete::aot::Shell,
-    },
-}
-
-/// The Clap type for all the commandline parameters
-#[derive(clap::Parser, Debug)]
-#[clap(name = "cargo-for-each",
-       about = clap::crate_description!(),
-       author = clap::crate_authors!(),
-       version = clap::crate_version!(),
-       )]
-struct Options {
-    /// which subcommand to use
-    #[clap(subcommand)]
-    command: Command,
-}
-
-/// The main behaviour of the binary should go here
+/// The main behavior of the binary should go here
 ///
 /// # Errors
 ///
 /// fails if the main behavior of the application fails
-#[instrument]
-async fn do_stuff() -> Result<(), Error> {
-    let options = <Options as clap::Parser>::parse();
+async fn do_stuff() -> Result<(), cargo_for_each::error::Error> {
+    let options = <cargo_for_each::Options as clap::Parser>::parse();
     tracing::debug!("{:#?}", options);
 
-    // main code either goes here or into the individual subcommands
+    let environment = cargo_for_each::Environment::new()?;
 
-    match options.command {
-        Command::Target(target_parameters) => {
-            target_command(target_parameters).await?;
-        }
-        Command::TargetSet(target_set_parameters) => {
-            target_set_command(target_set_parameters).await?;
-        }
-        Command::Plan(plan_parameters) => {
-            plan_command(plan_parameters).await?;
-        }
-        Command::Task(task_parameters) => {
-            task_command(task_parameters).await?;
-        }
-
-        Command::GenerateManpage { output_dir } => {
-            // generate man pages
-            clap_mangen::generate_to(<Options as clap::CommandFactory>::command(), output_dir)
-                .map_err(Error::GenerateManpageError)?;
-        }
-        Command::GenerateShellCompletion { output_file, shell } => {
-            let mut f =
-                std::fs::File::create(output_file).map_err(Error::GenerateShellCompletionError)?;
-            let mut c = <Options as clap::CommandFactory>::command();
-            clap_complete::generate(shell, &mut c, "cargo-for-each", &mut f);
-        }
-    }
-
-    Ok(())
+    cargo_for_each::run_app(options, environment).await
 }
 
 /// The main function mainly just handles setting up tracing
 /// and handling any Err Results.
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<(), cargo_for_each::error::Error> {
     let terminal_env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::WARN.into())
         .parse(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string()))?;
@@ -138,7 +58,7 @@ async fn main() -> Result<(), Error> {
     #[cfg(target_os = "linux")]
     let registry = registry.with(
         tracing_journald::layer()
-            .map_err(Error::TracingJournaldError)?
+            .map_err(cargo_for_each::error::Error::TracingJournaldError)?
             .with_filter(journald_env_filter),
     );
     registry.init();

@@ -200,8 +200,8 @@ pub fn resolve_target_set(
 /// # Errors
 ///
 /// Returns an error if the config directory path cannot be determined.
-pub fn dir_path() -> Result<PathBuf, Error> {
-    Ok(crate::config_dir_path()?.join("target-sets"))
+pub fn dir_path(environment: &crate::Environment) -> Result<PathBuf, Error> {
+    Ok(crate::config_dir_path(environment)?.join("target-sets"))
 }
 
 /// loads a target set from a file
@@ -210,8 +210,8 @@ pub fn dir_path() -> Result<PathBuf, Error> {
 ///
 /// Returns an error if the target set file cannot be checked for existence,
 /// read, parsed, or if the target set is not found.
-pub fn load_target_set(name: &str) -> Result<TargetSet, Error> {
-    let target_set_path = dir_path()?.join(format!("{name}.toml"));
+pub fn load_target_set(name: &str, environment: &crate::Environment) -> Result<TargetSet, Error> {
+    let target_set_path = dir_path(environment)?.join(format!("{name}.toml"));
     if fs_err::exists(&target_set_path)
         .map_err(|e| Error::CouldNotCheckTargetSetExistence(target_set_path.clone(), e))?
     {
@@ -268,14 +268,17 @@ pub struct TargetSetParameters {
 /// fails if the implementation of target-set fails
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-pub async fn target_set_command(target_set_parameters: TargetSetParameters) -> Result<(), Error> {
+pub async fn target_set_command(
+    target_set_parameters: TargetSetParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
     match target_set_parameters.command {
         TargetSetCommand::Create(params) => {
             let target_set = match params.target_set_type {
                 TargetSetType::Crates(params) => TargetSet::Crates(params),
                 TargetSetType::Workspaces(params) => TargetSet::Workspaces(params),
             };
-            let target_set_path = dir_path()?.join(format!("{}.toml", params.name));
+            let target_set_path = dir_path(&environment)?.join(format!("{}.toml", params.name));
             if target_set_path.exists() {
                 return Err(Error::AlreadyExists(format!("target set {}", params.name)));
             }
@@ -290,11 +293,11 @@ pub async fn target_set_command(target_set_parameters: TargetSetParameters) -> R
             .map_err(Error::CouldNotWriteTargetSetFile)?;
         }
         TargetSetCommand::Remove(params) => {
-            let target_set_path = dir_path()?.join(format!("{}.toml", params.name));
+            let target_set_path = dir_path(&environment)?.join(format!("{}.toml", params.name));
             fs_err::remove_file(target_set_path).map_err(Error::CouldNotRemoveTargetSetFile)?;
         }
         TargetSetCommand::List => {
-            let target_sets_dir = dir_path()?;
+            let target_sets_dir = dir_path(&environment)?;
             if !target_sets_dir.exists() {
                 return Ok(());
             }
