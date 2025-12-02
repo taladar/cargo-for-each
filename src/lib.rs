@@ -11,6 +11,8 @@ pub mod plans;
 pub mod target_sets;
 /// Defines target-related structures and resolution logic.
 pub mod targets;
+/// Implements functionality for managing targets.
+pub mod targets_commands;
 /// Implements functionality for managing tasks.
 pub mod tasks;
 
