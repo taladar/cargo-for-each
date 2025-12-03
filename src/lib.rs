@@ -284,7 +284,23 @@ pub fn config_file(environment: &Environment) -> Result<PathBuf, crate::error::E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::targets::{ListParameters, ListType, TargetParameters, TargetType};
+    use crate::{
+        plans::{
+            AddStepParameters, CreatePlanParameters, PlanParameters, PlanStepParameters,
+            PlanStepSubCommand, PlanSubCommand, Step,
+        },
+        target_sets::{
+            CreateTargetSetParameters, TargetSet, TargetSetParameters, TargetSetSubCommand,
+        },
+        targets::{
+            AddParameters, CrateFilterParameters, ListParameters, TargetFilter, TargetParameters,
+            TargetSubCommand, WorkspaceFilterParameters,
+        },
+        tasks::{
+            CreateTaskParameters, RunAllTargetsParameters, TaskParameters, TaskRunParameters,
+            TaskRunSubCommand, TaskSubCommand,
+        },
+    };
 
     #[tracing_test::traced_test]
     #[tokio::test]
@@ -298,10 +314,8 @@ mod tests {
         // Create Options for the "targets list" command
         let options = Options {
             command: Command::Target(TargetParameters {
-                target_type: TargetType::List(ListParameters {
-                    list_type: ListType::Workspaces(
-                        crate::targets::WorkspaceListParameters::default(),
-                    ),
+                sub_command: TargetSubCommand::List(ListParameters {
+                    target_filter: TargetFilter::Workspaces(WorkspaceFilterParameters::default()),
                 }),
             }),
         };
@@ -311,6 +325,195 @@ mod tests {
         assert!(
             result.is_ok(),
             "run_app failed with error: {:?}",
+            result.err()
+        );
+
+        Ok(())
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_full_workflow_crates() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a temporary directory for the test environment
+        // needs to be done here since it cleans up when it goes
+        // out of scope
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+        let temp_path = temp_dir.path();
+        let workspaces_dir = temp_path.join("workspaces");
+        fs_err::create_dir_all(&workspaces_dir)?;
+
+        tracing::debug!("Creating library crate test1");
+
+        let output = std::process::Command::new("cargo")
+            .current_dir(&workspaces_dir)
+            .arg("new")
+            .arg("--lib")
+            .arg("test1")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "Creating test crate test1 failed with status {} stdout {} stderr {}",
+            output.status,
+            std::str::from_utf8(&output.stdout)?,
+            std::str::from_utf8(&output.stderr)?,
+        );
+
+        tracing::debug!("Adding test1 as a target");
+
+        let options = Options {
+            command: Command::Target(TargetParameters {
+                sub_command: TargetSubCommand::Add(AddParameters {
+                    manifest_path: workspaces_dir.join("test1").join("Cargo.toml"),
+                }),
+            }),
+        };
+
+        // Call run_app and assert it completes successfully
+        let result = run_app(options, environment.clone()).await;
+        assert!(
+            result.is_ok(),
+            "run_app for adding test1 target failed with error: {:?}",
+            result.err()
+        );
+
+        tracing::debug!("Creating binary crate test2");
+
+        let output = std::process::Command::new("cargo")
+            .current_dir(&workspaces_dir)
+            .arg("new")
+            .arg("--bin")
+            .arg("test2")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "Creating test crate test2 failed with status {} stdout {} stderr {}",
+            output.status,
+            std::str::from_utf8(&output.stdout)?,
+            std::str::from_utf8(&output.stderr)?,
+        );
+
+        tracing::debug!("Adding test2 as a target");
+
+        let options = Options {
+            command: Command::Target(TargetParameters {
+                sub_command: TargetSubCommand::Add(AddParameters {
+                    manifest_path: workspaces_dir.join("test2").join("Cargo.toml"),
+                }),
+            }),
+        };
+
+        // Call run_app and assert it completes successfully
+        let result = run_app(options, environment.clone()).await;
+        assert!(
+            result.is_ok(),
+            "run_app for adding test2 target failed with error: {:?}",
+            result.err()
+        );
+
+        tracing::debug!("Creating target set test-target-set");
+
+        let options = Options {
+            command: Command::TargetSet(TargetSetParameters {
+                sub_command: TargetSetSubCommand::Create(CreateTargetSetParameters {
+                    name: "test-target-set".to_string(),
+                    target_set: TargetSet::Crates(CrateFilterParameters {
+                        r#type: None,
+                        standalone: None,
+                    }),
+                }),
+            }),
+        };
+
+        // Call run_app and assert it completes successfully
+        let result = run_app(options, environment.clone()).await;
+        assert!(
+            result.is_ok(),
+            "run_app for creating target set failed with error: {:?}",
+            result.err()
+        );
+
+        tracing::debug!("Creating plan test-plan");
+
+        let options = Options {
+            command: Command::Plan(PlanParameters {
+                sub_command: PlanSubCommand::Create(CreatePlanParameters {
+                    name: "test-plan".to_string(),
+                }),
+            }),
+        };
+
+        // Call run_app and assert it completes successfully
+        let result = run_app(options, environment.clone()).await;
+        assert!(
+            result.is_ok(),
+            "run_app for creating plan failed with error: {:?}",
+            result.err()
+        );
+
+        tracing::debug!("Adding run command cargo build step to test-plan");
+
+        let options = Options {
+            command: Command::Plan(PlanParameters {
+                sub_command: PlanSubCommand::Step(PlanStepParameters {
+                    sub_command: PlanStepSubCommand::Add(AddStepParameters {
+                        name: "test-plan".to_string(),
+                        step: Step::RunCommand {
+                            command: "cargo".to_string(),
+                            args: vec!["build".to_string()],
+                        },
+                    }),
+                }),
+            }),
+        };
+
+        // Call run_app and assert it completes successfully
+        let result = run_app(options, environment.clone()).await;
+        assert!(
+            result.is_ok(),
+            "run_app for creating plan failed with error: {:?}",
+            result.err()
+        );
+
+        tracing::debug!("Creating task test-task from test-target-set and test-plan");
+
+        let options = Options {
+            command: Command::Task(TaskParameters {
+                sub_command: TaskSubCommand::Create(CreateTaskParameters {
+                    name: "test-task".to_string(),
+                    plan: "test-plan".to_string(),
+                    target_set: "test-target-set".to_string(),
+                }),
+            }),
+        };
+
+        // Call run_app and assert it completes successfully
+        let result = run_app(options, environment.clone()).await;
+        assert!(
+            result.is_ok(),
+            "run_app for creating plan failed with error: {:?}",
+            result.err()
+        );
+
+        tracing::debug!("Running task test-task");
+
+        let options = Options {
+            command: Command::Task(TaskParameters {
+                sub_command: TaskSubCommand::Run(TaskRunParameters {
+                    sub_command: TaskRunSubCommand::AllTargets(RunAllTargetsParameters {
+                        name: "test-task".to_string(),
+                        jobs: None,
+                        keep_going: false,
+                    }),
+                }),
+            }),
+        };
+
+        // Call run_app and assert it completes successfully
+        let result = run_app(options, environment).await;
+        assert!(
+            result.is_ok(),
+            "run_app for creating plan failed with error: {:?}",
             result.err()
         );
 

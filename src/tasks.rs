@@ -13,7 +13,7 @@ use crate::error::Error;
 use crate::plans::Step;
 use crate::target_sets::load_target_set;
 
-use crate::Config;
+use crate::{Config, Environment};
 use clap::Parser;
 
 /// returns the tasks dir path
@@ -80,7 +80,7 @@ pub struct RunAllTargetsParameters {
 
 /// The `task run` subcommand
 #[derive(Parser, Debug, Clone)]
-pub enum TaskRunCommand {
+pub enum TaskRunSubCommand {
     /// Run a single step of a task
     SingleStep(RunSingleStepParameters),
     /// Run a task on a single target
@@ -94,12 +94,12 @@ pub enum TaskRunCommand {
 pub struct TaskRunParameters {
     /// the `task run` subcommand to run
     #[clap(subcommand)]
-    pub command: TaskRunCommand,
+    pub sub_command: TaskRunSubCommand,
 }
 
 /// The `task` subcommand
 #[derive(Parser, Debug, Clone)]
-pub enum TaskCommand {
+pub enum TaskSubCommand {
     /// Create a new task
     Create(CreateTaskParameters),
     /// Remove a task
@@ -121,14 +121,14 @@ pub struct RemoveTaskParameters {
 pub struct TaskParameters {
     /// the `task` subcommand to run
     #[clap(subcommand)]
-    pub command: TaskCommand,
+    pub sub_command: TaskSubCommand,
 }
 
 /// implementation of the task create subcommand
 ///
 /// # Errors
 ///
-/// fails if the implementation of task create fails
+/// This command can fail if the configuration directory cannot be determined, if the specified plan or target set is not found, if the global configuration cannot be loaded, if there are issues resolving the target set (e.g., cargo metadata errors, package not found, path errors), if the task directory cannot be created (e.g., task already exists, file system errors), if plan or target set files cannot be copied, or if the resolved target set cannot be serialized or written.
 #[instrument]
 pub async fn task_create_command(
     params: CreateTaskParameters,
@@ -192,7 +192,7 @@ pub async fn task_create_command(
 ///
 /// # Errors
 ///
-/// Returns an error if the step fails to execute.
+/// Returns an error if the state directory cannot be determined or created, if a 'run command' step's command is not found or fails to execute, if the command's exit status cannot be written, if the shell's output cannot be flushed or input read during a 'manual step', if the manual step's confirmation cannot be written, or if the manual step is not confirmed by the user.
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
 pub async fn run_single_step(
@@ -201,9 +201,10 @@ pub async fn run_single_step(
     task_name: &str,
     step_number: usize,
     target_number: usize,
+    environment: &Environment,
 ) -> Result<(), Error> {
-    let state_dir = dirs::state_dir()
-        .ok_or(Error::CouldNotDetermineStateDir)?
+    let state_dir = environment
+        .state_dir
         .join("cargo-for-each")
         .join("tasks")
         .join(task_name)
@@ -225,6 +226,7 @@ pub async fn run_single_step(
 
             let command_str = format!("{} {}", command, args.join(" "));
             cmd.arg("record")
+                .arg("-q")
                 .arg("-c")
                 .arg(&command_str)
                 .arg(&cast_path);
@@ -267,7 +269,7 @@ pub async fn run_single_step(
             );
 
             let mut cmd = Command::new("asciinema");
-            cmd.arg("record").arg(&cast_path);
+            cmd.arg("record").arg("-q").arg(&cast_path);
             cmd.current_dir(manifest_dir);
 
             let status = cmd.status().map_err(|e| {
@@ -334,19 +336,15 @@ fn is_step_completed(
     target_number: usize,
     step_number: usize,
     step: &Step,
+    environment: &Environment,
 ) -> bool {
-    let state_dir_option = dirs::state_dir().map(|path| {
-        path.join("cargo-for-each")
-            .join("tasks")
-            .join(task_name)
-            .join(target_number.to_string())
-            .join(step_number.to_string())
-    });
-
-    let Some(state_dir) = state_dir_option else {
-        // If we can't determine the state dir, assume not completed to be safe.
-        return false;
-    };
+    let state_dir = environment
+        .state_dir
+        .join("cargo-for-each")
+        .join("tasks")
+        .join(task_name)
+        .join(target_number.to_string())
+        .join(step_number.to_string());
 
     if !state_dir.exists() {
         return false;
@@ -373,9 +371,20 @@ fn is_step_completed(
 }
 
 /// Checks if a given target has completed all steps in a plan.
-fn is_target_completed(task_name: &str, target_idx: usize, plan: &Plan) -> bool {
+fn is_target_completed(
+    task_name: &str,
+    target_idx: usize,
+    plan: &Plan,
+    environment: &Environment,
+) -> bool {
     plan.steps.iter().enumerate().all(|(step_idx, step)| {
-        is_step_completed(task_name, target_idx, step_idx.saturating_add(1), step)
+        is_step_completed(
+            task_name,
+            target_idx,
+            step_idx.saturating_add(1),
+            step,
+            environment,
+        )
     })
 }
 
@@ -385,10 +394,11 @@ fn are_target_dependencies_completed(
     target: &Target,
     plan: &Plan,
     target_map: &HashMap<PathBuf, usize>,
+    environment: &Environment,
 ) -> bool {
     target.dependencies.iter().all(|dep_path| {
         if let Some(&dep_target_idx) = target_map.get(dep_path) {
-            is_target_completed(task_name, dep_target_idx, plan)
+            is_target_completed(task_name, dep_target_idx, plan, environment)
         } else {
             // This case should ideally not happen if the resolved_target_set is consistent.
             // Assuming that if a dependency isn't in the target map, it's not part of the
@@ -407,6 +417,7 @@ pub fn find_next_step<'a>(
     task_name: &'a str,
     plan: &'a Plan,
     resolved_target_set: &'a ResolvedTargetSet,
+    environment: &Environment,
 ) -> Option<NextStep<'a>> {
     let target_map: HashMap<PathBuf, usize> = resolved_target_set
         .targets
@@ -416,10 +427,10 @@ pub fn find_next_step<'a>(
         .collect();
 
     for (target_idx, target) in resolved_target_set.targets.iter().enumerate() {
-        if are_target_dependencies_completed(task_name, target, plan, &target_map) {
+        if are_target_dependencies_completed(task_name, target, plan, &target_map, environment) {
             for (step_idx, step) in plan.steps.iter().enumerate() {
                 let step_number = step_idx.saturating_add(1);
-                if !is_step_completed(task_name, target_idx, step_number, step) {
+                if !is_step_completed(task_name, target_idx, step_number, step, environment) {
                     return Some(NextStep {
                         step,
                         manifest_dir: &target.manifest_dir,
@@ -438,7 +449,7 @@ pub fn find_next_step<'a>(
 ///
 /// # Errors
 ///
-/// fails if the implementation of task run single-step fails
+/// This command can fail if the task directory cannot be determined, if the plan or resolved target set files cannot be read or parsed, or if an individual step fails during execution.
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
 pub async fn run_single_step_command(
@@ -457,7 +468,8 @@ pub async fn run_single_step_command(
     let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
         .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
 
-    if let Some(next_step) = find_next_step(&params.name, &plan, &resolved_target_set) {
+    if let Some(next_step) = find_next_step(&params.name, &plan, &resolved_target_set, &environment)
+    {
         println!(
             "Running step {} for target {}",
             next_step.step_number,
@@ -469,6 +481,7 @@ pub async fn run_single_step_command(
             next_step.task_name,
             next_step.step_number,
             next_step.target_number,
+            &environment,
         )
         .await
     } else {
@@ -481,7 +494,7 @@ pub async fn run_single_step_command(
 ///
 /// # Errors
 ///
-/// fails if the implementation of task run single-target fails
+/// This command can fail if the task directory cannot be determined, if the plan or resolved target set files cannot be read or parsed, or if any of the individual steps for the selected target fail during execution.
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
 pub async fn run_single_target_command(
@@ -514,8 +527,14 @@ pub async fn run_single_target_command(
             .iter()
             .enumerate()
             .find(|(target_idx, target)| {
-                !is_target_completed(&params.name, *target_idx, &plan)
-                    && are_target_dependencies_completed(&params.name, target, &plan, &target_map)
+                !is_target_completed(&params.name, *target_idx, &plan, &environment)
+                    && are_target_dependencies_completed(
+                        &params.name,
+                        target,
+                        &plan,
+                        &target_map,
+                        &environment,
+                    )
             })
     else {
         println!(
@@ -531,13 +550,14 @@ pub async fn run_single_target_command(
 
     for (step_idx, step) in plan.steps.iter().enumerate() {
         let step_number = step_idx.saturating_add(1);
-        if !is_step_completed(&params.name, target_idx, step_number, step) {
+        if !is_step_completed(&params.name, target_idx, step_number, step, &environment) {
             run_single_step(
                 step,
                 &target.manifest_dir,
                 &params.name,
                 step_number,
                 target_idx,
+                &environment,
             )
             .await?;
         }
@@ -550,7 +570,7 @@ pub async fn run_single_target_command(
 ///
 /// # Errors
 ///
-/// fails if the implementation of task run all-targets fails
+/// This command can fail if the task directory cannot be determined, if the plan or resolved target set files cannot be read or parsed, if any individual step fails during execution (unless 'keep_going' is enabled), if a circular dependency is detected between targets, or if 'keep_going' is enabled and some steps failed.
 #[instrument]
 pub async fn run_all_targets_command(
     params: RunAllTargetsParameters,
@@ -591,7 +611,13 @@ pub async fn run_all_targets_command(
             .enumerate()
             .filter(|(target_idx, target)| {
                 completed_targets.get(*target_idx).is_none_or(|&c| !c)
-                    && are_target_dependencies_completed(&params.name, target, &plan, &target_map)
+                    && are_target_dependencies_completed(
+                        &params.name,
+                        target,
+                        &plan,
+                        &target_map,
+                        &environment,
+                    )
             })
             .collect();
 
@@ -603,27 +629,36 @@ pub async fn run_all_targets_command(
             .map(|(target_idx, target)| {
                 let plan = Arc::clone(&plan);
                 let params = params.clone();
-                async move {
-                    for (step_idx, step) in plan.steps.iter().enumerate() {
-                        let step_number = step_idx.saturating_add(1);
-                        if !is_step_completed(&params.name, target_idx, step_number, step) {
-                            run_single_step(
-                                step,
-                                &target.manifest_dir,
+                {
+                    let environment = environment.clone();
+                    async move {
+                        for (step_idx, step) in plan.steps.iter().enumerate() {
+                            let step_number = step_idx.saturating_add(1);
+                            if !is_step_completed(
                                 &params.name,
-                                step_number,
                                 target_idx,
-                            )
-                            .await?;
+                                step_number,
+                                step,
+                                &environment,
+                            ) {
+                                run_single_step(
+                                    step,
+                                    &target.manifest_dir,
+                                    &params.name,
+                                    step_number,
+                                    target_idx,
+                                    &environment,
+                                )
+                                .await?;
+                            }
                         }
+                        Ok(target_idx)
                     }
-                    Ok(target_idx)
                 }
             })
             .buffer_unordered(jobs)
             .collect::<Vec<_>>()
             .await;
-
         for result in batch_results {
             match result {
                 Ok(target_idx) => {
@@ -658,16 +693,16 @@ pub async fn run_all_targets_command(
 ///
 /// # Errors
 ///
-/// fails if the implementation of task run fails
+/// This command can fail due to errors in its subcommands (run single step, run single target, run all targets).
 #[instrument]
 pub async fn task_run_command(
     params: TaskRunParameters,
     environment: crate::Environment,
 ) -> Result<(), Error> {
-    match params.command {
-        TaskRunCommand::SingleStep(p) => run_single_step_command(p, environment).await,
-        TaskRunCommand::SingleTarget(p) => run_single_target_command(p, environment).await,
-        TaskRunCommand::AllTargets(p) => run_all_targets_command(p, environment).await,
+    match params.sub_command {
+        TaskRunSubCommand::SingleStep(p) => run_single_step_command(p, environment).await,
+        TaskRunSubCommand::SingleTarget(p) => run_single_target_command(p, environment).await,
+        TaskRunSubCommand::AllTargets(p) => run_all_targets_command(p, environment).await,
     }
 }
 
@@ -675,22 +710,22 @@ pub async fn task_run_command(
 ///
 /// # Errors
 ///
-/// fails if the implementation of task fails
+/// This command can fail due to errors in its subcommands (create, remove, run), such as issues with task creation, removal (e.g., file system errors), or execution.
 #[instrument]
 pub async fn task_command(
     task_parameters: TaskParameters,
     environment: crate::Environment,
 ) -> Result<(), Error> {
-    match task_parameters.command {
-        TaskCommand::Create(params) => {
+    match task_parameters.sub_command {
+        TaskSubCommand::Create(params) => {
             task_create_command(params, environment).await?;
         }
-        TaskCommand::Remove(params) => {
+        TaskSubCommand::Remove(params) => {
             let task_dir = named_dir_path(&params.name, &environment)?;
             fs_err::remove_dir_all(&task_dir)
                 .map_err(|e| Error::CouldNotRemoveTaskDir(task_dir.clone(), e))?;
         }
-        TaskCommand::Run(params) => {
+        TaskSubCommand::Run(params) => {
             task_run_command(params, environment).await?;
         }
     }

@@ -10,9 +10,57 @@ use std::collections::HashMap;
 use crate::{Crate, Workspace};
 use tracing::instrument;
 
-/// Parameters for listing crates
+/// The target sub command
+#[derive(clap::Parser, Debug, Clone)]
+pub enum TargetSubCommand {
+    /// List workspaces and crates managed by cargo-for-each.
+    List(ListParameters),
+    /// Add a workspace or crate to be managed by cargo-for-each.
+    Add(AddParameters),
+    /// Remove a workspace or crate managed by cargo-for-each.
+    Remove(RemoveParameters),
+    /// Refresh the list of workspaces and crates managed by cargo-for-each, removing deleted entries and adding new ones.
+    Refresh,
+}
+
+/// Parameters for target subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct TargetParameters {
+    /// The target subcommand
+    #[clap(subcommand)]
+    pub sub_command: TargetSubCommand,
+}
+
+/// implementation of the target subcommand
+///
+/// # Errors
+///
+/// This command can fail due to errors in its subcommands, such as issues with loading or saving configuration, resolving manifest paths, or executing cargo metadata operations.
+#[instrument]
+pub async fn target_command(
+    target_parameters: TargetParameters,
+    environment: crate::Environment,
+) -> Result<(), crate::error::Error> {
+    match target_parameters.sub_command {
+        TargetSubCommand::List(list_parameters) => {
+            list_command(list_parameters, environment).await?;
+        }
+        TargetSubCommand::Add(add_parameters) => {
+            add_command(add_parameters, environment).await?;
+        }
+        TargetSubCommand::Remove(remove_parameters) => {
+            remove_command(remove_parameters, environment).await?;
+        }
+        TargetSubCommand::Refresh => {
+            refresh_command(environment).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Parameters for filtering crates
 #[derive(clap::Parser, Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CrateListParameters {
+pub struct CrateFilterParameters {
     /// only list crates of this type
     #[clap(long)]
     pub r#type: Option<CrateType>,
@@ -21,21 +69,21 @@ pub struct CrateListParameters {
     pub standalone: Option<bool>,
 }
 
-/// Parameters for listing workspaces
+/// Parameters for filtering workspaces
 #[derive(clap::Parser, Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct WorkspaceListParameters {
+pub struct WorkspaceFilterParameters {
     /// only list multi-crate workspaces
     #[clap(long)]
     pub no_standalone: bool,
 }
 
-/// The type of object to list
+/// The type of object to filter
 #[derive(clap::Parser, Debug, Clone)]
-pub enum ListType {
+pub enum TargetFilter {
     /// list workspaces
-    Workspaces(WorkspaceListParameters),
+    Workspaces(WorkspaceFilterParameters),
     /// list crates
-    Crates(CrateListParameters),
+    Crates(CrateFilterParameters),
 }
 
 /// Parameters for list subcommand
@@ -43,30 +91,14 @@ pub enum ListType {
 pub struct ListParameters {
     /// the type of object to list
     #[clap(subcommand)]
-    pub list_type: ListType,
-}
-
-/// Parameters for add subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub struct AddParameters {
-    /// the manifest file to add, if it refers to a workspace manifest all crates in the workspace are added too
-    #[clap(long)]
-    pub manifest_path: PathBuf,
-}
-
-/// Parameters for remove subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub struct RemoveParameters {
-    /// the manifest file to remove
-    #[clap(long)]
-    pub manifest_path: PathBuf,
+    pub target_filter: TargetFilter,
 }
 
 /// implementation of the list subcommand
 ///
 /// # Errors
 ///
-/// fails if the implementation of list fails
+/// This command can fail if the configuration file cannot be loaded or parsed.
 #[instrument]
 pub async fn list_command(
     list_parameters: ListParameters,
@@ -78,8 +110,8 @@ pub async fn list_command(
         return Ok(());
     };
     #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-    match list_parameters.list_type {
-        ListType::Workspaces(params) => {
+    match list_parameters.target_filter {
+        TargetFilter::Workspaces(params) => {
             for workspace in config.workspaces {
                 if params.no_standalone && workspace.is_standalone {
                     continue;
@@ -91,7 +123,7 @@ pub async fn list_command(
                 );
             }
         }
-        ListType::Crates(params) => {
+        TargetFilter::Crates(params) => {
             let workspace_standalone_map: HashMap<_, _> = config
                 .workspaces
                 .iter()
@@ -131,11 +163,19 @@ pub async fn list_command(
     Ok(())
 }
 
+/// Parameters for add subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct AddParameters {
+    /// the manifest file to add, if it refers to a workspace manifest all crates in the workspace are added too
+    #[clap(long)]
+    pub manifest_path: PathBuf,
+}
+
 /// implementation of the add subcommand
 ///
 /// # Errors
 ///
-/// fails if the implementation of add fails
+/// This command can fail due to issues with loading or saving the configuration, resolving or canonicalizing manifest paths, errors during cargo metadata execution, inability to determine parent directories of manifest paths, or if expected packages are not found in cargo metadata output.
 #[instrument]
 pub async fn add_command(
     add_parameters: AddParameters,
@@ -227,11 +267,19 @@ pub async fn add_command(
     Ok(())
 }
 
+/// Parameters for remove subcommand
+#[derive(clap::Parser, Debug, Clone)]
+pub struct RemoveParameters {
+    /// the manifest file to remove
+    #[clap(long)]
+    pub manifest_path: PathBuf,
+}
+
 /// implementation of the remove subcommand
 ///
 /// # Errors
 ///
-/// fails if the implementation of remove fails
+/// This command can fail due to issues with loading or saving the configuration, resolving or canonicalizing manifest paths, or other file system errors during config saving.
 #[instrument]
 pub async fn remove_command(
     remove_parameters: RemoveParameters,
@@ -282,7 +330,7 @@ pub async fn remove_command(
 ///
 /// # Errors
 ///
-/// fails if the implementation of refresh fails
+/// This command can fail due to issues with loading or saving the configuration, errors during cargo metadata execution, if expected packages are not found in cargo metadata output, or other file system errors during config saving.
 #[instrument]
 pub async fn refresh_command(environment: crate::Environment) -> Result<(), crate::error::Error> {
     let mut config = crate::Config::load(&environment)?;
@@ -377,54 +425,6 @@ pub async fn refresh_command(environment: crate::Environment) -> Result<(), crat
     Ok(())
 }
 
-/// The type of object to target
-#[derive(clap::Parser, Debug, Clone)]
-pub enum TargetType {
-    /// List workspaces and crates managed by cargo-for-each.
-    List(ListParameters),
-    /// Add a workspace or crate to be managed by cargo-for-each.
-    Add(AddParameters),
-    /// Remove a workspace or crate managed by cargo-for-each.
-    Remove(RemoveParameters),
-    /// Refresh the list of workspaces and crates managed by cargo-for-each, removing deleted entries and adding new ones.
-    Refresh,
-}
-
-/// Parameters for target subcommand
-#[derive(clap::Parser, Debug, Clone)]
-pub struct TargetParameters {
-    /// The type of object to target
-    #[clap(subcommand)]
-    pub target_type: TargetType,
-}
-
-/// implementation of the target subcommand
-///
-/// # Errors
-///
-/// fails if the implementation of target fails
-#[instrument]
-pub async fn target_command(
-    target_parameters: TargetParameters,
-    environment: crate::Environment,
-) -> Result<(), crate::error::Error> {
-    match target_parameters.target_type {
-        TargetType::List(list_parameters) => {
-            list_command(list_parameters, environment).await?;
-        }
-        TargetType::Add(add_parameters) => {
-            add_command(add_parameters, environment).await?;
-        }
-        TargetType::Remove(remove_parameters) => {
-            remove_command(remove_parameters, environment).await?;
-        }
-        TargetType::Refresh => {
-            refresh_command(environment).await?;
-        }
-    }
-    Ok(())
-}
-
 /// an extension trait on Cargo Metadata that allows easy retrieval
 /// of a few pieces of information we need regularly
 pub trait CargoMetadataExt {
@@ -435,7 +435,7 @@ pub trait CargoMetadataExt {
     ///
     /// # Errors
     ///
-    /// fails if there is no package like that
+    /// Returns a `FoundNoPackageInCargoMetadataWithCurrentManifestPath` error if no package is found with a manifest path matching the provided one.
     fn get_package_by_manifest_path(
         &self,
         manifest_path: &Path,
@@ -448,7 +448,7 @@ pub trait CargoMetadataExt {
     ///
     /// # Errors
     ///
-    /// fails if there is no package like that
+    /// Returns a `FoundNoPackageInCargoMetadataWithPackageId` error if no package is found with the provided package ID.
     fn get_package_by_id(
         &self,
         package_id: &PackageId,

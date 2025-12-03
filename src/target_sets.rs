@@ -19,25 +19,16 @@ pub struct ResolvedTargetSet {
     pub targets: Vec<Target>,
 }
 
-/// The type of target set to create
-#[derive(clap::Parser, Debug, Clone)]
-pub enum TargetSetType {
-    /// a set of workspaces
-    Workspaces(crate::targets::WorkspaceListParameters),
-    /// a set of crates
-    Crates(crate::targets::CrateListParameters),
-}
-
 /// an enum that describes a set of targets
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, clap::Parser)]
 pub enum TargetSet {
     /// a set of crates
-    Crates(crate::targets::CrateListParameters),
+    Crates(crate::targets::CrateFilterParameters),
     /// a set of workspaces
-    Workspaces(crate::targets::WorkspaceListParameters),
+    Workspaces(crate::targets::WorkspaceFilterParameters),
 }
 
-/// resolves a target set to a list of manifest directories
+/// resolves a target set to a list of manifest directories with dependencies
 ///
 /// # Errors
 ///
@@ -189,8 +180,7 @@ pub fn dir_path(environment: &crate::Environment) -> Result<PathBuf, Error> {
 ///
 /// # Errors
 ///
-/// Returns an error if the target set file cannot be checked for existence,
-/// read, parsed, or if the target set is not found.
+/// Returns an error if the configuration directory cannot be determined, if the target set file cannot be checked for existence, read, or parsed, or if the target set is not found.
 pub fn load_target_set(name: &str, environment: &crate::Environment) -> Result<TargetSet, Error> {
     let target_set_path = dir_path(environment)?.join(format!("{name}.toml"));
     if fs_err::exists(&target_set_path)
@@ -204,6 +194,76 @@ pub fn load_target_set(name: &str, environment: &crate::Environment) -> Result<T
     }
 }
 
+/// Subcommands for the target-set command
+#[derive(Parser, Debug, Clone)]
+pub enum TargetSetSubCommand {
+    /// List existing target sets
+    List,
+    /// Create a new target set
+    Create(CreateTargetSetParameters),
+    /// Remove a target set
+    Remove(RemoveTargetSetParameters),
+}
+
+/// Parameters for target-set subcommand
+#[derive(Parser, Debug, Clone)]
+pub struct TargetSetParameters {
+    /// the `target-set` subcommand to run
+    #[clap(subcommand)]
+    pub sub_command: TargetSetSubCommand,
+}
+
+/// implementation of the target-set subcommand
+///
+/// # Errors
+///
+/// This command can fail due to errors in its subcommands (list, create, remove), such as issues with configuration, file system operations, or if a target set is not found.
+#[instrument]
+pub async fn target_set_command(
+    target_set_parameters: TargetSetParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    match target_set_parameters.sub_command {
+        TargetSetSubCommand::List => {
+            list_command(environment).await?;
+        }
+        TargetSetSubCommand::Create(create_parameters) => {
+            create_command(create_parameters, environment).await?;
+        }
+        TargetSetSubCommand::Remove(remove_parameters) => {
+            remove_command(remove_parameters, environment).await?;
+        }
+    }
+    Ok(())
+}
+
+/// implementation of the target-set list subcommand
+///
+/// # Errors
+///
+/// This command can fail if the configuration directory cannot be determined, or if there are issues reading the target sets directory or individual target set files.
+pub async fn list_command(environment: crate::Environment) -> Result<(), Error> {
+    let target_sets_dir = dir_path(&environment)?;
+    if !target_sets_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs_err::read_dir(target_sets_dir).map_err(Error::CouldNotReadTargetSetsDir)? {
+        let entry = entry.map_err(Error::CouldNotReadTargetSetsDir)?;
+        let path = entry.path();
+        #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
+        if path.is_file()
+            && let Some(extension) = path.extension()
+            && extension == "toml"
+            && let Some(name) = path.file_stem()
+        {
+            println!("{}", name.to_string_lossy());
+            let content = fs_err::read_to_string(&path).map_err(Error::CouldNotReadConfigFile)?;
+            println!("{content}");
+        }
+    }
+    Ok(())
+}
+
 /// Parameters for creating a new target set
 #[derive(Parser, Debug, Clone)]
 pub struct CreateTargetSetParameters {
@@ -212,7 +272,36 @@ pub struct CreateTargetSetParameters {
     pub name: String,
     /// the type of target set to create
     #[clap(subcommand)]
-    pub target_set_type: TargetSetType,
+    pub target_set: TargetSet,
+}
+
+/// implementation of the target-set create subcommand
+///
+/// # Errors
+///
+/// This command can fail if the configuration directory cannot be determined, if a target set with the given name already exists, if parent directories for the target set file cannot be created, if the target set cannot be serialized, or if the target set file cannot be written.
+pub async fn create_command(
+    create_parameters: CreateTargetSetParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    let target_set = create_parameters.target_set;
+    let target_set_path = dir_path(&environment)?.join(format!("{}.toml", create_parameters.name));
+    if target_set_path.exists() {
+        return Err(Error::AlreadyExists(format!(
+            "target set {}",
+            create_parameters.name
+        )));
+    }
+    if let Some(target_set_dir_path) = target_set_path.parent() {
+        fs_err::create_dir_all(target_set_dir_path)
+            .map_err(Error::CouldNotCreateTargetSetFileParentDirs)?;
+    }
+    fs_err::write(
+        &target_set_path,
+        toml::to_string(&target_set).map_err(Error::CouldNotSerializeTargetSetFile)?,
+    )
+    .map_err(Error::CouldNotWriteTargetSetFile)?;
+    Ok(())
 }
 
 /// Parameters for deleting a target set
@@ -223,82 +312,16 @@ pub struct RemoveTargetSetParameters {
     pub name: String,
 }
 
-/// The `target-set` subcommand
-#[derive(Parser, Debug, Clone)]
-pub enum TargetSetCommand {
-    /// Create a new target set
-    Create(CreateTargetSetParameters),
-    /// Remove a target set
-    Remove(RemoveTargetSetParameters),
-    /// List existing target sets
-    List,
-}
-
-/// Parameters for target-set subcommand
-#[derive(Parser, Debug, Clone)]
-pub struct TargetSetParameters {
-    /// the `target-set` subcommand to run
-    #[clap(subcommand)]
-    pub command: TargetSetCommand,
-}
-
-/// implementation of the target-set subcommand
+/// implementation of the target-set remove subcommand
 ///
 /// # Errors
 ///
-/// fails if the implementation of target-set fails
-#[instrument]
-#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-pub async fn target_set_command(
-    target_set_parameters: TargetSetParameters,
+/// This command can fail if the configuration directory cannot be determined, or if the target set file cannot be removed.
+pub async fn remove_command(
+    remove_parameters: RemoveTargetSetParameters,
     environment: crate::Environment,
 ) -> Result<(), Error> {
-    match target_set_parameters.command {
-        TargetSetCommand::Create(params) => {
-            let target_set = match params.target_set_type {
-                TargetSetType::Crates(params) => TargetSet::Crates(params),
-                TargetSetType::Workspaces(params) => TargetSet::Workspaces(params),
-            };
-            let target_set_path = dir_path(&environment)?.join(format!("{}.toml", params.name));
-            if target_set_path.exists() {
-                return Err(Error::AlreadyExists(format!("target set {}", params.name)));
-            }
-            if let Some(target_set_dir_path) = target_set_path.parent() {
-                fs_err::create_dir_all(target_set_dir_path)
-                    .map_err(Error::CouldNotCreateTargetSetFileParentDirs)?;
-            }
-            fs_err::write(
-                &target_set_path,
-                toml::to_string(&target_set).map_err(Error::CouldNotSerializeTargetSetFile)?,
-            )
-            .map_err(Error::CouldNotWriteTargetSetFile)?;
-        }
-        TargetSetCommand::Remove(params) => {
-            let target_set_path = dir_path(&environment)?.join(format!("{}.toml", params.name));
-            fs_err::remove_file(target_set_path).map_err(Error::CouldNotRemoveTargetSetFile)?;
-        }
-        TargetSetCommand::List => {
-            let target_sets_dir = dir_path(&environment)?;
-            if !target_sets_dir.exists() {
-                return Ok(());
-            }
-            for entry in
-                fs_err::read_dir(target_sets_dir).map_err(Error::CouldNotReadTargetSetsDir)?
-            {
-                let entry = entry.map_err(Error::CouldNotReadTargetSetsDir)?;
-                let path = entry.path();
-                if path.is_file()
-                    && let Some(extension) = path.extension()
-                    && extension == "toml"
-                    && let Some(name) = path.file_stem()
-                {
-                    println!("{}", name.to_string_lossy());
-                    let content =
-                        fs_err::read_to_string(&path).map_err(Error::CouldNotReadConfigFile)?;
-                    println!("{content}");
-                }
-            }
-        }
-    }
+    let target_set_path = dir_path(&environment)?.join(format!("{}.toml", remove_parameters.name));
+    fs_err::remove_file(target_set_path).map_err(Error::CouldNotRemoveTargetSetFile)?;
     Ok(())
 }
