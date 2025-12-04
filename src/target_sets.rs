@@ -40,12 +40,37 @@ pub fn resolve_target_set(
     config: &crate::Config,
 ) -> Result<ResolvedTargetSet, Error> {
     let initial_manifest_dirs: Vec<PathBuf> = match target_set {
-        TargetSet::Workspaces(params) => config
-            .workspaces
-            .iter()
-            .filter(|w| !params.no_standalone || !w.is_standalone)
-            .map(|w| w.manifest_dir.clone())
-            .collect(),
+        TargetSet::Workspaces(params) => {
+            let mut manifest_dirs = Vec::new();
+            for w in config
+                .workspaces
+                .iter()
+                .filter(|w| !params.no_standalone || !w.is_standalone)
+            {
+                let metadata = cargo_metadata::MetadataCommand::new()
+                    .manifest_path(w.manifest_dir.join("Cargo.toml"))
+                    .exec()
+                    .map_err(|e| Error::CargoMetadataError(w.manifest_dir.clone(), e))?;
+
+                for member_id in &metadata.workspace_members {
+                    if let Some(package) = metadata.packages.iter().find(|p| &p.id == member_id) {
+                        manifest_dirs.push(
+                            package
+                                .manifest_path
+                                .parent()
+                                .ok_or_else(|| {
+                                    Error::ManifestPathHasNoParentDir(
+                                        package.manifest_path.clone().into_std_path_buf(),
+                                    )
+                                })?
+                                .to_path_buf()
+                                .into(),
+                        );
+                    }
+                }
+            }
+            manifest_dirs
+        }
         TargetSet::Crates(params) => {
             let workspace_standalone_map: HashMap<_, _> = config
                 .workspaces
@@ -111,11 +136,11 @@ pub fn resolve_target_set(
                             package.manifest_path.clone().into_std_path_buf(),
                         )
                     })
-                    .ok()?; // Use ok() to turn into Option for find_map
+                    .ok()?;
                 let canonical_package_manifest_dir =
-                    fs_err::canonicalize(package_manifest_dir).ok()?; // Use ok()
+                    fs_err::canonicalize(package_manifest_dir).ok()?;
 
-                let canonical_manifest_dir = fs_err::canonicalize(manifest_dir.clone()).ok()?; // Use ok()
+                let canonical_manifest_dir = fs_err::canonicalize(manifest_dir.clone()).ok()?;
 
                 if canonical_package_manifest_dir == canonical_manifest_dir {
                     Some(id.clone())
@@ -129,7 +154,7 @@ pub fn resolve_target_set(
 
         let current_package = all_packages.get(&current_package_id).ok_or_else(|| {
             Error::FoundNoPackageInCargoMetadataWithGivenManifestPath(manifest_dir.clone())
-        })?; // Should not happen if current_package_id was found
+        })?;
 
         let mut dependencies: Vec<PathBuf> = Vec::new();
 
@@ -324,4 +349,80 @@ pub async fn remove_command(
     let target_set_path = dir_path(&environment)?.join(format!("{}.toml", remove_parameters.name));
     fs_err::remove_file(target_set_path).map_err(Error::CouldNotRemoveTargetSetFile)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Config, Environment, targets::WorkspaceFilterParameters};
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_resolve_target_set_workspaces_with_sub_crates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Create a temporary directory for the test environment
+        let temp_dir = tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+        let temp_path = temp_dir.path();
+
+        // 1. Setup workspace with sub-crates
+        let workspace_root_dir = temp_path.join("workspace_root");
+        fs_err::create_dir_all(&workspace_root_dir)?;
+        fs_err::write(
+            workspace_root_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member1\", \"member2\"]\nresolver = \"2\"\n",
+        )?;
+
+        let member1_dir = workspace_root_dir.join("member1");
+        std::process::Command::new("cargo")
+            .current_dir(&workspace_root_dir)
+            .arg("new")
+            .arg("--lib")
+            .arg("member1")
+            .output()?;
+
+        let member2_dir = workspace_root_dir.join("member2");
+        std::process::Command::new("cargo")
+            .current_dir(&workspace_root_dir)
+            .arg("new")
+            .arg("--bin")
+            .arg("member2")
+            .output()?;
+
+        // 2. Create a mock Config
+        let mut config = Config::default();
+        config.add_workspace(crate::Workspace {
+            manifest_dir: workspace_root_dir.clone(),
+            is_standalone: false,
+        });
+
+        // Save the mock config to the environment
+        config.save(&environment)?;
+
+        // 3. Call resolve_target_set
+        let target_set = TargetSet::Workspaces(WorkspaceFilterParameters {
+            no_standalone: false,
+        });
+        let resolved_target_set = resolve_target_set(&target_set, &config)?;
+
+        // 4. Assertions
+        assert_eq!(resolved_target_set.targets.len(), 2);
+
+        let mut found_member1 = false;
+        let mut found_member2 = false;
+
+        for target in resolved_target_set.targets {
+            if target.manifest_dir == member1_dir {
+                found_member1 = true;
+            } else if target.manifest_dir == member2_dir {
+                found_member2 = true;
+            }
+        }
+
+        assert!(found_member1, "Did not find target for member1");
+        assert!(found_member2, "Did not find target for member2");
+
+        Ok(())
+    }
 }
