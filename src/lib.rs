@@ -73,6 +73,8 @@ pub struct Environment {
     pub state_dir: std::path::PathBuf,
     /// paths from PATH
     pub paths: Vec<std::path::PathBuf>,
+    /// if true, sub-processes stdout and stderr are suppressed and traced
+    pub suppress_subprocess_output: bool,
 }
 
 impl Environment {
@@ -90,6 +92,7 @@ impl Environment {
                 .split(':')
                 .map(std::path::PathBuf::from)
                 .collect(),
+            suppress_subprocess_output: false,
         })
     }
 
@@ -115,6 +118,7 @@ impl Environment {
             config_dir,
             state_dir,
             paths: vec![bin_dir], // Add the bin_dir to the paths
+            suppress_subprocess_output: true,
         })
     }
 }
@@ -300,6 +304,7 @@ mod tests {
             CreateTaskParameters, RunAllTargetsParameters, TaskParameters, TaskRunParameters,
             TaskRunSubCommand, TaskSubCommand,
         },
+        utils::execute_command,
     };
 
     #[tracing_test::traced_test]
@@ -345,12 +350,13 @@ mod tests {
 
         tracing::debug!("Creating library crate test1");
 
-        let output = std::process::Command::new("cargo")
-            .current_dir(&workspaces_dir)
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&workspaces_dir)
             .arg("new")
             .arg("--lib")
-            .arg("test1")
-            .output()?;
+            .arg("test1");
+
+        let output = execute_command(&mut cmd, &environment, &workspaces_dir)?;
         assert!(
             output.status.success(),
             "Creating test crate test1 failed with status {} stdout {} stderr {}",
@@ -379,12 +385,13 @@ mod tests {
 
         tracing::debug!("Creating binary crate test2");
 
-        let output = std::process::Command::new("cargo")
-            .current_dir(&workspaces_dir)
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&workspaces_dir)
             .arg("new")
             .arg("--bin")
-            .arg("test2")
-            .output()?;
+            .arg("test2");
+
+        let output = execute_command(&mut cmd, &environment, &workspaces_dir)?;
         assert!(
             output.status.success(),
             "Creating test crate test2 failed with status {} stdout {} stderr {}",
@@ -543,12 +550,13 @@ mod tests {
 
         tracing::debug!("Creating library crate test1");
 
-        let output = std::process::Command::new("cargo")
-            .current_dir(&workspace1_dir)
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&workspace1_dir)
             .arg("new")
             .arg("--lib")
-            .arg("test1")
-            .output()?;
+            .arg("test1");
+
+        let output = execute_command(&mut cmd, &environment, &workspace1_dir)?;
         assert!(
             output.status.success(),
             "Creating test crate test1 failed with status {} stdout {} stderr {}",
@@ -559,12 +567,13 @@ mod tests {
 
         tracing::debug!("Creating binary crate test2");
 
-        let output = std::process::Command::new("cargo")
-            .current_dir(&workspace1_dir)
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&workspace1_dir)
             .arg("new")
             .arg("--bin")
-            .arg("test2")
-            .output()?;
+            .arg("test2");
+
+        let output = execute_command(&mut cmd, &environment, &workspace1_dir)?;
         assert!(
             output.status.success(),
             "Creating test crate test2 failed with status {} stdout {} stderr {}",
@@ -602,12 +611,13 @@ mod tests {
 
         tracing::debug!("Creating library crate test3");
 
-        let output = std::process::Command::new("cargo")
-            .current_dir(&workspace2_dir)
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&workspace2_dir)
             .arg("new")
             .arg("--lib")
-            .arg("test3")
-            .output()?;
+            .arg("test3");
+
+        let output = execute_command(&mut cmd, &environment, &workspace2_dir)?;
         assert!(
             output.status.success(),
             "Creating test crate test3 failed with status {} stdout {} stderr {}",
@@ -618,12 +628,13 @@ mod tests {
 
         tracing::debug!("Creating binary crate test4");
 
-        let output = std::process::Command::new("cargo")
-            .current_dir(&workspace2_dir)
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&workspace2_dir)
             .arg("new")
             .arg("--bin")
-            .arg("test4")
-            .output()?;
+            .arg("test4");
+
+        let output = execute_command(&mut cmd, &environment, &workspace2_dir)?;
         assert!(
             output.status.success(),
             "Creating test crate test4 failed with status {} stdout {} stderr {}",

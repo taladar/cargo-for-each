@@ -69,3 +69,60 @@ pub fn is_executable(path: &std::path::Path) -> bool {
     // Fallback for non-unix, non-windows systems.
     path.is_file()
 }
+
+use crate::Environment;
+use crate::error::Error;
+use std::process::{Command, Output, Stdio};
+
+/// Executes a command, optionally suppressing its stdout/stderr and tracing them instead.
+///
+/// If `environment.suppress_subprocess_output` is `true`, the command's stdout and stderr
+/// are captured and logged at `tracing::trace` level. Otherwise, they are inherited
+/// from the parent process.
+///
+/// # Arguments
+///
+/// * `command` - A mutable reference to the `std::process::Command` to execute.
+/// * `environment` - A reference to the application's `Environment` configuration.
+/// * `cwd` - The current working directory in which to execute the command.
+///
+/// # Errors
+///
+/// returns an error if the command execution fails
+pub fn execute_command(
+    command: &mut Command,
+    environment: &Environment,
+    cwd: &std::path::Path,
+) -> Result<Output, Error> {
+    if environment.suppress_subprocess_output {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = command.output().map_err(|e| {
+            Error::CommandExecutionFailed(format!("{command:?}"), cwd.to_path_buf(), e)
+        })?;
+
+        tracing::trace!(
+            "Command stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        tracing::trace!(
+            "Command stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        Ok(output)
+    } else {
+        let output = command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .output()
+            .map_err(|e| {
+                Error::CommandExecutionFailed(format!("{command:?}"), cwd.to_path_buf(), e)
+            })?;
+        Ok(output)
+    }
+}

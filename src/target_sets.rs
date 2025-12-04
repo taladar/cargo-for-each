@@ -354,7 +354,7 @@ pub async fn remove_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, Environment, targets::WorkspaceFilterParameters};
+    use crate::{Config, Environment, targets::WorkspaceFilterParameters, utils::execute_command};
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -375,20 +375,22 @@ mod tests {
         )?;
 
         let member1_dir = workspace_root_dir.join("member1");
-        std::process::Command::new("cargo")
-            .current_dir(&workspace_root_dir)
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&workspace_root_dir)
             .arg("new")
             .arg("--lib")
-            .arg("member1")
-            .output()?;
+            .arg("member1");
+
+        execute_command(&mut cmd, &environment, &workspace_root_dir)?;
 
         let member2_dir = workspace_root_dir.join("member2");
-        std::process::Command::new("cargo")
-            .current_dir(&workspace_root_dir)
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&workspace_root_dir)
             .arg("new")
             .arg("--bin")
-            .arg("member2")
-            .output()?;
+            .arg("member2");
+
+        execute_command(&mut cmd, &environment, &workspace_root_dir)?;
 
         // 2. Create a mock Config
         let mut config = Config::default();

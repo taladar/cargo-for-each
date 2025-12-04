@@ -225,20 +225,14 @@ pub async fn run_single_step(
             }
 
             let command_str = format!("{} {}", command, args.join(" "));
-            cmd.arg("record")
-                .arg("-q")
-                .arg("-c")
-                .arg(&command_str)
-                .arg(&cast_path);
+            cmd.arg("record");
+            if environment.suppress_subprocess_output {
+                cmd.arg("--headless");
+            }
+            cmd.arg("-q").arg("-c").arg(&command_str).arg(&cast_path);
             cmd.current_dir(manifest_dir);
 
-            let status = cmd.status().map_err(|e| {
-                Error::CommandExecutionFailed(
-                    "asciinema".to_string(),
-                    manifest_dir.to_path_buf(),
-                    e,
-                )
-            })?;
+            let status = crate::utils::execute_command(&mut cmd, environment, manifest_dir)?.status;
 
             let exit_status_path = state_dir.join("exit_status");
             fs_err::write(
@@ -269,16 +263,14 @@ pub async fn run_single_step(
             );
 
             let mut cmd = Command::new("asciinema");
-            cmd.arg("record").arg("-q").arg(&cast_path);
+            cmd.arg("record");
+            if environment.suppress_subprocess_output {
+                cmd.arg("--headless");
+            }
+            cmd.arg("-q").arg(&cast_path);
             cmd.current_dir(manifest_dir);
 
-            let status = cmd.status().map_err(|e| {
-                Error::CommandExecutionFailed(
-                    "asciinema".to_string(),
-                    manifest_dir.to_path_buf(),
-                    e,
-                )
-            })?;
+            let status = crate::utils::execute_command(&mut cmd, environment, manifest_dir)?.status;
 
             if !status.success() {
                 println!("Shell exited with a non-zero status code: {status}");
