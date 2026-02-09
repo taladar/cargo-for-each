@@ -224,7 +224,14 @@ pub async fn run_single_step(
                 return Err(crate::error::Error::CommandNotFound(command.to_owned()));
             }
 
-            let command_str = format!("{} {}", command, args.join(" "));
+            let command_str = format!(
+                "{} {}",
+                command,
+                args.iter()
+                    .map(|arg| format!("\"{}\"", arg.replace('"', "\\\"")))
+                    .collect::<Vec<String>>()
+                    .join(" ")
+            );
             cmd.arg("record");
             if environment.suppress_subprocess_output {
                 cmd.arg("--headless");
