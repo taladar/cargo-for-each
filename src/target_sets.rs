@@ -110,6 +110,7 @@ pub fn resolve_target_set(
     for manifest_dir in &initial_manifest_dirs {
         let metadata = cargo_metadata::MetadataCommand::new()
             .manifest_path(manifest_dir.join("Cargo.toml"))
+            .no_deps()
             .exec()
             .map_err(|e| Error::CargoMetadataError(manifest_dir.clone(), e))?;
 
