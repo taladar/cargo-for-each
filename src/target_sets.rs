@@ -229,6 +229,16 @@ pub enum TargetSetSubCommand {
     Create(CreateTargetSetParameters),
     /// Remove a target set
     Remove(RemoveTargetSetParameters),
+    /// Describe a target set by listing its resolved targets (crates/workspaces)
+    Describe(DescribeTargetSetParameters),
+}
+
+/// Parameters for describing a target set
+#[derive(Parser, Debug, Clone)]
+pub struct DescribeTargetSetParameters {
+    /// the name of the target set to describe
+    #[clap(long)]
+    pub name: String,
 }
 
 /// Parameters for target-set subcommand
@@ -259,7 +269,33 @@ pub async fn target_set_command(
         TargetSetSubCommand::Remove(remove_parameters) => {
             remove_command(remove_parameters, environment).await?;
         }
+        TargetSetSubCommand::Describe(describe_parameters) => {
+            describe_command(describe_parameters, environment).await?;
+        }
     }
+    Ok(())
+}
+
+/// implementation of the target-set describe subcommand
+///
+/// # Errors
+///
+/// This command can fail if the configuration cannot be loaded, if the target set is not found,
+/// or if there are issues resolving the target set to actual targets.
+#[instrument]
+pub async fn describe_command(
+    describe_parameters: DescribeTargetSetParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    let config = crate::Config::load(&environment)?;
+    let target_set = load_target_set(&describe_parameters.name, &environment)?;
+    let resolved_target_set = resolve_target_set(&target_set, &config)?;
+
+    #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
+    for target in resolved_target_set.targets {
+        println!("{}", target.manifest_dir.display());
+    }
+
     Ok(())
 }
 
@@ -358,6 +394,78 @@ mod tests {
     use crate::{Config, Environment, targets::WorkspaceFilterParameters, utils::execute_command};
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_describe_target_set_workspaces() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+        let temp_path = temp_dir.path();
+        let workspaces_dir = temp_path.join("workspaces");
+        fs_err::create_dir_all(&workspaces_dir)?;
+
+        let workspace_root_dir = workspaces_dir.join("workspace_root");
+        fs_err::create_dir_all(&workspace_root_dir)?;
+        fs_err::write(
+            workspace_root_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member1\", \"member2\"]\nresolver = \"2\"\n",
+        )?;
+
+        let member1_dir = workspace_root_dir.join("member1");
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&workspace_root_dir)
+            .arg("new")
+            .arg("--lib")
+            .arg("member1");
+        execute_command(&mut cmd, &environment, &workspace_root_dir)?;
+
+        let member2_dir = workspace_root_dir.join("member2");
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&workspace_root_dir)
+            .arg("new")
+            .arg("--bin")
+            .arg("member2");
+        execute_command(&mut cmd, &environment, &workspace_root_dir)?;
+
+        let options = crate::Options {
+            command: crate::Command::Target(crate::targets::TargetParameters {
+                sub_command: crate::targets::TargetSubCommand::Add(crate::targets::AddParameters {
+                    manifest_path: workspace_root_dir.join("Cargo.toml"),
+                }),
+            }),
+        };
+        crate::run_app(options, environment.clone()).await?;
+
+        let options = crate::Options {
+            command: crate::Command::TargetSet(TargetSetParameters {
+                sub_command: TargetSetSubCommand::Create(CreateTargetSetParameters {
+                    name: "test-describe-set".to_string(),
+                    target_set: TargetSet::Workspaces(WorkspaceFilterParameters {
+                        no_standalone: false,
+                    }),
+                }),
+            }),
+        };
+        crate::run_app(options, environment.clone()).await?;
+
+        let cargo_for_each_bin_path =
+            std::env::current_dir()?.join("target/release/cargo-for-each");
+
+        let mut command = std::process::Command::new(&cargo_for_each_bin_path);
+        command
+            .env("XDG_CONFIG_HOME", &environment.config_dir) // Set XDG_CONFIG_HOME for the external command
+            .arg("target-set")
+            .arg("describe")
+            .arg("--name")
+            .arg("test-describe-set");
+
+        let output = crate::utils::execute_command(&mut command, &environment, temp_path)?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(&member1_dir.to_string_lossy().to_string()));
+        assert!(stdout.contains(&member2_dir.to_string_lossy().to_string()));
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_resolve_target_set_workspaces_with_sub_crates()
