@@ -47,27 +47,7 @@ pub fn resolve_target_set(
                 .iter()
                 .filter(|w| !params.no_standalone || !w.is_standalone)
             {
-                let metadata = cargo_metadata::MetadataCommand::new()
-                    .manifest_path(w.manifest_dir.join("Cargo.toml"))
-                    .exec()
-                    .map_err(|e| Error::CargoMetadataError(w.manifest_dir.clone(), e))?;
-
-                for member_id in &metadata.workspace_members {
-                    if let Some(package) = metadata.packages.iter().find(|p| &p.id == member_id) {
-                        manifest_dirs.push(
-                            package
-                                .manifest_path
-                                .parent()
-                                .ok_or_else(|| {
-                                    Error::ManifestPathHasNoParentDir(
-                                        package.manifest_path.clone().into_std_path_buf(),
-                                    )
-                                })?
-                                .to_path_buf()
-                                .into(),
-                        );
-                    }
-                }
+                manifest_dirs.push(w.manifest_dir.clone());
             }
             manifest_dirs
         }
@@ -103,93 +83,113 @@ pub fn resolve_target_set(
     let target_manifest_paths_set: HashSet<PathBuf> =
         initial_manifest_dirs.iter().cloned().collect();
 
-    // Collect all packages from all initial_manifest_dirs into a single map
-    let mut all_packages: HashMap<PackageId, cargo_metadata::Package> = HashMap::new();
-    let mut package_name_to_id: HashMap<String, PackageId> = HashMap::new();
-
-    for manifest_dir in &initial_manifest_dirs {
-        let metadata = cargo_metadata::MetadataCommand::new()
-            .manifest_path(manifest_dir.join("Cargo.toml"))
-            .no_deps()
-            .exec()
-            .map_err(|e| Error::CargoMetadataError(manifest_dir.clone(), e))?;
-
-        for package in metadata.packages {
-            all_packages.insert(package.id.clone(), package.clone());
-            package_name_to_id.insert(package.name.to_string(), package.id.clone());
-        }
-    }
-
     let mut targets: Vec<Target> = Vec::new();
 
-    for manifest_dir in &initial_manifest_dirs {
-        // Find the package corresponding to the current manifest_dir
-        let current_package_id = package_name_to_id
-            .iter()
-            .find_map(|(_name, id)| {
-                let package = all_packages.get(id)?;
-                // Compare canonicalized paths to avoid issues with different path representations
-                let package_manifest_dir = package
-                    .manifest_path
-                    .parent()
-                    .ok_or_else(|| {
-                        Error::ManifestPathHasNoParentDir(
-                            package.manifest_path.clone().into_std_path_buf(),
-                        )
-                    })
-                    .ok()?;
-                let canonical_package_manifest_dir =
-                    fs_err::canonicalize(package_manifest_dir).ok()?;
+    match target_set {
+        TargetSet::Workspaces(_) => {
+            // If it's a Workspace target set, the initial_manifest_dirs are already the targets
+            for manifest_dir in initial_manifest_dirs {
+                targets.push(Target {
+                    manifest_dir,
+                    dependencies: Vec::new(), // Workspaces don't have dependencies in this context
+                });
+            }
+        }
+        TargetSet::Crates(_) => {
+            // For Crates, we need to collect metadata and resolve dependencies
+            let mut all_packages: HashMap<PackageId, cargo_metadata::Package> = HashMap::new();
+            let mut package_name_to_id: HashMap<String, PackageId> = HashMap::new();
 
-                let canonical_manifest_dir = fs_err::canonicalize(manifest_dir.clone()).ok()?;
+            let unique_workspace_roots: HashSet<PathBuf> = config
+                .workspaces
+                .iter()
+                .map(|w| w.manifest_dir.clone())
+                .collect();
 
-                if canonical_package_manifest_dir == canonical_manifest_dir {
-                    Some(id.clone())
-                } else {
-                    None
+            for workspace_root in &unique_workspace_roots {
+                let manifest_path_for_metadata = workspace_root.join("Cargo.toml");
+                let metadata = cargo_metadata::MetadataCommand::new()
+                    .manifest_path(&manifest_path_for_metadata)
+                    .no_deps()
+                    .exec()
+                    .map_err(|e| Error::CargoMetadataError(workspace_root.clone(), e))?;
+
+                for package in metadata.packages {
+                    all_packages.insert(package.id.clone(), package.clone());
+                    package_name_to_id.insert(package.name.to_string(), package.id.clone());
                 }
-            })
-            .ok_or_else(|| {
-                Error::FoundNoPackageInCargoMetadataWithGivenManifestPath(manifest_dir.clone())
-            })?;
+            }
 
-        let current_package = all_packages.get(&current_package_id).ok_or_else(|| {
-            Error::FoundNoPackageInCargoMetadataWithGivenManifestPath(manifest_dir.clone())
-        })?;
+            for manifest_dir in initial_manifest_dirs {
+                let current_package_id = package_name_to_id
+                    .iter()
+                    .find_map(|(_name, id)| {
+                        let package = all_packages.get(id)?;
+                        let package_manifest_dir = package
+                            .manifest_path
+                            .parent()
+                            .ok_or_else(|| {
+                                Error::ManifestPathHasNoParentDir(
+                                    package.manifest_path.clone().into_std_path_buf(),
+                                )
+                            })
+                            .ok()?;
+                        let canonical_package_manifest_dir =
+                            fs_err::canonicalize(package_manifest_dir).ok()?;
 
-        let mut dependencies: Vec<PathBuf> = Vec::new();
+                        let canonical_manifest_dir =
+                            fs_err::canonicalize(manifest_dir.clone()).ok()?;
 
-        for dep in &current_package.dependencies {
-            if let Some(dep_package_id) = package_name_to_id.get(&dep.name)
-                && let Some(dep_package) = all_packages.get(dep_package_id)
-            {
-                let dep_manifest_path = dep_package
-                    .manifest_path
-                    .parent()
+                        if canonical_package_manifest_dir == canonical_manifest_dir {
+                            Some(id.clone())
+                        } else {
+                            None
+                        }
+                    })
                     .ok_or_else(|| {
-                        Error::ManifestPathHasNoParentDir(
-                            dep_package.manifest_path.clone().into_std_path_buf(),
-                        )
-                    })?
-                    .canonicalize()
-                    .map_err(|e| {
-                        Error::CouldNotDetermineCanonicalManifestPath(
-                            dep_package.manifest_path.clone().into_std_path_buf(),
-                            e,
+                        Error::FoundNoPackageInCargoMetadataWithGivenManifestPath(
+                            manifest_dir.clone(),
                         )
                     })?;
 
-                if target_manifest_paths_set.contains(&dep_manifest_path) {
-                    dependencies.push(dep_manifest_path);
+                let current_package = all_packages.get(&current_package_id).ok_or_else(|| {
+                    Error::FoundNoPackageInCargoMetadataWithGivenManifestPath(manifest_dir.clone())
+                })?;
+
+                let mut dependencies: Vec<PathBuf> = Vec::new();
+
+                for dep in &current_package.dependencies {
+                    if let Some(dep_package_id) = package_name_to_id.get(&dep.name)
+                        && let Some(dep_package) = all_packages.get(dep_package_id)
+                    {
+                        let dep_manifest_path = dep_package
+                            .manifest_path
+                            .parent()
+                            .ok_or_else(|| {
+                                Error::ManifestPathHasNoParentDir(
+                                    dep_package.manifest_path.clone().into_std_path_buf(),
+                                )
+                            })?
+                            .canonicalize()
+                            .map_err(|e| {
+                                Error::CouldNotDetermineCanonicalManifestPath(
+                                    dep_package.manifest_path.clone().into_std_path_buf(),
+                                    e,
+                                )
+                            })?;
+
+                        if target_manifest_paths_set.contains(&dep_manifest_path) {
+                            dependencies.push(dep_manifest_path);
+                        }
+                    }
                 }
+                targets.push(Target {
+                    manifest_dir: manifest_dir.clone(),
+                    dependencies,
+                });
             }
         }
-        targets.push(Target {
-            manifest_dir: manifest_dir.clone(),
-            dependencies,
-        });
     }
-
     Ok(ResolvedTargetSet { targets })
 }
 
@@ -391,7 +391,7 @@ pub async fn remove_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, Environment, targets::WorkspaceFilterParameters, utils::execute_command};
+    use crate::{Environment, targets::WorkspaceFilterParameters, utils::execute_command};
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -410,7 +410,7 @@ mod tests {
             "[workspace]\nmembers = [\"member1\", \"member2\"]\nresolver = \"2\"\n",
         )?;
 
-        let member1_dir = workspace_root_dir.join("member1");
+        let _member1_dir = workspace_root_dir.join("member1");
         let mut cmd = std::process::Command::new("cargo");
         cmd.current_dir(&workspace_root_dir)
             .arg("new")
@@ -418,7 +418,7 @@ mod tests {
             .arg("member1");
         execute_command(&mut cmd, &environment, &workspace_root_dir)?;
 
-        let member2_dir = workspace_root_dir.join("member2");
+        let _member2_dir = workspace_root_dir.join("member2");
         let mut cmd = std::process::Command::new("cargo");
         cmd.current_dir(&workspace_root_dir)
             .arg("new")
@@ -447,8 +447,7 @@ mod tests {
         };
         crate::run_app(options, environment.clone()).await?;
 
-        let cargo_for_each_bin_path =
-            std::env::current_dir()?.join("target/release/cargo-for-each");
+        let cargo_for_each_bin_path = std::env::current_dir()?.join("target/debug/cargo-for-each"); // Use debug for tests
 
         let mut command = std::process::Command::new(&cargo_for_each_bin_path);
         command
@@ -461,8 +460,10 @@ mod tests {
         let output = crate::utils::execute_command(&mut command, &environment, temp_path)?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains(&member1_dir.to_string_lossy().to_string()));
-        assert!(stdout.contains(&member2_dir.to_string_lossy().to_string()));
+
+        assert!(stdout.contains(&workspace_root_dir.to_string_lossy().to_string()));
+        assert!(!stdout.contains(&_member1_dir.to_string_lossy().to_string()));
+        assert!(!stdout.contains(&_member2_dir.to_string_lossy().to_string()));
 
         Ok(())
     }
@@ -478,38 +479,40 @@ mod tests {
         // 1. Setup workspace with sub-crates
         let workspace_root_dir = temp_path.join("workspace_root");
         fs_err::create_dir_all(&workspace_root_dir)?;
+        let workspace_cargo_toml = workspace_root_dir.join("Cargo.toml");
         fs_err::write(
-            workspace_root_dir.join("Cargo.toml"),
+            &workspace_cargo_toml,
             "[workspace]\nmembers = [\"member1\", \"member2\"]\nresolver = \"2\"\n",
         )?;
 
-        let member1_dir = workspace_root_dir.join("member1");
+        let _member1_dir = workspace_root_dir.join("member1");
         let mut cmd = std::process::Command::new("cargo");
         cmd.current_dir(&workspace_root_dir)
             .arg("new")
             .arg("--lib")
             .arg("member1");
-
         execute_command(&mut cmd, &environment, &workspace_root_dir)?;
 
-        let member2_dir = workspace_root_dir.join("member2");
+        let _member2_dir = workspace_root_dir.join("member2");
         let mut cmd = std::process::Command::new("cargo");
         cmd.current_dir(&workspace_root_dir)
             .arg("new")
             .arg("--bin")
             .arg("member2");
-
         execute_command(&mut cmd, &environment, &workspace_root_dir)?;
 
-        // 2. Create a mock Config
-        let mut config = Config::default();
-        config.add_workspace(crate::Workspace {
-            manifest_dir: workspace_root_dir.clone(),
-            is_standalone: false,
-        });
+        // Instead of manually creating Config and adding workspace, use `add_command`
+        let options = crate::Options {
+            command: crate::Command::Target(crate::targets::TargetParameters {
+                sub_command: crate::targets::TargetSubCommand::Add(crate::targets::AddParameters {
+                    manifest_path: workspace_cargo_toml.clone(),
+                }),
+            }),
+        };
+        crate::run_app(options, environment.clone()).await?;
 
-        // Save the mock config to the environment
-        config.save(&environment)?;
+        // 2. Load the config (now properly populated by `add_command`)
+        let config = crate::Config::load(&environment)?;
 
         // 3. Call resolve_target_set
         let target_set = TargetSet::Workspaces(WorkspaceFilterParameters {
@@ -517,22 +520,18 @@ mod tests {
         });
         let resolved_target_set = resolve_target_set(&target_set, &config)?;
 
-        // 4. Assertions
-        assert_eq!(resolved_target_set.targets.len(), 2);
+        // 4. Assertions: Expect only the workspace root
+        assert_eq!(resolved_target_set.targets.len(), 1);
 
-        let mut found_member1 = false;
-        let mut found_member2 = false;
+        let found_workspace_root = resolved_target_set
+            .targets
+            .iter()
+            .any(|target| target.manifest_dir == workspace_root_dir);
 
-        for target in resolved_target_set.targets {
-            if target.manifest_dir == member1_dir {
-                found_member1 = true;
-            } else if target.manifest_dir == member2_dir {
-                found_member2 = true;
-            }
-        }
-
-        assert!(found_member1, "Did not find target for member1");
-        assert!(found_member2, "Did not find target for member2");
+        assert!(
+            found_workspace_root,
+            "Did not find target for workspace root"
+        );
 
         Ok(())
     }
