@@ -54,13 +54,13 @@ humantime = "2.3.0"
 log-panics = { version = "2.1.0", features = ["with-backtrace"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
-time = { version = "0.3.47", features = ["macros","parsing"] }
-tokio = { version = "1.49.0", features = [ "full" ] }
+time = { version = "0.3.47", features = ["macros", "parsing"] }
+tokio = { version = "1.49.0", features = ["full"] }
 toml = "0.9.11"
 tracing = "0.1.44"
 tracing-appender = "0.2.4"
 tracing-journald = "0.3.2"
-tracing-subscriber = { version = "0.3.22", features = [ "env-filter", "tracing-log" ] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "tracing-log"] }
 tracing-test = "0.2.6"
 
 [dev-dependencies]

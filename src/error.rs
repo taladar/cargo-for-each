@@ -121,6 +121,12 @@ pub enum Error {
     /// could not remove task directory
     #[error("could not remove task directory {0}: {1}")]
     CouldNotRemoveTaskDir(std::path::PathBuf, #[source] std::io::Error),
+    /// could not remove task state directory
+    #[error("could not remove task state directory {0}: {1}")]
+    CouldNotRemoveTaskStateDir(std::path::PathBuf, #[source] std::io::Error),
+    /// could not read tasks directory
+    #[error("could not read tasks directory {0}: {1}")]
+    CouldNotReadTasksDir(std::path::PathBuf, #[source] std::io::Error),
     /// could not read resolved target set file
     #[error("could not read resolved target set file {0}: {1}")]
     CouldNotReadResolvedTargetSet(std::path::PathBuf, #[source] std::io::Error),

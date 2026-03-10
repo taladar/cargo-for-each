@@ -34,6 +34,18 @@ pub fn named_dir_path(name: &str, environment: &crate::Environment) -> Result<Pa
     Ok(dir_path(environment)?.join(name))
 }
 
+/// returns the path to a specific task's state directory
+///
+/// # Errors
+///
+/// Returns an error if the tasks directory path cannot be determined.
+pub fn state_dir_for_task(name: &str, environment: &crate::Environment) -> Result<PathBuf, Error> {
+    Ok(environment
+        .state_dir
+        .join("cargo-for-each")
+        .join("tasks")
+        .join(name))
+}
 /// Parameters for creating a new task
 #[derive(Parser, Debug, Clone)]
 pub struct CreateTaskParameters {
@@ -97,20 +109,77 @@ pub struct TaskRunParameters {
     pub sub_command: TaskRunSubCommand,
 }
 
+/// Parameters for rewinding a single step of a task
+#[derive(Parser, Debug, Clone)]
+pub struct RewindSingleStepParameters {
+    /// the name of the task
+    #[clap(long)]
+    pub name: String,
+}
+
+/// Parameters for rewinding a task on a single target
+#[derive(Parser, Debug, Clone)]
+pub struct RewindSingleTargetParameters {
+    /// the name of the task
+    #[clap(long)]
+    pub name: String,
+}
+
+/// Parameters for rewinding a task on all targets
+#[derive(Parser, Debug, Clone)]
+pub struct RewindAllTargetsParameters {
+    /// the name of the task
+    #[clap(long)]
+    pub name: String,
+}
+
+/// The `task rewind` subcommand
+#[derive(Parser, Debug, Clone)]
+pub enum TaskRewindSubCommand {
+    /// Rewind a single step of a task
+    SingleStep(RewindSingleStepParameters),
+    /// Rewind a task on a single target
+    SingleTarget(RewindSingleTargetParameters),
+    /// Rewind a task on all targets
+    AllTargets(RewindAllTargetsParameters),
+}
+
+/// Parameters for the `task rewind` subcommand
+#[derive(Parser, Debug, Clone)]
+pub struct TaskRewindParameters {
+    /// the `task rewind` subcommand to run
+    #[clap(subcommand)]
+    pub sub_command: TaskRewindSubCommand,
+}
+
 /// The `task` subcommand
 #[derive(Parser, Debug, Clone)]
 pub enum TaskSubCommand {
+    /// List all tasks
+    List,
     /// Create a new task
     Create(CreateTaskParameters),
     /// Remove a task
     Remove(RemoveTaskParameters),
+    /// Describe a task
+    Describe(DescribeTaskParameters),
     /// Run a task
     Run(TaskRunParameters),
+    /// Rewind a task
+    Rewind(TaskRewindParameters),
 }
 
 /// Parameters for removing a task
 #[derive(Parser, Debug, Clone)]
 pub struct RemoveTaskParameters {
+    /// the name of the task
+    #[clap(long)]
+    pub name: String,
+}
+
+/// Parameters for describing a task
+#[derive(Parser, Debug, Clone)]
+pub struct DescribeTaskParameters {
     /// the name of the task
     #[clap(long)]
     pub name: String,
@@ -329,14 +398,25 @@ pub struct NextStep<'a> {
     pub target_number: usize,
 }
 
-/// Checks if a given step for a specific target in a task has been completed.
-fn is_step_completed(
+/// The status of a step.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StepStatus {
+    /// The step has been completed successfully.
+    Completed,
+    /// The step failed.
+    Failed,
+    /// The step has not yet been run.
+    NotRun,
+}
+
+/// Determines the status of a given step for a specific target in a task.
+fn get_step_status(
     task_name: &str,
     target_number: usize,
     step_number: usize,
     step: &Step,
     environment: &Environment,
-) -> bool {
+) -> StepStatus {
     let state_dir = environment
         .state_dir
         .join("cargo-for-each")
@@ -346,27 +426,49 @@ fn is_step_completed(
         .join(step_number.to_string());
 
     if !state_dir.exists() {
-        return false;
+        return StepStatus::NotRun;
     }
 
     match step {
         Step::RunCommand { .. } => {
             let exit_status_path = state_dir.join("exit_status");
             if let Ok(content) = fs_err::read_to_string(exit_status_path) {
-                content.trim() == "0"
+                if content.trim() == "0" {
+                    StepStatus::Completed
+                } else {
+                    StepStatus::Failed
+                }
             } else {
-                false
+                StepStatus::NotRun
             }
         }
         Step::ManualStep { .. } => {
             let manual_step_confirmed_path = state_dir.join("manual_step_confirmed");
             if let Ok(content) = fs_err::read_to_string(manual_step_confirmed_path) {
-                content.trim() == "y"
+                if content.trim() == "y" {
+                    StepStatus::Completed
+                } else {
+                    StepStatus::Failed
+                }
             } else {
-                false
+                StepStatus::NotRun
             }
         }
     }
+}
+
+/// Checks if a given step for a specific target in a task has been completed.
+fn is_step_completed(
+    task_name: &str,
+    target_number: usize,
+    step_number: usize,
+    step: &Step,
+    environment: &Environment,
+) -> bool {
+    matches!(
+        get_step_status(task_name, target_number, step_number, step, environment),
+        StepStatus::Completed
+    )
 }
 
 /// Checks if a given target has completed all steps in a plan.
@@ -705,6 +807,272 @@ pub async fn task_run_command(
     }
 }
 
+/// implementation of the task rewind all-targets subcommand
+///
+/// # Errors
+///
+/// This command can fail if the task's state directory cannot be determined, or if the directory cannot be removed.
+#[instrument]
+pub async fn rewind_all_targets_command(
+    params: RewindAllTargetsParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    let state_dir = state_dir_for_task(&params.name, &environment)?;
+    if state_dir.exists() {
+        fs_err::remove_dir_all(&state_dir)
+            .map_err(|e| Error::CouldNotRemoveTaskStateDir(state_dir.clone(), e))?;
+        tracing::info!("Removed state for task '{}' for all targets.", params.name);
+    } else {
+        tracing::info!(
+            "No state found for task '{}' for all targets, nothing to rewind.",
+            params.name
+        );
+    }
+    Ok(())
+}
+
+/// implementation of the task rewind single-target subcommand
+///
+/// # Errors
+///
+/// This command can fail if the task directory cannot be determined, if the resolved target set file cannot be read or parsed, if the state directory for a target cannot be removed.
+#[instrument]
+pub async fn rewind_single_target_command(
+    params: RewindSingleTargetParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    let task_dir = named_dir_path(&params.name, &environment)?;
+    if !task_dir.exists() {
+        return Err(Error::TaskNotFound(params.name));
+    }
+
+    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
+    let resolved_target_set_content = fs_err::read_to_string(&resolved_target_set_path)
+        .map_err(|e| Error::CouldNotReadResolvedTargetSet(resolved_target_set_path.clone(), e))?;
+    let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
+        .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
+
+    let plan_path = task_dir.join("plan.toml");
+    let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
+    let plan: Plan = toml::from_str(&plan_content).map_err(Error::CouldNotParsePlanFile)?;
+
+    // Find the last completed target to rewind.
+    // We iterate in reverse to find the "most recently completed" target.
+    if let Some((target_idx, target)) = resolved_target_set
+        .targets
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(target_idx, _)| is_target_completed(&params.name, *target_idx, &plan, &environment))
+    {
+        let target_state_dir = environment
+            .state_dir
+            .join("cargo-for-each")
+            .join("tasks")
+            .join(&params.name)
+            .join(target_idx.to_string());
+
+        if target_state_dir.exists() {
+            fs_err::remove_dir_all(&target_state_dir)
+                .map_err(|e| Error::CouldNotRemoveTaskStateDir(target_state_dir.clone(), e))?;
+            tracing::info!(
+                "Removed state for target '{}' (index {}) in task '{}'.",
+                target.manifest_dir.display(),
+                target_idx,
+                params.name
+            );
+        } else {
+            tracing::info!(
+                "No state found for target '{}' (index {}) in task '{}', nothing to rewind.",
+                target.manifest_dir.display(),
+                target_idx,
+                params.name
+            );
+        }
+    } else {
+        tracing::info!(
+            "No completed targets found for task '{}', nothing to rewind.",
+            params.name
+        );
+    }
+
+    Ok(())
+}
+
+/// implementation of the task rewind single-step subcommand
+///
+/// # Errors
+///
+/// This command can fail if the task directory cannot be determined, if the plan or resolved target set files cannot be read or parsed, or if the state directory for a step cannot be removed.
+#[instrument]
+pub async fn rewind_single_step_command(
+    params: RewindSingleStepParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    let task_dir = named_dir_path(&params.name, &environment)?;
+    if !task_dir.exists() {
+        return Err(Error::TaskNotFound(params.name));
+    }
+
+    let plan_path = task_dir.join("plan.toml");
+    let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
+    let plan: Plan = toml::from_str(&plan_content).map_err(Error::CouldNotParsePlanFile)?;
+
+    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
+    let resolved_target_set_content = fs_err::read_to_string(&resolved_target_set_path)
+        .map_err(|e| Error::CouldNotReadResolvedTargetSet(resolved_target_set_path.clone(), e))?;
+    let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
+        .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
+
+    // We need to find the "last" completed step. This is the last step within the last target
+    // that has any completed steps. Or, more precisely, the step with the highest step_number
+    // within the target with the highest target_number, that is completed.
+    let mut last_completed_step_info: Option<(usize, usize)> = None; // (target_idx, step_number)
+
+    for (target_idx, _target) in resolved_target_set.targets.iter().enumerate().rev() {
+        for (step_idx, _step) in plan.steps.iter().enumerate().rev() {
+            let step_number = step_idx.saturating_add(1);
+            if is_step_completed(&params.name, target_idx, step_number, _step, &environment) {
+                last_completed_step_info = Some((target_idx, step_number));
+                break; // Found the last completed step for this target, move to next target
+            }
+        }
+        if last_completed_step_info.is_some() {
+            break; // Found the last completed step overall, stop searching
+        }
+    }
+
+    if let Some((target_idx, step_number)) = last_completed_step_info {
+        let step_state_dir = environment
+            .state_dir
+            .join("cargo-for-each")
+            .join("tasks")
+            .join(&params.name)
+            .join(target_idx.to_string())
+            .join(step_number.to_string());
+
+        if step_state_dir.exists() {
+            fs_err::remove_dir_all(&step_state_dir)
+                .map_err(|e| Error::CouldNotRemoveTaskStateDir(step_state_dir.clone(), e))?;
+            tracing::info!(
+                "Removed state for step {} of target index {} in task '{}'.",
+                step_number,
+                target_idx,
+                params.name
+            );
+        } else {
+            tracing::info!(
+                "No state found for step {} of target index {} in task '{}', nothing to rewind.",
+                step_number,
+                target_idx,
+                params.name
+            );
+        }
+    } else {
+        tracing::info!(
+            "No completed steps found for task '{}', nothing to rewind.",
+            params.name
+        );
+    }
+
+    Ok(())
+}
+
+/// implementation of the task rewind subcommand
+///
+/// # Errors
+///
+/// This command can fail due to errors in its subcommands (rewind single step, rewind single target, rewind all targets).
+#[instrument]
+pub async fn task_rewind_command(
+    params: TaskRewindParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    match params.sub_command {
+        TaskRewindSubCommand::SingleStep(p) => rewind_single_step_command(p, environment).await,
+        TaskRewindSubCommand::SingleTarget(p) => rewind_single_target_command(p, environment).await,
+        TaskRewindSubCommand::AllTargets(p) => rewind_all_targets_command(p, environment).await,
+    }
+}
+
+/// implementation of the task describe subcommand
+///
+/// # Errors
+///
+/// This command can fail if the task directory cannot be determined, if the plan or resolved target set files cannot be read or parsed.
+#[instrument]
+#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
+pub async fn task_describe_command(
+    params: DescribeTaskParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    let task_dir = named_dir_path(&params.name, &environment)?;
+    if !task_dir.exists() {
+        return Err(Error::TaskNotFound(params.name));
+    }
+
+    let plan_path = task_dir.join("plan.toml");
+    let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
+    let plan: Plan = toml::from_str(&plan_content).map_err(Error::CouldNotParsePlanFile)?;
+
+    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
+    let resolved_target_set_content = fs_err::read_to_string(&resolved_target_set_path)
+        .map_err(|e| Error::CouldNotReadResolvedTargetSet(resolved_target_set_path.clone(), e))?;
+    let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
+        .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
+
+    println!("Task: {}", params.name);
+    println!("Targets:");
+
+    for (target_idx, target) in resolved_target_set.targets.iter().enumerate() {
+        println!("  - Target: {}", target.manifest_dir.display());
+        println!("    Path: {}", target.manifest_dir.display());
+        println!("    Steps:");
+        for (step_idx, step) in plan.steps.iter().enumerate() {
+            let step_number = step_idx.saturating_add(1);
+            let status = get_step_status(&params.name, target_idx, step_number, step, &environment);
+            let status_icon = match status {
+                StepStatus::Completed => "\u{2705}", // Green checkmark
+                StepStatus::Failed => "\u{274C}",    // Red 'X'
+                StepStatus::NotRun => "\u{2B1C}",    // White large square (empty checkbox)
+            };
+            println!("      {step_number}. {status_icon} {step:?}");
+        }
+    }
+
+    Ok(())
+}
+
+/// implementation of the task list subcommand
+///
+/// # Errors
+///
+/// This command can fail if the tasks directory cannot be determined or read.
+#[instrument]
+#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
+pub async fn task_list_command(environment: crate::Environment) -> Result<(), Error> {
+    let tasks_dir = dir_path(&environment)?;
+
+    if !tasks_dir.exists() {
+        println!("No tasks found.");
+        return Ok(());
+    }
+
+    println!("Existing tasks:");
+    for entry in fs_err::read_dir(&tasks_dir)
+        .map_err(|e| Error::CouldNotReadTasksDir(tasks_dir.clone(), e))?
+    {
+        let entry = entry.map_err(|e| Error::CouldNotReadTasksDir(tasks_dir.clone(), e))?;
+        let path = entry.path();
+        if path.is_dir()
+            && let Some(task_name) = path.file_name().and_then(|s| s.to_str())
+        {
+            println!("- {task_name}");
+        }
+    }
+    Ok(())
+}
+
 /// implementation of the task subcommand
 ///
 /// # Errors
@@ -726,6 +1094,15 @@ pub async fn task_command(
         }
         TaskSubCommand::Run(params) => {
             task_run_command(params, environment).await?;
+        }
+        TaskSubCommand::List => {
+            task_list_command(environment).await?;
+        }
+        TaskSubCommand::Describe(params) => {
+            task_describe_command(params, environment).await?;
+        }
+        TaskSubCommand::Rewind(params) => {
+            task_rewind_command(params, environment).await?;
         }
     }
     Ok(())
