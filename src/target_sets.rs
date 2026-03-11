@@ -80,17 +80,17 @@ pub fn resolve_target_set(
         }
     };
 
-    let target_manifest_paths_set: HashSet<PathBuf> =
-        initial_manifest_dirs.iter().cloned().collect();
-
     let mut targets: Vec<Target> = Vec::new();
 
     match target_set {
         TargetSet::Workspaces(_) => {
             // If it's a Workspace target set, the initial_manifest_dirs are already the targets
             for manifest_dir in initial_manifest_dirs {
+                let canonical_manifest_dir = fs_err::canonicalize(&manifest_dir).map_err(|e| {
+                    Error::CouldNotDetermineCanonicalManifestPath(manifest_dir.clone(), e)
+                })?;
                 targets.push(Target {
-                    manifest_dir,
+                    manifest_dir: canonical_manifest_dir,
                     dependencies: Vec::new(), // Workspaces don't have dependencies in this context
                 });
             }
@@ -120,7 +120,21 @@ pub fn resolve_target_set(
                 }
             }
 
+            // Build a set of canonical paths so dependency lookups match regardless of symlinks
+            let target_canonical_paths_set: HashSet<PathBuf> = initial_manifest_dirs
+                .iter()
+                .map(|d| {
+                    fs_err::canonicalize(d)
+                        .map_err(|e| Error::CouldNotDetermineCanonicalManifestPath(d.clone(), e))
+                })
+                .collect::<Result<HashSet<PathBuf>, Error>>()?;
+
             for manifest_dir in initial_manifest_dirs {
+                // Compute canonical form once; reuse in the package search and when storing
+                let canonical_manifest_dir = fs_err::canonicalize(&manifest_dir).map_err(|e| {
+                    Error::CouldNotDetermineCanonicalManifestPath(manifest_dir.clone(), e)
+                })?;
+
                 let current_package_id = package_name_to_id
                     .iter()
                     .find_map(|(_name, id)| {
@@ -136,9 +150,6 @@ pub fn resolve_target_set(
                             .ok()?;
                         let canonical_package_manifest_dir =
                             fs_err::canonicalize(package_manifest_dir).ok()?;
-
-                        let canonical_manifest_dir =
-                            fs_err::canonicalize(manifest_dir.clone()).ok()?;
 
                         if canonical_package_manifest_dir == canonical_manifest_dir {
                             Some(id.clone())
@@ -178,13 +189,13 @@ pub fn resolve_target_set(
                                 )
                             })?;
 
-                        if target_manifest_paths_set.contains(&dep_manifest_path) {
+                        if target_canonical_paths_set.contains(&dep_manifest_path) {
                             dependencies.push(dep_manifest_path);
                         }
                     }
                 }
                 targets.push(Target {
-                    manifest_dir: manifest_dir.clone(),
+                    manifest_dir: canonical_manifest_dir,
                     dependencies,
                 });
             }
@@ -532,6 +543,85 @@ mod tests {
             found_workspace_root,
             "Did not find target for workspace root"
         );
+
+        // Regression test for Bug 4: all stored manifest_dirs must already be
+        // in canonical form so that target_map lookups match dependency paths.
+        for target in &resolved_target_set.targets {
+            let canonical = fs_err::canonicalize(&target.manifest_dir)?;
+            assert_eq!(
+                target.manifest_dir, canonical,
+                "manifest_dir should be stored in canonical form"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Resolving a Crates target set stores canonical `manifest_dir` values and
+    /// records intra-workspace dependencies correctly (Bug 4 regression test).
+    #[tokio::test]
+    async fn test_resolve_crates_target_set_stores_canonical_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+        let temp_path = temp_dir.path();
+
+        // Build a workspace with two member crates.
+        let workspace_root_dir = temp_path.join("ws");
+        fs_err::create_dir_all(&workspace_root_dir)?;
+        fs_err::write(
+            workspace_root_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crate_a\", \"crate_b\"]\nresolver = \"2\"\n",
+        )?;
+
+        for name in &["crate_a", "crate_b"] {
+            let mut cmd = std::process::Command::new("cargo");
+            cmd.current_dir(&workspace_root_dir)
+                .arg("new")
+                .arg("--lib")
+                .arg(name);
+            execute_command(&mut cmd, &environment, &workspace_root_dir)?;
+        }
+
+        // Register workspace via the add command.
+        let options = crate::Options {
+            command: crate::Command::Target(crate::targets::TargetParameters {
+                sub_command: crate::targets::TargetSubCommand::Add(crate::targets::AddParameters {
+                    manifest_path: workspace_root_dir.join("Cargo.toml"),
+                }),
+            }),
+        };
+        crate::run_app(options, environment.clone()).await?;
+
+        let config = crate::Config::load(&environment)?;
+        let target_set = TargetSet::Crates(crate::targets::CrateFilterParameters {
+            r#type: None,
+            standalone: None,
+        });
+        let resolved = resolve_target_set(&target_set, &config)?;
+
+        assert_eq!(resolved.targets.len(), 2, "expected two crate targets");
+
+        // Every manifest_dir must equal its own canonicalized form.
+        for target in &resolved.targets {
+            let canonical = fs_err::canonicalize(&target.manifest_dir)?;
+            assert_eq!(
+                target.manifest_dir,
+                canonical,
+                "manifest_dir '{}' is not canonical",
+                target.manifest_dir.display()
+            );
+            // All stored dependency paths must also be canonical.
+            for dep in &target.dependencies {
+                let canonical_dep = fs_err::canonicalize(dep)?;
+                assert_eq!(
+                    dep,
+                    &canonical_dep,
+                    "dependency path '{}' is not canonical",
+                    dep.display()
+                );
+            }
+        }
 
         Ok(())
     }
