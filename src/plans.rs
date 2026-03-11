@@ -288,7 +288,7 @@ pub async fn plan_step_command(
         PlanStepSubCommand::Add(params) => {
             let mut plan = Plan::load(&params.name, &environment)?;
             if let Step::RunCommand { command, .. } = &params.step
-                && !crate::utils::command_is_executable(command)
+                && !crate::utils::command_is_executable(command, &environment)
             {
                 return Err(crate::error::Error::CommandNotFound(command.to_owned()));
             }
@@ -304,7 +304,7 @@ pub async fn plan_step_command(
                 ));
             }
             if let Step::RunCommand { command, .. } = &params.step
-                && !crate::utils::command_is_executable(command)
+                && !crate::utils::command_is_executable(command, &environment)
             {
                 return Err(crate::error::Error::CommandNotFound(command.to_owned()));
             }

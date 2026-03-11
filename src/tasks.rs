@@ -289,7 +289,7 @@ pub async fn run_single_step(
         Step::RunCommand { command, args } => {
             let mut cmd = Command::new("asciinema");
 
-            if !crate::utils::command_is_executable(command) {
+            if !crate::utils::command_is_executable(command, environment) {
                 return Err(crate::error::Error::CommandNotFound(command.to_owned()));
             }
 

@@ -114,10 +114,20 @@ impl Environment {
         fs_err::create_dir_all(&state_dir)?;
         fs_err::create_dir_all(&bin_dir)?;
 
+        // Start with the test-specific bin_dir, then append the real system PATH so
+        // standard commands like `cargo` are also found via command_is_executable.
+        let mut paths = vec![bin_dir];
+        paths.extend(
+            std::env::var("PATH")
+                .unwrap_or_default()
+                .split(':')
+                .map(std::path::PathBuf::from),
+        );
+
         Ok(Self {
             config_dir,
             state_dir,
-            paths: vec![bin_dir], // Add the bin_dir to the paths
+            paths,
             suppress_subprocess_output: true,
         })
     }

@@ -1,20 +1,18 @@
 //! Utility functions
 
 /// check if a command is executable either as an absolute path or
-/// with any of the paths from PATH prepended
+/// with any of the paths from environment.paths prepended
 #[must_use]
-pub fn command_is_executable(command: &str) -> bool {
+pub fn command_is_executable(command: &str, environment: &crate::Environment) -> bool {
     // Check if command exists and is executable before adding it
-    let command_path = std::path::Path::new(&command);
+    let command_path = std::path::Path::new(command);
     if command_path.is_absolute() {
         crate::utils::is_executable(command_path)
     } else {
-        std::env::var_os("PATH")
-            .and_then(|paths| {
-                std::env::split_paths(&paths)
-                    .find(|p| crate::utils::is_executable(&p.join(command)))
-            })
-            .is_some()
+        environment
+            .paths
+            .iter()
+            .any(|p| crate::utils::is_executable(&p.join(command)))
     }
 }
 
@@ -124,5 +122,89 @@ pub fn execute_command(
                 Error::CommandExecutionFailed(format!("{command:?}"), cwd.to_path_buf(), e)
             })?;
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_is_executable;
+    use crate::Environment;
+    use tempfile::tempdir;
+
+    fn env_with_paths(paths: Vec<std::path::PathBuf>) -> Environment {
+        Environment {
+            config_dir: std::path::PathBuf::new(),
+            state_dir: std::path::PathBuf::new(),
+            paths,
+            suppress_subprocess_output: true,
+        }
+    }
+
+    /// A command that lives in `environment.paths` is found.
+    ///
+    /// Regression test for Bug 5: previously `command_is_executable` used the
+    /// system PATH env var and completely ignored `environment.paths`.
+    #[test]
+    fn test_command_found_in_env_paths() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let bin = temp.path().join("my_test_cmd");
+        fs_err::write(&bin, "#!/bin/sh\nexit 0\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs_err::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let env = env_with_paths(vec![temp.path().to_path_buf()]);
+        assert!(
+            command_is_executable("my_test_cmd", &env),
+            "command in environment.paths should be found"
+        );
+        Ok(())
+    }
+
+    /// A command that is NOT in `environment.paths` is not found, even if it
+    /// would be found via the system PATH.
+    ///
+    /// This verifies that the function exclusively uses `environment.paths` and
+    /// does not fall back to the process-level PATH environment variable.
+    #[test]
+    fn test_command_not_found_when_absent_from_env_paths() {
+        // Use an empty path list — nothing should be found.
+        let env = env_with_paths(vec![]);
+        assert!(
+            !command_is_executable("cargo", &env),
+            "command should not be found when environment.paths is empty"
+        );
+    }
+
+    /// An absolute path to an existing executable is accepted.
+    #[test]
+    fn test_absolute_path_executable_is_found() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let bin = temp.path().join("abs_cmd");
+        fs_err::write(&bin, "#!/bin/sh\nexit 0\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs_err::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
+        }
+        // Absolute path lookup ignores environment.paths, so pass an empty list.
+        let env = env_with_paths(vec![]);
+        let bin_str = bin.to_str().ok_or("non-UTF8 path")?;
+        assert!(
+            command_is_executable(bin_str, &env),
+            "absolute path to an executable should be found"
+        );
+        Ok(())
+    }
+
+    /// An absolute path to a non-existent file is rejected.
+    #[test]
+    fn test_absolute_path_nonexistent_is_not_found() {
+        let env = env_with_paths(vec![]);
+        assert!(
+            !command_is_executable("/nonexistent/path/to/nothing", &env),
+            "absolute path to non-existent file should not be found"
+        );
     }
 }
