@@ -176,8 +176,8 @@ pub enum Error {
     #[error("error executing command `{0}` in `{1}`: {2}")]
     CommandExecutionFailed(String, PathBuf, #[source] std::io::Error),
     /// A command failed to execute
-    #[error("command `{0}` failed in `{1}` with status {2}")]
-    CommandFailed(String, PathBuf, std::process::ExitStatus),
+    #[error("command `{0}` failed in `{1}` with exit code {2}")]
+    CommandFailed(String, PathBuf, i32),
     /// The specified command was not found in PATH
     #[error("command not found: {0}")]
     CommandNotFound(String),

@@ -286,8 +286,6 @@ pub async fn run_single_step(
 
     match step {
         Step::RunCommand { command, args } => {
-            let mut cmd = Command::new("asciinema");
-
             if !crate::utils::command_is_executable(command, environment) {
                 return Err(crate::error::Error::CommandNotFound(command.to_owned()));
             }
@@ -300,14 +298,37 @@ pub async fn run_single_step(
                     .collect::<Vec<String>>()
                     .join(" ")
             );
+
+            // Write a wrapper script so the real exit code of the inner command
+            // is captured independently of asciinema's exit code.
+            // asciinema v3 in --headless mode always exits with code 0,
+            // so we cannot rely on asciinema's own exit code.
+            let wrapper_path = state_dir.join("run_wrapper.sh");
+            let exit_status_path = state_dir.join("exit_status");
+            let script = format!(
+                "#!/bin/sh\n{command_str}\nrc=$?\nprintf '%d' \"$rc\" > \"$CARGO_FOR_EACH_EXIT_STATUS_PATH\"\nexit \"$rc\"\n"
+            );
+            fs_err::write(&wrapper_path, &script)
+                .map_err(|e| Error::CouldNotWriteStateFile(wrapper_path.clone(), e))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let perms = std::fs::Permissions::from_mode(0o755);
+                fs_err::set_permissions(&wrapper_path, perms).map_err(Error::IoError)?;
+            }
+
+            let mut cmd = Command::new("asciinema");
             cmd.arg("record");
             if environment.suppress_subprocess_output {
                 cmd.arg("--headless");
             }
-            cmd.arg("-q").arg("-c").arg(&command_str).arg(&cast_path);
+            cmd.arg("-q")
+                .arg("-c")
+                .arg(wrapper_path.to_string_lossy().as_ref())
+                .arg(&cast_path);
+            cmd.env("CARGO_FOR_EACH_EXIT_STATUS_PATH", &exit_status_path);
             cmd.current_dir(manifest_dir);
 
-            let exit_status_path = state_dir.join("exit_status");
             match crate::utils::execute_command(&mut cmd, environment, manifest_dir) {
                 Err(e) => {
                     // asciinema failed to launch; write an empty exit_status so
@@ -316,21 +337,29 @@ pub async fn run_single_step(
                         .map_err(|we| Error::CouldNotWriteStateFile(exit_status_path, we))?;
                     return Err(e);
                 }
-                Ok(output) => {
-                    let status = output.status;
-                    fs_err::write(
-                        &exit_status_path,
-                        status
-                            .code()
-                            .map_or_else(|| "".to_string(), |c| c.to_string()),
-                    )
-                    .map_err(|e| Error::CouldNotWriteStateFile(exit_status_path, e))?;
+                Ok(_output) => {
+                    // Read the real exit code written by the wrapper script.
+                    // If the file is missing or unparsable (wrapper crashed),
+                    // treat as failure (-1).
+                    let exit_code: i32 = fs_err::read_to_string(&exit_status_path)
+                        .ok()
+                        .as_deref()
+                        .map(str::trim)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(-1);
 
-                    if !status.success() {
+                    // Ensure exit_status is always written so get_step_status
+                    // never returns NotRun for a step that was executed.
+                    if !exit_status_path.exists() {
+                        fs_err::write(&exit_status_path, exit_code.to_string())
+                            .map_err(|e| Error::CouldNotWriteStateFile(exit_status_path, e))?;
+                    }
+
+                    if exit_code != 0 {
                         return Err(Error::CommandFailed(
                             command_str,
                             manifest_dir.to_path_buf(),
-                            status,
+                            exit_code,
                         ));
                     }
                 }
@@ -1130,8 +1159,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
-    use super::{StepStatus, find_next_step, get_step_status};
+    use super::{StepStatus, find_next_step, get_step_status, run_single_step};
     use crate::Environment;
+    use crate::error::Error;
     use crate::plans::{Plan, Step};
     use crate::target_sets::ResolvedTargetSet;
     use crate::targets::Target;
@@ -1144,6 +1174,22 @@ mod tests {
             config_dir: temp_dir.path().join("config"),
             state_dir: temp_dir.path().join("state"),
             paths: vec![],
+            suppress_subprocess_output: true,
+        }
+    }
+
+    /// Build a test environment that includes the real system PATH so that
+    /// commands like `true` and `false` can be found by `run_single_step`.
+    fn make_environment_with_system_paths(temp_dir: &tempfile::TempDir) -> Environment {
+        let system_paths: Vec<PathBuf> = std::env::var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .map(PathBuf::from)
+            .collect();
+        Environment {
+            config_dir: temp_dir.path().join("config"),
+            state_dir: temp_dir.path().join("state"),
+            paths: system_paths,
             suppress_subprocess_output: true,
         }
     }
@@ -1434,6 +1480,76 @@ mod tests {
         assert!(next.is_some());
         let next = next.ok_or("expected Some next step")?;
         assert_eq!(next.step_number, 2, "Step 1 is done; step 2 should be next");
+        Ok(())
+    }
+
+    // ── run_single_step: wrapper script captures real exit code ───────────────
+
+    /// A successful command (exit code 0) writes "0" to exit_status.
+    ///
+    /// Regression test for Bug 7: previously asciinema in --headless mode
+    /// always exited with code 0, so run_single_step would read asciinema's
+    /// exit code instead of the inner command's real exit code.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_single_step_success_writes_zero_exit_status() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment_with_system_paths(&temp);
+        let manifest_dir = temp.path();
+        let step = Step::RunCommand {
+            command: "true".to_string(),
+            args: vec![],
+        };
+        run_single_step(&step, manifest_dir, "test-task", 1, 0, &env).await?;
+
+        let exit_status_path = env
+            .state_dir
+            .join("cargo-for-each")
+            .join("tasks")
+            .join("test-task")
+            .join("0")
+            .join("1")
+            .join("exit_status");
+        let content = fs_err::read_to_string(&exit_status_path)?;
+        assert_eq!(content.trim(), "0");
+        Ok(())
+    }
+
+    /// A failing command (non-zero exit code) writes a non-zero code to
+    /// exit_status and causes run_single_step to return CommandFailed.
+    ///
+    /// Regression test for Bug 7: without the wrapper script fix, asciinema
+    /// in --headless mode would always exit 0 and run_single_step would
+    /// incorrectly write "0" to exit_status and return Ok(()).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_single_step_failure_writes_nonzero_exit_status() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment_with_system_paths(&temp);
+        let manifest_dir = temp.path();
+        let step = Step::RunCommand {
+            command: "false".to_string(),
+            args: vec![],
+        };
+        let result = run_single_step(&step, manifest_dir, "test-task", 1, 0, &env).await;
+
+        assert!(result.is_err(), "failing command should return Err");
+        assert!(
+            matches!(result, Err(Error::CommandFailed(..))),
+            "expected CommandFailed error"
+        );
+
+        let exit_status_path = env
+            .state_dir
+            .join("cargo-for-each")
+            .join("tasks")
+            .join("test-task")
+            .join("0")
+            .join("1")
+            .join("exit_status");
+        let content = fs_err::read_to_string(&exit_status_path)?;
+        let exit_code: i32 = content.trim().parse()?;
+        assert!(exit_code != 0, "exit_status must contain a non-zero code");
         Ok(())
     }
 }
