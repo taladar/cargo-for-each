@@ -260,6 +260,9 @@ pub async fn plan_step_command(
 ) -> Result<(), Error> {
     match plan_step_parameters.sub_command {
         PlanStepSubCommand::List(params) => {
+            if !Plan::exists(&params.name, &environment)? {
+                return Err(Error::PlanNotFound(params.name));
+            }
             let plan = Plan::load(&params.name, &environment)?;
             for (i, step) in plan.steps.iter().enumerate() {
                 match step {
@@ -286,6 +289,9 @@ pub async fn plan_step_command(
             }
         }
         PlanStepSubCommand::Add(params) => {
+            if !Plan::exists(&params.name, &environment)? {
+                return Err(Error::PlanNotFound(params.name));
+            }
             let mut plan = Plan::load(&params.name, &environment)?;
             if let Step::RunCommand { command, .. } = &params.step
                 && !crate::utils::command_is_executable(command, &environment)
@@ -296,6 +302,9 @@ pub async fn plan_step_command(
             plan.save(&params.name, &environment)?;
         }
         PlanStepSubCommand::Insert(params) => {
+            if !Plan::exists(&params.name, &environment)? {
+                return Err(Error::PlanNotFound(params.name));
+            }
             let mut plan = Plan::load(&params.name, &environment)?;
             if params.position > plan.steps.len().saturating_add(1) || params.position == 0 {
                 return Err(Error::PlanStepOutOfBounds(
@@ -313,6 +322,9 @@ pub async fn plan_step_command(
             plan.save(&params.name, &environment)?;
         }
         PlanStepSubCommand::Remove(params) => {
+            if !Plan::exists(&params.name, &environment)? {
+                return Err(Error::PlanNotFound(params.name));
+            }
             let mut plan = Plan::load(&params.name, &environment)?;
             if params.position > plan.steps.len() || params.position == 0 {
                 return Err(Error::PlanStepOutOfBounds(
@@ -325,4 +337,138 @@ pub async fn plan_step_command(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// All four `plan step` sub-commands must return `PlanNotFound` when the
+    /// named plan does not exist on disk, rather than silently creating it.
+    ///
+    /// Regression tests for Bug 6: previously `Plan::load` returned an empty
+    /// default plan when the file was absent, so `plan step add` would create a
+    /// brand-new plan file instead of reporting an error.
+
+    #[tokio::test]
+    async fn test_plan_step_list_missing_plan_returns_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        let result = plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::List(ListStepsParameters {
+                    name: "nonexistent-plan".to_string(),
+                }),
+            },
+            environment,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(crate::error::Error::PlanNotFound(_))),
+            "expected PlanNotFound, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_step_add_missing_plan_returns_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        let result = plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::Add(AddStepParameters {
+                    name: "nonexistent-plan".to_string(),
+                    step: Step::ManualStep {
+                        title: "t".to_string(),
+                        instructions: "i".to_string(),
+                    },
+                }),
+            },
+            environment,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(crate::error::Error::PlanNotFound(_))),
+            "expected PlanNotFound, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_step_insert_missing_plan_returns_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        let result = plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::Insert(InsertStepParameters {
+                    name: "nonexistent-plan".to_string(),
+                    position: 1,
+                    step: Step::ManualStep {
+                        title: "t".to_string(),
+                        instructions: "i".to_string(),
+                    },
+                }),
+            },
+            environment,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(crate::error::Error::PlanNotFound(_))),
+            "expected PlanNotFound, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_step_remove_missing_plan_returns_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        let result = plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::Remove(RemoveStepParameters {
+                    name: "nonexistent-plan".to_string(),
+                    position: 1,
+                }),
+            },
+            environment,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(crate::error::Error::PlanNotFound(_))),
+            "expected PlanNotFound, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// `plan step add` on an existing plan must NOT return PlanNotFound.
+    #[tokio::test]
+    async fn test_plan_step_add_existing_plan_succeeds() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        // Create the plan first.
+        Plan::default().save("my-plan", &environment)?;
+        let result = plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::Add(AddStepParameters {
+                    name: "my-plan".to_string(),
+                    step: Step::ManualStep {
+                        title: "step".to_string(),
+                        instructions: "do something".to_string(),
+                    },
+                }),
+            },
+            environment,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "adding to an existing plan should succeed: {result:?}"
+        );
+        Ok(())
+    }
 }
