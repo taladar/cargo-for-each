@@ -300,7 +300,7 @@ mod tests {
     use super::*;
     use crate::{
         plans::{
-            AddStepParameters, CreatePlanParameters, PlanParameters, PlanStepParameters,
+            AddStepParameters, CreatePlanParameters, Plan, PlanParameters, PlanStepParameters,
             PlanStepSubCommand, PlanSubCommand, Step,
         },
         target_sets::{
@@ -774,6 +774,101 @@ mod tests {
             result.is_ok(),
             "run_app for creating plan failed with error: {:?}",
             result.err()
+        );
+
+        Ok(())
+    }
+
+    /// A task whose only step always fails must terminate when run with
+    /// `keep_going = true` and return `SomeStepsFailed`, not loop forever and
+    /// not return `CircularDependency`.
+    ///
+    /// Regression test for Bug 1 (infinite loop) and Bug 3 (wrong error kind).
+    ///
+    /// The plan is written directly via `Plan::save` with a nonexistent command so
+    /// that `run_single_step` returns `Err(CommandNotFound)` at execution time,
+    /// which is reliable regardless of the installed asciinema version's
+    /// exit-code propagation behaviour.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_run_all_targets_keep_going_terminates_with_some_steps_failed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+        let temp_path = temp_dir.path();
+        let workspaces_dir = temp_path.join("workspaces");
+        fs_err::create_dir_all(&workspaces_dir)?;
+
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&workspaces_dir)
+            .arg("new")
+            .arg("--lib")
+            .arg("failing_target");
+        execute_command(&mut cmd, &environment, &workspaces_dir)?;
+
+        let options = Options {
+            command: Command::Target(TargetParameters {
+                sub_command: TargetSubCommand::Add(AddParameters {
+                    manifest_path: workspaces_dir.join("failing_target").join("Cargo.toml"),
+                }),
+            }),
+        };
+        run_app(options, environment.clone()).await?;
+
+        let options = Options {
+            command: Command::TargetSet(TargetSetParameters {
+                sub_command: TargetSetSubCommand::Create(CreateTargetSetParameters {
+                    name: "failing-set".to_string(),
+                    target_set: TargetSet::Crates(CrateFilterParameters {
+                        r#type: None,
+                        standalone: None,
+                    }),
+                }),
+            }),
+        };
+        run_app(options, environment.clone()).await?;
+
+        // Write the plan directly with a command that is guaranteed not to
+        // exist in environment.paths.  We bypass plan_step_command's
+        // command_is_executable check intentionally so we can produce a step
+        // that will fail at execution time.
+        let plan = Plan {
+            steps: vec![Step::RunCommand {
+                command: "nonexistent_command_cargo_for_each_test".to_string(),
+                args: vec![],
+            }],
+        };
+        plan.save("failing-plan", &environment)?;
+
+        let options = Options {
+            command: Command::Task(TaskParameters {
+                sub_command: TaskSubCommand::Create(CreateTaskParameters {
+                    name: "failing-task".to_string(),
+                    plan: "failing-plan".to_string(),
+                    target_set: "failing-set".to_string(),
+                }),
+            }),
+        };
+        run_app(options, environment.clone()).await?;
+
+        // Run with keep_going=true — must terminate and report SomeStepsFailed,
+        // not loop forever (Bug 1) and not return CircularDependency (Bug 3).
+        let options = Options {
+            command: Command::Task(TaskParameters {
+                sub_command: TaskSubCommand::Run(TaskRunParameters {
+                    sub_command: TaskRunSubCommand::AllTargets(RunAllTargetsParameters {
+                        name: "failing-task".to_string(),
+                        jobs: None,
+                        keep_going: true,
+                    }),
+                }),
+            }),
+        };
+        let result = run_app(options, environment).await;
+
+        assert!(
+            matches!(result, Err(crate::error::Error::SomeStepsFailed)),
+            "expected SomeStepsFailed with keep_going=true on a failing step, got {result:?}"
         );
 
         Ok(())

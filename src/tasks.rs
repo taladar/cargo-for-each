@@ -3,7 +3,6 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::stream::{self, StreamExt as _};
 
@@ -703,7 +702,8 @@ pub async fn run_all_targets_command(
     );
 
     let mut completed_targets = vec![false; resolved_target_set.targets.len()];
-    let has_errors = Arc::new(AtomicBool::new(false));
+    let mut failed_targets = vec![false; resolved_target_set.targets.len()];
+    let mut has_errors = false;
 
     loop {
         let ready_targets: Vec<_> = resolved_target_set
@@ -712,6 +712,7 @@ pub async fn run_all_targets_command(
             .enumerate()
             .filter(|(target_idx, target)| {
                 completed_targets.get(*target_idx).is_none_or(|&c| !c)
+                    && !failed_targets.get(*target_idx).is_some_and(|&f| f)
                     && are_target_dependencies_completed(
                         &params.name,
                         target,
@@ -741,28 +742,29 @@ pub async fn run_all_targets_command(
                                 step_number,
                                 step,
                                 &environment,
-                            ) {
-                                run_single_step(
-                                    step,
-                                    &target.manifest_dir,
-                                    &params.name,
-                                    step_number,
-                                    target_idx,
-                                    &environment,
-                                )
-                                .await?;
+                            ) && let Err(e) = run_single_step(
+                                step,
+                                &target.manifest_dir,
+                                &params.name,
+                                step_number,
+                                target_idx,
+                                &environment,
+                            )
+                            .await
+                            {
+                                return (target_idx, Err(e));
                             }
                         }
-                        Ok(target_idx)
+                        (target_idx, Ok(()))
                     }
                 }
             })
             .buffer_unordered(jobs)
-            .collect::<Vec<_>>()
+            .collect::<Vec<(usize, Result<(), Error>)>>()
             .await;
-        for result in batch_results {
+        for (target_idx, result) in batch_results {
             match result {
-                Ok(target_idx) => {
+                Ok(()) => {
                     if let Some(c) = completed_targets.get_mut(target_idx) {
                         *c = true;
                     }
@@ -770,7 +772,10 @@ pub async fn run_all_targets_command(
                 Err(e) => {
                     if params.keep_going {
                         tracing::error!("A step failed: {}", e);
-                        has_errors.store(true, Ordering::SeqCst);
+                        if let Some(f) = failed_targets.get_mut(target_idx) {
+                            *f = true;
+                        }
+                        has_errors = true;
                     } else {
                         return Err(e);
                     }
@@ -779,12 +784,12 @@ pub async fn run_all_targets_command(
         }
     }
 
-    if !completed_targets.iter().all(|&c| c) {
-        return Err(Error::CircularDependency);
+    if has_errors {
+        return Err(Error::SomeStepsFailed);
     }
 
-    if has_errors.load(Ordering::SeqCst) {
-        return Err(Error::SomeStepsFailed);
+    if !completed_targets.iter().all(|&c| c) {
+        return Err(Error::CircularDependency);
     }
 
     Ok(())
