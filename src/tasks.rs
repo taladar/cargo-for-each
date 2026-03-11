@@ -10,6 +10,7 @@ use tracing::instrument;
 
 use crate::error::Error;
 use crate::plans::Step;
+use crate::step_position::StepPosition;
 use crate::target_sets::load_target_set;
 
 use crate::{Config, Environment};
@@ -267,7 +268,7 @@ pub async fn run_single_step(
     step: &Step,
     manifest_dir: &Path,
     task_name: &str,
-    step_number: usize,
+    step_number: StepPosition,
     target_number: usize,
     environment: &Environment,
 ) -> Result<(), Error> {
@@ -431,7 +432,7 @@ pub struct NextStep<'a> {
     /// The name of the task.
     pub task_name: &'a str,
     /// The 1-based index of the step within the plan.
-    pub step_number: usize,
+    pub step_number: StepPosition,
     /// The 0-based index of the target within the resolved target set.
     pub target_number: usize,
 }
@@ -451,7 +452,7 @@ pub enum StepStatus {
 fn get_step_status(
     task_name: &str,
     target_number: usize,
-    step_number: usize,
+    step_number: StepPosition,
     step: &Step,
     environment: &Environment,
 ) -> StepStatus {
@@ -499,7 +500,7 @@ fn get_step_status(
 fn is_step_completed(
     task_name: &str,
     target_number: usize,
-    step_number: usize,
+    step_number: StepPosition,
     step: &Step,
     environment: &Environment,
 ) -> bool {
@@ -517,13 +518,11 @@ fn is_target_completed(
     environment: &Environment,
 ) -> bool {
     plan.steps.iter().enumerate().all(|(step_idx, step)| {
-        is_step_completed(
-            task_name,
-            target_idx,
-            step_idx.saturating_add(1),
-            step,
-            environment,
-        )
+        if let Some(step_number) = StepPosition::from_step_index(step_idx) {
+            is_step_completed(task_name, target_idx, step_number, step, environment)
+        } else {
+            false // impossible: step_idx overflow
+        }
     })
 }
 
@@ -568,8 +567,16 @@ pub fn find_next_step<'a>(
     for (target_idx, target) in resolved_target_set.targets.iter().enumerate() {
         if are_target_dependencies_completed(task_name, target, plan, &target_map, environment) {
             for (step_idx, step) in plan.steps.iter().enumerate() {
-                let step_number = step_idx.saturating_add(1);
-                if !is_step_completed(task_name, target_idx, step_number, step, environment) {
+                let Some(step_number) = StepPosition::from_step_index(step_idx) else {
+                    continue;
+                };
+                if !is_step_completed(
+                    task_name,
+                    target_idx,
+                    step_number.clone(),
+                    step,
+                    environment,
+                ) {
                     return Some(NextStep {
                         step,
                         manifest_dir: &target.manifest_dir,
@@ -688,8 +695,16 @@ pub async fn run_single_target_command(
     );
 
     for (step_idx, step) in plan.steps.iter().enumerate() {
-        let step_number = step_idx.saturating_add(1);
-        if !is_step_completed(&params.name, target_idx, step_number, step, &environment) {
+        let Some(step_number) = StepPosition::from_step_index(step_idx) else {
+            continue;
+        };
+        if !is_step_completed(
+            &params.name,
+            target_idx,
+            step_number.clone(),
+            step,
+            &environment,
+        ) {
             run_single_step(
                 step,
                 &target.manifest_dir,
@@ -774,11 +789,13 @@ pub async fn run_all_targets_command(
                     let environment = environment.clone();
                     async move {
                         for (step_idx, step) in plan.steps.iter().enumerate() {
-                            let step_number = step_idx.saturating_add(1);
+                            let Some(step_number) = StepPosition::from_step_index(step_idx) else {
+                                continue;
+                            };
                             if !is_step_completed(
                                 &params.name,
                                 target_idx,
-                                step_number,
+                                step_number.clone(),
                                 step,
                                 &environment,
                             ) && let Err(e) = run_single_step(
@@ -971,12 +988,20 @@ pub async fn rewind_single_step_command(
     // We need to find the "last" completed step. This is the last step within the last target
     // that has any completed steps. Or, more precisely, the step with the highest step_number
     // within the target with the highest target_number, that is completed.
-    let mut last_completed_step_info: Option<(usize, usize)> = None; // (target_idx, step_number)
+    let mut last_completed_step_info: Option<(usize, StepPosition)> = None; // (target_idx, step_number)
 
     for (target_idx, _target) in resolved_target_set.targets.iter().enumerate().rev() {
         for (step_idx, _step) in plan.steps.iter().enumerate().rev() {
-            let step_number = step_idx.saturating_add(1);
-            if is_step_completed(&params.name, target_idx, step_number, _step, &environment) {
+            let Some(step_number) = StepPosition::from_step_index(step_idx) else {
+                continue;
+            };
+            if is_step_completed(
+                &params.name,
+                target_idx,
+                step_number.clone(),
+                _step,
+                &environment,
+            ) {
                 last_completed_step_info = Some((target_idx, step_number));
                 break; // Found the last completed step for this target, move to next target
             }
@@ -1073,8 +1098,16 @@ pub async fn task_describe_command(
         println!("    Path: {}", target.manifest_dir.display());
         println!("    Steps:");
         for (step_idx, step) in plan.steps.iter().enumerate() {
-            let step_number = step_idx.saturating_add(1);
-            let status = get_step_status(&params.name, target_idx, step_number, step, &environment);
+            let Some(step_number) = StepPosition::from_step_index(step_idx) else {
+                continue;
+            };
+            let status = get_step_status(
+                &params.name,
+                target_idx,
+                step_number.clone(),
+                step,
+                &environment,
+            );
             let status_icon = match status {
                 StepStatus::Completed => "\u{2705}", // Green checkmark
                 StepStatus::Failed => "\u{274C}",    // Red 'X'
@@ -1163,6 +1196,7 @@ mod tests {
     use crate::Environment;
     use crate::error::Error;
     use crate::plans::{Plan, Step};
+    use crate::step_position::StepPosition;
     use crate::target_sets::ResolvedTargetSet;
     use crate::targets::Target;
 
@@ -1199,7 +1233,7 @@ mod tests {
         env: &Environment,
         task_name: &str,
         target_idx: usize,
-        step_number: usize,
+        step_number: &StepPosition,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let dir = env
             .state_dir
@@ -1224,7 +1258,13 @@ mod tests {
             args: vec![],
         };
         assert_eq!(
-            get_step_status("task", 0, 1, &step, &env),
+            get_step_status(
+                "task",
+                0,
+                StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
+                &step,
+                &env
+            ),
             StepStatus::NotRun
         );
         Ok(())
@@ -1239,13 +1279,14 @@ mod tests {
     fn test_get_step_status_run_command_not_run_no_file() -> TestResult {
         let temp = tempdir()?;
         let env = make_environment(&temp);
-        make_state_dir(&env, "task", 0, 1)?; // dir exists, no file
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        make_state_dir(&env, "task", 0, &step_pos)?; // dir exists, no file
         let step = Step::RunCommand {
             command: "echo".to_string(),
             args: vec![],
         };
         assert_eq!(
-            get_step_status("task", 0, 1, &step, &env),
+            get_step_status("task", 0, step_pos, &step, &env),
             StepStatus::NotRun
         );
         Ok(())
@@ -1256,14 +1297,15 @@ mod tests {
     fn test_get_step_status_run_command_completed() -> TestResult {
         let temp = tempdir()?;
         let env = make_environment(&temp);
-        let dir = make_state_dir(&env, "task", 0, 1)?;
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
         fs_err::write(dir.join("exit_status"), "0")?;
         let step = Step::RunCommand {
             command: "echo".to_string(),
             args: vec![],
         };
         assert_eq!(
-            get_step_status("task", 0, 1, &step, &env),
+            get_step_status("task", 0, step_pos, &step, &env),
             StepStatus::Completed
         );
         Ok(())
@@ -1274,14 +1316,15 @@ mod tests {
     fn test_get_step_status_run_command_failed_nonzero() -> TestResult {
         let temp = tempdir()?;
         let env = make_environment(&temp);
-        let dir = make_state_dir(&env, "task", 0, 1)?;
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
         fs_err::write(dir.join("exit_status"), "1")?;
         let step = Step::RunCommand {
             command: "echo".to_string(),
             args: vec![],
         };
         assert_eq!(
-            get_step_status("task", 0, 1, &step, &env),
+            get_step_status("task", 0, step_pos, &step, &env),
             StepStatus::Failed
         );
         Ok(())
@@ -1295,14 +1338,15 @@ mod tests {
     fn test_get_step_status_run_command_failed_empty_means_failed_not_notrun() -> TestResult {
         let temp = tempdir()?;
         let env = make_environment(&temp);
-        let dir = make_state_dir(&env, "task", 0, 1)?;
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
         fs_err::write(dir.join("exit_status"), "")?;
         let step = Step::RunCommand {
             command: "echo".to_string(),
             args: vec![],
         };
         assert_eq!(
-            get_step_status("task", 0, 1, &step, &env),
+            get_step_status("task", 0, step_pos, &step, &env),
             StepStatus::Failed
         );
         Ok(())
@@ -1320,7 +1364,13 @@ mod tests {
             instructions: "i".to_string(),
         };
         assert_eq!(
-            get_step_status("task", 0, 1, &step, &env),
+            get_step_status(
+                "task",
+                0,
+                StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
+                &step,
+                &env
+            ),
             StepStatus::NotRun
         );
         Ok(())
@@ -1331,14 +1381,15 @@ mod tests {
     fn test_get_step_status_manual_step_completed() -> TestResult {
         let temp = tempdir()?;
         let env = make_environment(&temp);
-        let dir = make_state_dir(&env, "task", 0, 1)?;
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
         fs_err::write(dir.join("manual_step_confirmed"), "y")?;
         let step = Step::ManualStep {
             title: "t".to_string(),
             instructions: "i".to_string(),
         };
         assert_eq!(
-            get_step_status("task", 0, 1, &step, &env),
+            get_step_status("task", 0, step_pos, &step, &env),
             StepStatus::Completed
         );
         Ok(())
@@ -1349,14 +1400,15 @@ mod tests {
     fn test_get_step_status_manual_step_failed() -> TestResult {
         let temp = tempdir()?;
         let env = make_environment(&temp);
-        let dir = make_state_dir(&env, "task", 0, 1)?;
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
         fs_err::write(dir.join("manual_step_confirmed"), "n")?;
         let step = Step::ManualStep {
             title: "t".to_string(),
             instructions: "i".to_string(),
         };
         assert_eq!(
-            get_step_status("task", 0, 1, &step, &env),
+            get_step_status("task", 0, step_pos, &step, &env),
             StepStatus::Failed
         );
         Ok(())
@@ -1369,7 +1421,8 @@ mod tests {
     fn test_find_next_step_returns_none_when_all_completed() -> TestResult {
         let temp = tempdir()?;
         let env = make_environment(&temp);
-        let dir = make_state_dir(&env, "task", 0, 1)?;
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
         fs_err::write(dir.join("exit_status"), "0")?;
 
         let plan = Plan {
@@ -1394,7 +1447,8 @@ mod tests {
     fn test_find_next_step_returns_failed_step_for_retry() -> TestResult {
         let temp = tempdir()?;
         let env = make_environment(&temp);
-        let dir = make_state_dir(&env, "task", 0, 1)?;
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
         fs_err::write(dir.join("exit_status"), "1")?;
 
         let plan = Plan {
@@ -1415,7 +1469,10 @@ mod tests {
             "Failed step should be returned for retry, not skipped"
         );
         let next = next.ok_or("expected Some next step")?;
-        assert_eq!(next.step_number, 1);
+        assert_eq!(
+            next.step_number,
+            StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?
+        );
         Ok(())
     }
 
@@ -1446,7 +1503,11 @@ mod tests {
         let next = find_next_step("task", &plan, &resolved, &env);
         assert!(next.is_some());
         let next = next.ok_or("expected Some next step")?;
-        assert_eq!(next.step_number, 1, "Should return step 1 first");
+        assert_eq!(
+            next.step_number,
+            StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
+            "Should return step 1 first"
+        );
         Ok(())
     }
 
@@ -1455,7 +1516,8 @@ mod tests {
     fn test_find_next_step_skips_completed_steps() -> TestResult {
         let temp = tempdir()?;
         let env = make_environment(&temp);
-        let dir = make_state_dir(&env, "task", 0, 1)?;
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
         fs_err::write(dir.join("exit_status"), "0")?; // step 1 done
 
         let plan = Plan {
@@ -1479,7 +1541,11 @@ mod tests {
         let next = find_next_step("task", &plan, &resolved, &env);
         assert!(next.is_some());
         let next = next.ok_or("expected Some next step")?;
-        assert_eq!(next.step_number, 2, "Step 1 is done; step 2 should be next");
+        assert_eq!(
+            next.step_number,
+            StepPosition::from_one_based(2).ok_or("step position 2 is always valid")?,
+            "Step 1 is done; step 2 should be next"
+        );
         Ok(())
     }
 
@@ -1500,7 +1566,15 @@ mod tests {
             command: "true".to_string(),
             args: vec![],
         };
-        run_single_step(&step, manifest_dir, "test-task", 1, 0, &env).await?;
+        run_single_step(
+            &step,
+            manifest_dir,
+            "test-task",
+            StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
+            0,
+            &env,
+        )
+        .await?;
 
         let exit_status_path = env
             .state_dir
@@ -1531,7 +1605,15 @@ mod tests {
             command: "false".to_string(),
             args: vec![],
         };
-        let result = run_single_step(&step, manifest_dir, "test-task", 1, 0, &env).await;
+        let result = run_single_step(
+            &step,
+            manifest_dir,
+            "test-task",
+            StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
+            0,
+            &env,
+        )
+        .await;
 
         assert!(result.is_err(), "failing command should return Err");
         assert!(

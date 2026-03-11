@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use tracing::instrument;
 
 use crate::error::Error;
+use crate::step_position::StepPosition;
 use clap::Parser;
 
 /// represents a single step in a plan
@@ -125,7 +126,7 @@ pub struct InsertStepParameters {
     pub name: String,
     /// the 1-based position to insert the step at (e.g., 1 to insert before the first step, N to insert before the Nth step)
     #[clap(long)]
-    pub position: usize,
+    pub position: StepPosition,
     /// the type of step to insert
     #[clap(subcommand)]
     pub step: Step,
@@ -139,7 +140,7 @@ pub struct RemoveStepParameters {
     pub name: String,
     /// the position of the step to delete
     #[clap(long)]
-    pub position: usize,
+    pub position: StepPosition,
 }
 
 /// Parameters for deleting a plan
@@ -265,24 +266,18 @@ pub async fn plan_step_command(
             }
             let plan = Plan::load(&params.name, &environment)?;
             for (i, step) in plan.steps.iter().enumerate() {
+                let pos =
+                    StepPosition::from_step_index(i).ok_or(Error::FmtError(std::fmt::Error))?;
                 match step {
                     Step::RunCommand { command, args } => {
-                        println!(
-                            "{}: RunCommand - {} {}",
-                            i.saturating_add(1),
-                            command,
-                            args.join(" ")
-                        );
+                        println!("{pos}: RunCommand - {} {}", command, args.join(" "));
                     }
                     Step::ManualStep {
                         title,
                         instructions,
                     } => {
                         println!(
-                            "{}: ManualStep - Title: \"{}\", Instructions: \"{}\"",
-                            i.saturating_add(1),
-                            title,
-                            instructions
+                            "{pos}: ManualStep - Title: \"{title}\", Instructions: \"{instructions}\""
                         );
                     }
                 }
@@ -306,7 +301,10 @@ pub async fn plan_step_command(
                 return Err(Error::PlanNotFound(params.name));
             }
             let mut plan = Plan::load(&params.name, &environment)?;
-            if params.position > plan.steps.len().saturating_add(1) || params.position == 0 {
+            let insert_idx = params.position.to_top_level_index().ok_or_else(|| {
+                Error::PlanStepOutOfBounds(params.position.clone(), plan.steps.len())
+            })?;
+            if insert_idx > plan.steps.len() {
                 return Err(Error::PlanStepOutOfBounds(
                     params.position,
                     plan.steps.len(),
@@ -317,8 +315,7 @@ pub async fn plan_step_command(
             {
                 return Err(crate::error::Error::CommandNotFound(command.to_owned()));
             }
-            plan.steps
-                .insert(params.position.saturating_sub(1), params.step);
+            plan.steps.insert(insert_idx, params.step);
             plan.save(&params.name, &environment)?;
         }
         PlanStepSubCommand::Remove(params) => {
@@ -326,13 +323,16 @@ pub async fn plan_step_command(
                 return Err(Error::PlanNotFound(params.name));
             }
             let mut plan = Plan::load(&params.name, &environment)?;
-            if params.position > plan.steps.len() || params.position == 0 {
+            let remove_idx = params.position.to_top_level_index().ok_or_else(|| {
+                Error::PlanStepOutOfBounds(params.position.clone(), plan.steps.len())
+            })?;
+            if remove_idx >= plan.steps.len() {
                 return Err(Error::PlanStepOutOfBounds(
                     params.position,
                     plan.steps.len(),
                 ));
             }
-            plan.steps.remove(params.position.saturating_sub(1));
+            plan.steps.remove(remove_idx);
             plan.save(&params.name, &environment)?;
         }
     }
@@ -406,7 +406,8 @@ mod tests {
             PlanStepParameters {
                 sub_command: PlanStepSubCommand::Insert(InsertStepParameters {
                     name: "nonexistent-plan".to_string(),
-                    position: 1,
+                    position: StepPosition::from_one_based(1)
+                        .ok_or("step position 1 is always valid")?,
                     step: Step::ManualStep {
                         title: "t".to_string(),
                         instructions: "i".to_string(),
@@ -432,7 +433,8 @@ mod tests {
             PlanStepParameters {
                 sub_command: PlanStepSubCommand::Remove(RemoveStepParameters {
                     name: "nonexistent-plan".to_string(),
-                    position: 1,
+                    position: StepPosition::from_one_based(1)
+                        .ok_or("step position 1 is always valid")?,
                 }),
             },
             environment,

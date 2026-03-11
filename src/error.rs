@@ -98,7 +98,14 @@ pub enum Error {
     CouldNotParsePlanFile(#[source] toml::de::Error),
     /// plan step is out of bounds
     #[error("plan step {0} is out of bounds for plan with {1} steps (valid range is 1 to {1})")]
-    PlanStepOutOfBounds(usize, usize),
+    PlanStepOutOfBounds(crate::step_position::StepPosition, usize),
+    /// error parsing a step position string
+    #[error("error parsing step position: {0}")]
+    StepPositionParseError(
+        #[source]
+        #[from]
+        crate::step_position::StepPositionParseError,
+    ),
     /// the specified task was not found
     #[error("the specified task {0} was not found")]
     TaskNotFound(String),

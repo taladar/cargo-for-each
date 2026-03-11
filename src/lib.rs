@@ -7,6 +7,8 @@
 pub mod error;
 /// Implements functionality for managing plans and their steps.
 pub mod plans;
+/// Defines the StepPosition type for addressing plan steps.
+pub mod step_position;
 /// Implements functionality for managing target sets.
 pub mod target_sets;
 /// Defines target-related structures and resolution logic.
