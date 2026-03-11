@@ -44,19 +44,19 @@ assets = [
 
 [dependencies]
 cargo_metadata = "0.23.1"
-clap = { version = "4.5.57", features = ["derive", "cargo"] }
-clap_complete = "4.5.65"
+clap = { version = "4.5.60", features = ["derive", "cargo"] }
+clap_complete = "4.5.66"
 clap_mangen = "0.2.31"
 dirs = "6.0.0"
 fs-err = "3.3.0"
-futures = "0.3.31"
+futures = "0.3.32"
 humantime = "2.3.0"
 log-panics = { version = "2.1.0", features = ["with-backtrace"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["macros", "parsing"] }
-tokio = { version = "1.49.0", features = ["full"] }
-toml = "0.9.11"
+tokio = { version = "1.50.0", features = ["full"] }
+toml = "1.0.6"
 tracing = "0.1.44"
 tracing-appender = "0.2.4"
 tracing-journald = "0.3.2"
@@ -65,7 +65,7 @@ tracing-test = "0.2.6"
 
 [dev-dependencies]
 pretty_assertions = { version = "1.4.1" }
-tempfile = "3.24.0"
+tempfile = "3.27.0"
 
 [profile.release]
 # do not strip debug info from release builds, useful for debugging those, cargo-flamegraph profiling or similar use cases
