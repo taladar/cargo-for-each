@@ -3,6 +3,8 @@
 //! This library provides the core logic for managing workspaces, crates,
 //! target sets, plans, and tasks for the `cargo-for-each` CLI.
 
+/// Defines the Condition type for evaluating boolean conditions in plan control flow.
+pub mod condition;
 /// Handles application-specific errors.
 pub mod error;
 /// Implements functionality for managing plans and their steps.

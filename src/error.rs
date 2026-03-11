@@ -206,6 +206,9 @@ pub enum Error {
     /// the user did not confirm the manual step
     #[error("manual step not confirmed")]
     ManualStepNotConfirmed,
+    /// a condition result state file contained an unexpected value
+    #[error("invalid condition result: {0:?}")]
+    InvalidConditionResult(String),
     /// some steps failed
     #[error("some steps failed")]
     SomeStepsFailed,
