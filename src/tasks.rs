@@ -307,23 +307,33 @@ pub async fn run_single_step(
             cmd.arg("-q").arg("-c").arg(&command_str).arg(&cast_path);
             cmd.current_dir(manifest_dir);
 
-            let status = crate::utils::execute_command(&mut cmd, environment, manifest_dir)?.status;
-
             let exit_status_path = state_dir.join("exit_status");
-            fs_err::write(
-                &exit_status_path,
-                status
-                    .code()
-                    .map_or_else(|| "".to_string(), |c| c.to_string()),
-            )
-            .map_err(|e| Error::CouldNotWriteStateFile(exit_status_path, e))?;
+            match crate::utils::execute_command(&mut cmd, environment, manifest_dir) {
+                Err(e) => {
+                    // asciinema failed to launch; write an empty exit_status so
+                    // get_step_status sees Failed rather than NotRun.
+                    fs_err::write(&exit_status_path, "")
+                        .map_err(|we| Error::CouldNotWriteStateFile(exit_status_path, we))?;
+                    return Err(e);
+                }
+                Ok(output) => {
+                    let status = output.status;
+                    fs_err::write(
+                        &exit_status_path,
+                        status
+                            .code()
+                            .map_or_else(|| "".to_string(), |c| c.to_string()),
+                    )
+                    .map_err(|e| Error::CouldNotWriteStateFile(exit_status_path, e))?;
 
-            if !status.success() {
-                return Err(Error::CommandFailed(
-                    command_str,
-                    manifest_dir.to_path_buf(),
-                    status,
-                ));
+                    if !status.success() {
+                        return Err(Error::CommandFailed(
+                            command_str,
+                            manifest_dir.to_path_buf(),
+                            status,
+                        ));
+                    }
+                }
             }
         }
         Step::ManualStep {
@@ -1111,4 +1121,319 @@ pub async fn task_command(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    use super::{StepStatus, find_next_step, get_step_status};
+    use crate::Environment;
+    use crate::plans::{Plan, Step};
+    use crate::target_sets::ResolvedTargetSet;
+    use crate::targets::Target;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Build a minimal test environment pointing into `temp_dir`.
+    fn make_environment(temp_dir: &tempfile::TempDir) -> Environment {
+        Environment {
+            config_dir: temp_dir.path().join("config"),
+            state_dir: temp_dir.path().join("state"),
+            paths: vec![],
+            suppress_subprocess_output: true,
+        }
+    }
+
+    /// Create the step state directory for `(task, target_idx, step_number)` and return its path.
+    fn make_state_dir(
+        env: &Environment,
+        task_name: &str,
+        target_idx: usize,
+        step_number: usize,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let dir = env
+            .state_dir
+            .join("cargo-for-each")
+            .join("tasks")
+            .join(task_name)
+            .join(target_idx.to_string())
+            .join(step_number.to_string());
+        fs_err::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    // ── get_step_status: RunCommand ────────────────────────────────────────────
+
+    /// No state directory → NotRun.
+    #[test]
+    fn test_get_step_status_run_command_not_run_no_dir() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let step = Step::RunCommand {
+            command: "echo".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            get_step_status("task", 0, 1, &step, &env),
+            StepStatus::NotRun
+        );
+        Ok(())
+    }
+
+    /// State directory exists but exit_status file is absent → NotRun.
+    ///
+    /// This is the pre-condition that Bug 2's fix prevents from occurring at
+    /// runtime: after the fix, `run_single_step` always writes exit_status
+    /// before returning, so the file will never be absent once the dir exists.
+    #[test]
+    fn test_get_step_status_run_command_not_run_no_file() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        make_state_dir(&env, "task", 0, 1)?; // dir exists, no file
+        let step = Step::RunCommand {
+            command: "echo".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            get_step_status("task", 0, 1, &step, &env),
+            StepStatus::NotRun
+        );
+        Ok(())
+    }
+
+    /// exit_status = "0" → Completed.
+    #[test]
+    fn test_get_step_status_run_command_completed() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let dir = make_state_dir(&env, "task", 0, 1)?;
+        fs_err::write(dir.join("exit_status"), "0")?;
+        let step = Step::RunCommand {
+            command: "echo".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            get_step_status("task", 0, 1, &step, &env),
+            StepStatus::Completed
+        );
+        Ok(())
+    }
+
+    /// exit_status = "1" (command exited non-zero) → Failed.
+    #[test]
+    fn test_get_step_status_run_command_failed_nonzero() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let dir = make_state_dir(&env, "task", 0, 1)?;
+        fs_err::write(dir.join("exit_status"), "1")?;
+        let step = Step::RunCommand {
+            command: "echo".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            get_step_status("task", 0, 1, &step, &env),
+            StepStatus::Failed
+        );
+        Ok(())
+    }
+
+    /// exit_status = "" (written by Bug 2 fix when execute_command itself errors) → Failed.
+    ///
+    /// Regression test for Bug 2: an empty exit_status file (written when the
+    /// OS-level command launch fails) must be read as Failed, not as NotRun.
+    #[test]
+    fn test_get_step_status_run_command_failed_empty_means_failed_not_notrun() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let dir = make_state_dir(&env, "task", 0, 1)?;
+        fs_err::write(dir.join("exit_status"), "")?;
+        let step = Step::RunCommand {
+            command: "echo".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            get_step_status("task", 0, 1, &step, &env),
+            StepStatus::Failed
+        );
+        Ok(())
+    }
+
+    // ── get_step_status: ManualStep ───────────────────────────────────────────
+
+    /// No state directory → NotRun.
+    #[test]
+    fn test_get_step_status_manual_step_not_run() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let step = Step::ManualStep {
+            title: "t".to_string(),
+            instructions: "i".to_string(),
+        };
+        assert_eq!(
+            get_step_status("task", 0, 1, &step, &env),
+            StepStatus::NotRun
+        );
+        Ok(())
+    }
+
+    /// manual_step_confirmed = "y" → Completed.
+    #[test]
+    fn test_get_step_status_manual_step_completed() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let dir = make_state_dir(&env, "task", 0, 1)?;
+        fs_err::write(dir.join("manual_step_confirmed"), "y")?;
+        let step = Step::ManualStep {
+            title: "t".to_string(),
+            instructions: "i".to_string(),
+        };
+        assert_eq!(
+            get_step_status("task", 0, 1, &step, &env),
+            StepStatus::Completed
+        );
+        Ok(())
+    }
+
+    /// manual_step_confirmed = "n" → Failed.
+    #[test]
+    fn test_get_step_status_manual_step_failed() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let dir = make_state_dir(&env, "task", 0, 1)?;
+        fs_err::write(dir.join("manual_step_confirmed"), "n")?;
+        let step = Step::ManualStep {
+            title: "t".to_string(),
+            instructions: "i".to_string(),
+        };
+        assert_eq!(
+            get_step_status("task", 0, 1, &step, &env),
+            StepStatus::Failed
+        );
+        Ok(())
+    }
+
+    // ── find_next_step ────────────────────────────────────────────────────────
+
+    /// All steps completed → None returned.
+    #[test]
+    fn test_find_next_step_returns_none_when_all_completed() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let dir = make_state_dir(&env, "task", 0, 1)?;
+        fs_err::write(dir.join("exit_status"), "0")?;
+
+        let plan = Plan {
+            steps: vec![Step::RunCommand {
+                command: "echo".to_string(),
+                args: vec![],
+            }],
+        };
+        let resolved = ResolvedTargetSet {
+            targets: vec![Target {
+                manifest_dir: PathBuf::from("/tmp"),
+                dependencies: vec![],
+            }],
+        };
+        assert!(find_next_step("task", &plan, &resolved, &env).is_none());
+        Ok(())
+    }
+
+    /// A failed step (exit_status != "0") is NOT skipped by find_next_step —
+    /// it is returned as the next step so it can be retried.
+    #[test]
+    fn test_find_next_step_returns_failed_step_for_retry() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let dir = make_state_dir(&env, "task", 0, 1)?;
+        fs_err::write(dir.join("exit_status"), "1")?;
+
+        let plan = Plan {
+            steps: vec![Step::RunCommand {
+                command: "echo".to_string(),
+                args: vec![],
+            }],
+        };
+        let resolved = ResolvedTargetSet {
+            targets: vec![Target {
+                manifest_dir: PathBuf::from("/tmp"),
+                dependencies: vec![],
+            }],
+        };
+        let next = find_next_step("task", &plan, &resolved, &env);
+        assert!(
+            next.is_some(),
+            "Failed step should be returned for retry, not skipped"
+        );
+        let next = next.ok_or("expected Some next step")?;
+        assert_eq!(next.step_number, 1);
+        Ok(())
+    }
+
+    /// No state at all → first step is returned.
+    #[test]
+    fn test_find_next_step_returns_first_step_when_nothing_run() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+
+        let plan = Plan {
+            steps: vec![
+                Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec!["a".to_string()],
+                },
+                Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec!["b".to_string()],
+                },
+            ],
+        };
+        let resolved = ResolvedTargetSet {
+            targets: vec![Target {
+                manifest_dir: PathBuf::from("/tmp"),
+                dependencies: vec![],
+            }],
+        };
+        let next = find_next_step("task", &plan, &resolved, &env);
+        assert!(next.is_some());
+        let next = next.ok_or("expected Some next step")?;
+        assert_eq!(next.step_number, 1, "Should return step 1 first");
+        Ok(())
+    }
+
+    /// Step 1 completed, step 2 not yet run → step 2 is returned.
+    #[test]
+    fn test_find_next_step_skips_completed_steps() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let dir = make_state_dir(&env, "task", 0, 1)?;
+        fs_err::write(dir.join("exit_status"), "0")?; // step 1 done
+
+        let plan = Plan {
+            steps: vec![
+                Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec!["a".to_string()],
+                },
+                Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec!["b".to_string()],
+                },
+            ],
+        };
+        let resolved = ResolvedTargetSet {
+            targets: vec![Target {
+                manifest_dir: PathBuf::from("/tmp"),
+                dependencies: vec![],
+            }],
+        };
+        let next = find_next_step("task", &plan, &resolved, &env);
+        assert!(next.is_some());
+        let next = next.ok_or("expected Some next step")?;
+        assert_eq!(next.step_number, 2, "Step 1 is done; step 2 should be next");
+        Ok(())
+    }
 }
