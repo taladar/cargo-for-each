@@ -218,4 +218,22 @@ pub enum Error {
     /// circular dependency or deadlock detected
     #[error("circular dependency or deadlock detected")]
     CircularDependency,
+    /// the step at the given position is not an IfElseIf step
+    #[error("step at position {0} is not an if-else-if step")]
+    StepIsNotIfElseIf(crate::step_position::StepPosition),
+    /// a branch index is out of bounds for the IfElseIf step at the given position
+    #[error(
+        "branch {1} is out of bounds for the if-else-if step at position {0} which has {2} branch(es)"
+    )]
+    IfElseIfBranchOutOfBounds(
+        crate::step_position::StepPosition,
+        std::num::NonZeroUsize,
+        usize,
+    ),
+    /// the IfElseIf step already has an else block
+    #[error("if-else-if step at position {0} already has an else block")]
+    IfElseIfAlreadyHasElse(crate::step_position::StepPosition),
+    /// the IfElseIf step has no else block to remove
+    #[error("if-else-if step at position {0} has no else block")]
+    IfElseIfHasNoElse(crate::step_position::StepPosition),
 }

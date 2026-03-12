@@ -66,6 +66,49 @@ pub enum CliStep {
     },
 }
 
+/// A CLI-only condition type that can be constructed via clap.
+/// Does not include `Not`, `And`, or `Or` (not CLI-parseable).
+#[derive(Debug, Clone, Parser)]
+pub enum CliCondition {
+    /// Ask the user a yes/no question.
+    AskUser {
+        /// The question to display to the user.
+        question: String,
+    },
+    /// Run a command; true if it exits with code 0.
+    RunCommand {
+        /// The command to execute.
+        command: String,
+        /// The arguments to pass to the command.
+        #[clap(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// True if the current target is a binary crate.
+    IsBinaryCrate,
+    /// True if the current target is a library crate.
+    IsLibraryCrate,
+    /// True if the current target is a procedural macro crate.
+    IsProcMacroCrate,
+    /// True if the current target is a standalone crate workspace.
+    IsStandaloneWorkspace,
+    /// True if the current target is a workspace with multiple member crates.
+    IsWorkspaceWithMembers,
+}
+
+impl From<CliCondition> for crate::condition::Condition {
+    fn from(cli: CliCondition) -> Self {
+        match cli {
+            CliCondition::AskUser { question } => Self::AskUser { question },
+            CliCondition::RunCommand { command, args } => Self::RunCommand { command, args },
+            CliCondition::IsBinaryCrate => Self::IsBinaryCrate {},
+            CliCondition::IsLibraryCrate => Self::IsLibraryCrate {},
+            CliCondition::IsProcMacroCrate => Self::IsProcMacroCrate {},
+            CliCondition::IsStandaloneWorkspace => Self::IsStandaloneWorkspace {},
+            CliCondition::IsWorkspaceWithMembers => Self::IsWorkspaceWithMembers {},
+        }
+    }
+}
+
 impl From<CliStep> for Step {
     fn from(cli: CliStep) -> Self {
         match cli {
@@ -212,6 +255,70 @@ pub struct ListStepsParameters {
     pub name: String,
 }
 
+/// Parameters for adding a new IfElseIf step (with one initial branch) to a plan
+#[derive(Parser, Debug, Clone)]
+pub struct IfAddParameters {
+    /// the name of the plan
+    #[clap(long)]
+    pub name: String,
+    /// the condition for the first branch
+    #[clap(subcommand)]
+    pub condition: CliCondition,
+}
+
+/// Parameters for adding an elsif branch to an existing IfElseIf step
+#[derive(Parser, Debug, Clone)]
+pub struct IfBranchAddParameters {
+    /// the name of the plan
+    #[clap(long)]
+    pub name: String,
+    /// the position of the IfElseIf step (top-level, 1-based)
+    #[clap(long)]
+    pub position: StepPosition,
+    /// the condition for the new branch
+    #[clap(subcommand)]
+    pub condition: CliCondition,
+}
+
+/// Parameters for adding an else block (with a first step) to an existing IfElseIf step
+#[derive(Parser, Debug, Clone)]
+pub struct IfElseAddParameters {
+    /// the name of the plan
+    #[clap(long)]
+    pub name: String,
+    /// the position of the IfElseIf step (top-level, 1-based)
+    #[clap(long)]
+    pub position: StepPosition,
+    /// the first step to add to the else block
+    #[clap(subcommand)]
+    pub step: CliStep,
+}
+
+/// Parameters for removing a branch from an existing IfElseIf step
+#[derive(Parser, Debug, Clone)]
+pub struct IfBranchRemoveParameters {
+    /// the name of the plan
+    #[clap(long)]
+    pub name: String,
+    /// the position of the IfElseIf step (top-level, 1-based)
+    #[clap(long)]
+    pub position: StepPosition,
+    /// the 1-based index of the branch to remove
+    #[clap(long)]
+    pub branch: std::num::NonZeroUsize,
+}
+
+/// Parameters for removing the else block from an existing IfElseIf step
+#[derive(Parser, Debug, Clone)]
+pub struct IfElseRemoveParameters {
+    /// the name of the plan
+    #[clap(long)]
+    pub name: String,
+    /// the position of the IfElseIf step (top-level, 1-based)
+    #[clap(long)]
+    pub position: StepPosition,
+}
+
 /// The sub-commands of `plan step`
 #[derive(Parser, Debug, Clone)]
 pub enum PlanStepSubCommand {
@@ -223,6 +330,16 @@ pub enum PlanStepSubCommand {
     Remove(RemoveStepParameters),
     /// List the steps of a plan
     List(ListStepsParameters),
+    /// Add a new IfElseIf step with one initial branch
+    IfAdd(IfAddParameters),
+    /// Add an elsif branch to an existing IfElseIf step
+    IfBranchAdd(IfBranchAddParameters),
+    /// Add an else block (with a first step) to an existing IfElseIf step
+    IfElseAdd(IfElseAddParameters),
+    /// Remove an elsif branch from an existing IfElseIf step
+    IfBranchRemove(IfBranchRemoveParameters),
+    /// Remove the else block from an existing IfElseIf step
+    IfElseRemove(IfElseRemoveParameters),
 }
 
 /// Parameters for plan step subcommand
@@ -299,6 +416,33 @@ pub async fn plan_command(
         }
     }
     Ok(())
+}
+
+/// Returns mutable references to the `branches` and `else_steps` of the `IfElseIf` step at `position`.
+///
+/// # Errors
+///
+/// Returns `PlanStepOutOfBounds` if the position does not refer to a top-level index or is out of range.
+/// Returns `StepIsNotIfElseIf` if the step at that position is not an `IfElseIf` step.
+fn get_if_step_mut<'a>(
+    plan: &'a mut Plan,
+    position: &StepPosition,
+) -> Result<(&'a mut Vec<Branch>, &'a mut Vec<Step>), Error> {
+    let idx = position
+        .to_top_level_index()
+        .ok_or_else(|| Error::PlanStepOutOfBounds(position.clone(), plan.steps.len()))?;
+    let steps_len = plan.steps.len();
+    match plan
+        .steps
+        .get_mut(idx)
+        .ok_or_else(|| Error::PlanStepOutOfBounds(position.clone(), steps_len))?
+    {
+        Step::IfElseIf {
+            branches,
+            else_steps,
+        } => Ok((branches, else_steps)),
+        _ => Err(Error::StepIsNotIfElseIf(position.clone())),
+    }
 }
 
 /// implementation of the plan step subcommand
@@ -400,6 +544,79 @@ pub async fn plan_step_command(
                 ));
             }
             plan.steps.remove(remove_idx);
+            plan.save(&params.name, &environment)?;
+        }
+        PlanStepSubCommand::IfAdd(params) => {
+            if !Plan::exists(&params.name, &environment)? {
+                return Err(Error::PlanNotFound(params.name));
+            }
+            let mut plan = Plan::load(&params.name, &environment)?;
+            plan.steps.push(Step::IfElseIf {
+                branches: vec![Branch {
+                    condition: params.condition.into(),
+                    steps: vec![],
+                }],
+                else_steps: vec![],
+            });
+            plan.save(&params.name, &environment)?;
+        }
+        PlanStepSubCommand::IfBranchAdd(params) => {
+            if !Plan::exists(&params.name, &environment)? {
+                return Err(Error::PlanNotFound(params.name));
+            }
+            let mut plan = Plan::load(&params.name, &environment)?;
+            let (branches, _) = get_if_step_mut(&mut plan, &params.position)?;
+            branches.push(Branch {
+                condition: params.condition.into(),
+                steps: vec![],
+            });
+            plan.save(&params.name, &environment)?;
+        }
+        PlanStepSubCommand::IfElseAdd(params) => {
+            if !Plan::exists(&params.name, &environment)? {
+                return Err(Error::PlanNotFound(params.name));
+            }
+            let mut plan = Plan::load(&params.name, &environment)?;
+            let (_, else_steps) = get_if_step_mut(&mut plan, &params.position)?;
+            if !else_steps.is_empty() {
+                return Err(Error::IfElseIfAlreadyHasElse(params.position));
+            }
+            else_steps.push(params.step.into());
+            plan.save(&params.name, &environment)?;
+        }
+        PlanStepSubCommand::IfBranchRemove(params) => {
+            if !Plan::exists(&params.name, &environment)? {
+                return Err(Error::PlanNotFound(params.name));
+            }
+            let mut plan = Plan::load(&params.name, &environment)?;
+            let (branches, _) = get_if_step_mut(&mut plan, &params.position)?;
+            let idx = params.branch.get().checked_sub(1).ok_or_else(|| {
+                Error::IfElseIfBranchOutOfBounds(
+                    params.position.clone(),
+                    params.branch,
+                    branches.len(),
+                )
+            })?;
+            if idx >= branches.len() {
+                return Err(Error::IfElseIfBranchOutOfBounds(
+                    params.position,
+                    params.branch,
+                    branches.len(),
+                ));
+            }
+            branches.remove(idx);
+            plan.save(&params.name, &environment)?;
+        }
+        PlanStepSubCommand::IfElseRemove(params) => {
+            if !Plan::exists(&params.name, &environment)? {
+                return Err(Error::PlanNotFound(params.name));
+            }
+            let mut plan = Plan::load(&params.name, &environment)?;
+            let (_, else_steps) = get_if_step_mut(&mut plan, &params.position)?;
+            if else_steps.is_empty() {
+                return Err(Error::IfElseIfHasNoElse(params.position));
+            }
+            else_steps.clear();
             plan.save(&params.name, &environment)?;
         }
     }
@@ -604,6 +821,292 @@ mod tests {
         assert!(
             result.is_ok(),
             "adding to an existing plan should succeed: {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Helper to create a plan with one IfElseIf step at position 1.
+    fn make_plan_with_if_step(else_steps: Vec<Step>) -> Plan {
+        Plan {
+            steps: vec![Step::IfElseIf {
+                branches: vec![Branch {
+                    condition: Condition::IsBinaryCrate {},
+                    steps: vec![],
+                }],
+                else_steps,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn if_add_appends_if_step() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        Plan::default().save("p", &environment)?;
+        plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::IfAdd(IfAddParameters {
+                    name: "p".to_string(),
+                    condition: CliCondition::IsBinaryCrate,
+                }),
+            },
+            environment.clone(),
+        )
+        .await?;
+        let plan = Plan::load("p", &environment)?;
+        assert_eq!(plan.steps.len(), 1);
+        assert!(
+            matches!(plan.steps.first(), Some(Step::IfElseIf { branches, .. }) if branches.len() == 1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn if_branch_add_appends_branch() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        make_plan_with_if_step(vec![]).save("p", &environment)?;
+        plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::IfBranchAdd(IfBranchAddParameters {
+                    name: "p".to_string(),
+                    position: StepPosition::from_one_based(1)
+                        .ok_or("step position 1 is always valid")?,
+                    condition: CliCondition::IsLibraryCrate,
+                }),
+            },
+            environment.clone(),
+        )
+        .await?;
+        let plan = Plan::load("p", &environment)?;
+        assert!(
+            matches!(plan.steps.first(), Some(Step::IfElseIf { branches, .. }) if branches.len() == 2)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn if_else_add_creates_else() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        make_plan_with_if_step(vec![]).save("p", &environment)?;
+        plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::IfElseAdd(IfElseAddParameters {
+                    name: "p".to_string(),
+                    position: StepPosition::from_one_based(1)
+                        .ok_or("step position 1 is always valid")?,
+                    step: CliStep::ManualStep {
+                        title: "t".to_string(),
+                        instructions: "i".to_string(),
+                    },
+                }),
+            },
+            environment.clone(),
+        )
+        .await?;
+        let plan = Plan::load("p", &environment)?;
+        assert!(
+            matches!(plan.steps.first(), Some(Step::IfElseIf { else_steps, .. }) if else_steps.len() == 1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn if_else_add_errors_when_else_exists() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        make_plan_with_if_step(vec![Step::ManualStep {
+            title: "t".to_string(),
+            instructions: "i".to_string(),
+        }])
+        .save("p", &environment)?;
+        let result = plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::IfElseAdd(IfElseAddParameters {
+                    name: "p".to_string(),
+                    position: StepPosition::from_one_based(1)
+                        .ok_or("step position 1 is always valid")?,
+                    step: CliStep::ManualStep {
+                        title: "t2".to_string(),
+                        instructions: "i2".to_string(),
+                    },
+                }),
+            },
+            environment,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(crate::error::Error::IfElseIfAlreadyHasElse(_))),
+            "expected IfElseIfAlreadyHasElse, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn if_branch_remove_removes_correct_branch() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        Plan {
+            steps: vec![Step::IfElseIf {
+                branches: vec![
+                    Branch {
+                        condition: Condition::IsBinaryCrate {},
+                        steps: vec![],
+                    },
+                    Branch {
+                        condition: Condition::IsLibraryCrate {},
+                        steps: vec![],
+                    },
+                ],
+                else_steps: vec![],
+            }],
+        }
+        .save("p", &environment)?;
+        plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::IfBranchRemove(IfBranchRemoveParameters {
+                    name: "p".to_string(),
+                    position: StepPosition::from_one_based(1)
+                        .ok_or("step position 1 is always valid")?,
+                    branch: std::num::NonZeroUsize::new(1).ok_or("1 is non-zero")?,
+                }),
+            },
+            environment.clone(),
+        )
+        .await?;
+        let plan = Plan::load("p", &environment)?;
+        assert!(
+            matches!(plan.steps.first(), Some(Step::IfElseIf { branches, .. }) if branches.len() == 1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn if_branch_remove_out_of_bounds() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        make_plan_with_if_step(vec![]).save("p", &environment)?;
+        let result = plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::IfBranchRemove(IfBranchRemoveParameters {
+                    name: "p".to_string(),
+                    position: StepPosition::from_one_based(1)
+                        .ok_or("step position 1 is always valid")?,
+                    branch: std::num::NonZeroUsize::new(5).ok_or("5 is non-zero")?,
+                }),
+            },
+            environment,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::Error::IfElseIfBranchOutOfBounds(..))
+            ),
+            "expected IfElseIfBranchOutOfBounds, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn if_else_remove_clears_else() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        make_plan_with_if_step(vec![Step::ManualStep {
+            title: "t".to_string(),
+            instructions: "i".to_string(),
+        }])
+        .save("p", &environment)?;
+        plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::IfElseRemove(IfElseRemoveParameters {
+                    name: "p".to_string(),
+                    position: StepPosition::from_one_based(1)
+                        .ok_or("step position 1 is always valid")?,
+                }),
+            },
+            environment.clone(),
+        )
+        .await?;
+        let plan = Plan::load("p", &environment)?;
+        assert!(
+            matches!(plan.steps.first(), Some(Step::IfElseIf { else_steps, .. }) if else_steps.is_empty())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn if_else_remove_errors_when_no_else() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        make_plan_with_if_step(vec![]).save("p", &environment)?;
+        let result = plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::IfElseRemove(IfElseRemoveParameters {
+                    name: "p".to_string(),
+                    position: StepPosition::from_one_based(1)
+                        .ok_or("step position 1 is always valid")?,
+                }),
+            },
+            environment,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(crate::error::Error::IfElseIfHasNoElse(_))),
+            "expected IfElseIfHasNoElse, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn if_add_on_non_if_step_returns_error() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        Plan {
+            steps: vec![Step::ManualStep {
+                title: "t".to_string(),
+                instructions: "i".to_string(),
+            }],
+        }
+        .save("p", &environment)?;
+        let result = plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::IfBranchAdd(IfBranchAddParameters {
+                    name: "p".to_string(),
+                    position: StepPosition::from_one_based(1)
+                        .ok_or("step position 1 is always valid")?,
+                    condition: CliCondition::IsBinaryCrate,
+                }),
+            },
+            environment,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(crate::error::Error::StepIsNotIfElseIf(_))),
+            "expected StepIsNotIfElseIf, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn if_add_missing_plan_returns_plan_not_found() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let environment = crate::Environment::mock(&temp)?;
+        let result = plan_step_command(
+            PlanStepParameters {
+                sub_command: PlanStepSubCommand::IfAdd(IfAddParameters {
+                    name: "nonexistent".to_string(),
+                    condition: CliCondition::IsBinaryCrate,
+                }),
+            },
+            environment,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(crate::error::Error::PlanNotFound(_))),
+            "expected PlanNotFound, got {result:?}"
         );
         Ok(())
     }
