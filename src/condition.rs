@@ -48,6 +48,13 @@ pub enum Condition {
     /// True if the current target is a workspace with multiple member crates.
     IsWorkspaceWithMembers {},
 
+    // ── File system conditions ────────────────────────────────────────────────
+    /// True if a file with the given name exists in the target's directory.
+    FileExists {
+        /// The file name (or relative path) to check for.
+        filename: String,
+    },
+
     // ── Logical combinators ───────────────────────────────────────────────────
     /// True if the inner condition evaluates to false.
     Not {
@@ -122,6 +129,7 @@ impl Condition {
                 .workspaces
                 .iter()
                 .any(|w| w.manifest_dir == manifest_dir && !w.is_standalone)),
+            Self::FileExists { filename } => Ok(manifest_dir.join(filename).exists()),
             Self::Not { condition } => {
                 Ok(!condition.evaluate(manifest_dir, environment, config)?)
             }
@@ -539,6 +547,48 @@ mod tests {
         }
         .evaluate(dir, &env, &config)?;
         assert_eq!(result, false);
+        Ok(())
+    }
+
+    #[test]
+    fn file_exists_true() -> TestResult {
+        let temp_dir = tempfile::tempdir()?;
+        let env = mock_environment(&temp_dir)?;
+        let dir = temp_dir.path();
+        fs_err::write(dir.join("build.rs"), "")?;
+        let config = empty_config();
+        let result = Condition::FileExists {
+            filename: "build.rs".to_string(),
+        }
+        .evaluate(dir, &env, &config)?;
+        assert_eq!(result, true);
+        Ok(())
+    }
+
+    #[test]
+    fn file_exists_false() -> TestResult {
+        let temp_dir = tempfile::tempdir()?;
+        let env = mock_environment(&temp_dir)?;
+        let dir = temp_dir.path();
+        let config = empty_config();
+        let result = Condition::FileExists {
+            filename: "nonexistent.txt".to_string(),
+        }
+        .evaluate(dir, &env, &config)?;
+        assert_eq!(result, false);
+        Ok(())
+    }
+
+    #[test]
+    fn file_exists_toml_roundtrip() -> TestResult {
+        let condition = Condition::FileExists {
+            filename: "foo.txt".to_string(),
+        };
+        let serialized = toml::to_string(&condition)?;
+        let deserialized: Condition = toml::from_str(&serialized)?;
+        assert!(
+            matches!(deserialized, Condition::FileExists { filename } if filename == "foo.txt")
+        );
         Ok(())
     }
 }

@@ -93,6 +93,11 @@ pub enum CliCondition {
     IsStandaloneWorkspace,
     /// True if the current target is a workspace with multiple member crates.
     IsWorkspaceWithMembers,
+    /// True if a file with the given name exists in the target's directory.
+    FileExists {
+        /// The file name to check for.
+        filename: String,
+    },
 }
 
 impl From<CliCondition> for crate::condition::Condition {
@@ -105,6 +110,7 @@ impl From<CliCondition> for crate::condition::Condition {
             CliCondition::IsProcMacroCrate => Self::IsProcMacroCrate {},
             CliCondition::IsStandaloneWorkspace => Self::IsStandaloneWorkspace {},
             CliCondition::IsWorkspaceWithMembers => Self::IsWorkspaceWithMembers {},
+            CliCondition::FileExists { filename } => Self::FileExists { filename },
         }
     }
 }
