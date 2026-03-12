@@ -209,6 +209,9 @@ pub enum Error {
     /// a condition result state file contained an unexpected value
     #[error("invalid condition result: {0:?}")]
     InvalidConditionResult(String),
+    /// The chosen_branch state file contains an unrecognized value.
+    #[error("invalid chosen branch value: {0:?}")]
+    InvalidChosenBranch(String),
     /// some steps failed
     #[error("some steps failed")]
     SomeStepsFailed,

@@ -7,10 +7,48 @@ use crate::error::Error;
 use crate::step_position::StepPosition;
 use clap::Parser;
 
+/// A single conditional branch in an `IfElseIf` step.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Branch {
+    /// The condition that must be true for this branch to execute.
+    pub condition: crate::condition::Condition,
+    /// The steps to execute when this branch is chosen.
+    pub steps: Vec<Step>,
+}
+
 /// represents a single step in a plan
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Parser)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Step {
+    /// a step that runs a command
+    RunCommand {
+        /// the command to execute
+        command: String,
+        /// the arguments for the command
+        args: Vec<String>,
+    },
+    /// a step that requires manual intervention
+    ManualStep {
+        /// the title of the manual step
+        title: String,
+        /// the instructions for the manual step
+        instructions: String,
+    },
+    /// A step that evaluates conditions and executes the first matching branch's steps.
+    IfElseIf {
+        /// Ordered list of conditional branches (if / elsif).
+        branches: Vec<Branch>,
+        /// Steps to execute when no branch condition matches (else). Empty means no else.
+        #[serde(default)]
+        else_steps: Vec<Self>,
+    },
+}
+
+/// A CLI-only step type that can be constructed via clap. Does not include `IfElseIf`
+/// because its `Vec<Branch>` fields are not clap-parseable.
+#[derive(Debug, Clone, Parser)]
+pub enum CliStep {
     /// a step that runs a command
     RunCommand {
         /// the command to execute
@@ -26,6 +64,21 @@ pub enum Step {
         /// the instructions for the manual step
         instructions: String,
     },
+}
+
+impl From<CliStep> for Step {
+    fn from(cli: CliStep) -> Self {
+        match cli {
+            CliStep::RunCommand { command, args } => Self::RunCommand { command, args },
+            CliStep::ManualStep {
+                title,
+                instructions,
+            } => Self::ManualStep {
+                title,
+                instructions,
+            },
+        }
+    }
 }
 
 /// represents a plan
@@ -115,7 +168,7 @@ pub struct AddStepParameters {
     pub name: String,
     /// the type of step to add
     #[clap(subcommand)]
-    pub step: Step,
+    pub step: CliStep,
 }
 
 /// Parameters for inserting a step into a plan
@@ -129,7 +182,7 @@ pub struct InsertStepParameters {
     pub position: StepPosition,
     /// the type of step to insert
     #[clap(subcommand)]
-    pub step: Step,
+    pub step: CliStep,
 }
 
 /// Parameters for removing a step from a plan
@@ -280,6 +333,20 @@ pub async fn plan_step_command(
                             "{pos}: ManualStep - Title: \"{title}\", Instructions: \"{instructions}\""
                         );
                     }
+                    Step::IfElseIf {
+                        branches,
+                        else_steps,
+                    } => {
+                        println!(
+                            "{pos}: IfElseIf - {} branch(es){}",
+                            branches.len(),
+                            if else_steps.is_empty() {
+                                ""
+                            } else {
+                                ", with else"
+                            }
+                        );
+                    }
                 }
             }
         }
@@ -288,12 +355,12 @@ pub async fn plan_step_command(
                 return Err(Error::PlanNotFound(params.name));
             }
             let mut plan = Plan::load(&params.name, &environment)?;
-            if let Step::RunCommand { command, .. } = &params.step
+            if let CliStep::RunCommand { command, .. } = &params.step
                 && !crate::utils::command_is_executable(command, &environment)
             {
                 return Err(crate::error::Error::CommandNotFound(command.to_owned()));
             }
-            plan.steps.push(params.step);
+            plan.steps.push(params.step.into());
             plan.save(&params.name, &environment)?;
         }
         PlanStepSubCommand::Insert(params) => {
@@ -310,12 +377,12 @@ pub async fn plan_step_command(
                     plan.steps.len(),
                 ));
             }
-            if let Step::RunCommand { command, .. } = &params.step
+            if let CliStep::RunCommand { command, .. } = &params.step
                 && !crate::utils::command_is_executable(command, &environment)
             {
                 return Err(crate::error::Error::CommandNotFound(command.to_owned()));
             }
-            plan.steps.insert(insert_idx, params.step);
+            plan.steps.insert(insert_idx, params.step.into());
             plan.save(&params.name, &environment)?;
         }
         PlanStepSubCommand::Remove(params) => {
@@ -341,7 +408,10 @@ pub async fn plan_step_command(
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use super::*;
+    use crate::condition::Condition;
     use tempfile::tempdir;
 
     /// All four `plan step` sub-commands must return `PlanNotFound` when the
@@ -381,7 +451,7 @@ mod tests {
             PlanStepParameters {
                 sub_command: PlanStepSubCommand::Add(AddStepParameters {
                     name: "nonexistent-plan".to_string(),
-                    step: Step::ManualStep {
+                    step: CliStep::ManualStep {
                         title: "t".to_string(),
                         instructions: "i".to_string(),
                     },
@@ -408,7 +478,7 @@ mod tests {
                     name: "nonexistent-plan".to_string(),
                     position: StepPosition::from_one_based(1)
                         .ok_or("step position 1 is always valid")?,
-                    step: Step::ManualStep {
+                    step: CliStep::ManualStep {
                         title: "t".to_string(),
                         instructions: "i".to_string(),
                     },
@@ -447,6 +517,70 @@ mod tests {
         Ok(())
     }
 
+    /// TOML round-trip for a `Branch`.
+    #[test]
+    fn test_branch_toml_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let branch = Branch {
+            condition: Condition::IsBinaryCrate {},
+            steps: vec![Step::RunCommand {
+                command: "cargo".to_string(),
+                args: vec!["build".to_string()],
+            }],
+        };
+        let serialized = toml::to_string(&branch)?;
+        let deserialized: Branch = toml::from_str(&serialized)?;
+        assert!(matches!(
+            deserialized.condition,
+            Condition::IsBinaryCrate {}
+        ));
+        assert_eq!(deserialized.steps.len(), 1);
+        Ok(())
+    }
+
+    /// TOML round-trip for a plan containing an `IfElseIf` step.
+    #[test]
+    fn test_plan_with_if_else_if_toml_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let plan = Plan {
+            steps: vec![
+                Step::RunCommand {
+                    command: "cargo".to_string(),
+                    args: vec!["check".to_string()],
+                },
+                Step::IfElseIf {
+                    branches: vec![Branch {
+                        condition: Condition::IsBinaryCrate {},
+                        steps: vec![Step::RunCommand {
+                            command: "cargo".to_string(),
+                            args: vec!["build".to_string()],
+                        }],
+                    }],
+                    else_steps: vec![Step::ManualStep {
+                        title: "Manual".to_string(),
+                        instructions: "Do it".to_string(),
+                    }],
+                },
+            ],
+        };
+        let serialized = toml::to_string(&plan)?;
+        let deserialized: Plan = toml::from_str(&serialized)?;
+        assert_eq!(deserialized.steps.len(), 2);
+        assert!(matches!(
+            deserialized.steps.first(),
+            Some(Step::RunCommand { .. })
+        ));
+        match deserialized.steps.get(1) {
+            Some(Step::IfElseIf {
+                branches,
+                else_steps,
+            }) => {
+                assert_eq!(branches.len(), 1);
+                assert_eq!(else_steps.len(), 1);
+            }
+            other => return Err(format!("expected IfElseIf at index 1, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
     /// `plan step add` on an existing plan must NOT return PlanNotFound.
     #[tokio::test]
     async fn test_plan_step_add_existing_plan_succeeds() -> Result<(), Box<dyn std::error::Error>> {
@@ -458,7 +592,7 @@ mod tests {
             PlanStepParameters {
                 sub_command: PlanStepSubCommand::Add(AddStepParameters {
                     name: "my-plan".to_string(),
-                    step: Step::ManualStep {
+                    step: CliStep::ManualStep {
                         title: "step".to_string(),
                         instructions: "do something".to_string(),
                     },

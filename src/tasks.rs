@@ -271,6 +271,7 @@ pub async fn run_single_step(
     step_number: StepPosition,
     target_number: usize,
     environment: &Environment,
+    config: &Config,
 ) -> Result<(), Error> {
     let state_dir = environment
         .state_dir
@@ -412,6 +413,38 @@ pub async fn run_single_step(
                 return Err(Error::ManualStepNotConfirmed);
             }
         }
+        Step::IfElseIf {
+            branches,
+            else_steps,
+        } => {
+            // state_dir already created above; evaluate each branch condition
+            let chosen_branch_path = state_dir.join("chosen_branch");
+
+            let mut chosen: Option<String> = None;
+            for (i, branch) in branches.iter().enumerate() {
+                let branch_num = i.saturating_add(1);
+                let result = branch
+                    .condition
+                    .evaluate(manifest_dir, environment, config)?;
+                crate::condition::Condition::save_result(
+                    result,
+                    &state_dir.join(format!("branch_{branch_num}_condition_result")),
+                )?;
+                if result && chosen.is_none() {
+                    chosen = Some(format!("{branch_num}"));
+                }
+            }
+
+            let chosen_str = chosen.unwrap_or_else(|| {
+                if else_steps.is_empty() {
+                    "none".to_string()
+                } else {
+                    "else".to_string()
+                }
+            });
+            fs_err::write(&chosen_branch_path, &chosen_str)
+                .map_err(|e| Error::CouldNotWriteStateFile(chosen_branch_path, e))?;
+        }
     }
     Ok(())
 }
@@ -493,6 +526,39 @@ fn get_step_status(
                 StepStatus::NotRun
             }
         }
+        Step::IfElseIf {
+            branches,
+            else_steps,
+        } => {
+            let chosen_branch_path = state_dir.join("chosen_branch");
+            let Ok(chosen) = fs_err::read_to_string(&chosen_branch_path) else {
+                return StepStatus::NotRun;
+            };
+            let nested_steps: &[Step] = match chosen.trim() {
+                "none" => &[],
+                "else" => else_steps,
+                n => {
+                    let parsed = n
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|&i| i >= 1 && i <= branches.len());
+                    match parsed.and_then(|i| i.checked_sub(1).and_then(|idx| branches.get(idx))) {
+                        Some(b) => &b.steps,
+                        None => return StepStatus::Failed,
+                    }
+                }
+            };
+            let all_done = nested_steps.iter().enumerate().all(|(i, s)| {
+                step_number.child_from_index(i).is_some_and(|pos| {
+                    is_step_completed(task_name, target_number, pos, s, environment)
+                })
+            });
+            if all_done {
+                StepStatus::Completed
+            } else {
+                StepStatus::NotRun
+            }
+        }
     }
 }
 
@@ -546,6 +612,74 @@ fn are_target_dependencies_completed(
     })
 }
 
+/// Finds the next incomplete step within a slice of steps, supporting nested `IfElseIf` steps.
+///
+/// `make_pos` maps a 0-based index into the slice to a `StepPosition`.
+/// Returns the position and reference of the first incomplete step, or `None` if all are done.
+fn find_next_in_steps<'a>(
+    steps: &'a [Step],
+    make_pos: &dyn Fn(usize) -> Option<StepPosition>,
+    task_name: &str,
+    target_idx: usize,
+    environment: &Environment,
+) -> Option<(StepPosition, &'a Step)> {
+    for (i, step) in steps.iter().enumerate() {
+        let Some(pos) = make_pos(i) else { continue };
+        match step {
+            Step::RunCommand { .. } | Step::ManualStep { .. } => {
+                if !is_step_completed(task_name, target_idx, pos.clone(), step, environment) {
+                    return Some((pos, step));
+                }
+            }
+            Step::IfElseIf {
+                branches,
+                else_steps,
+            } => {
+                let state_dir = environment
+                    .state_dir
+                    .join("cargo-for-each")
+                    .join("tasks")
+                    .join(task_name)
+                    .join(target_idx.to_string())
+                    .join(pos.to_string());
+                let chosen_branch_path = state_dir.join("chosen_branch");
+                let Ok(chosen) = fs_err::read_to_string(&chosen_branch_path) else {
+                    // Not yet evaluated — return this IfElseIf step for condition evaluation.
+                    return Some((pos, step));
+                };
+                let nested_steps: &[Step] = match chosen.trim() {
+                    "none" => continue, // trivially done, no nested steps
+                    "else" => else_steps,
+                    n => {
+                        let parsed = n
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|&idx| idx >= 1 && idx <= branches.len());
+                        match parsed
+                            .and_then(|idx| idx.checked_sub(1).and_then(|i| branches.get(i)))
+                        {
+                            Some(b) => &b.steps,
+                            None => continue, // invalid value, treat as done
+                        }
+                    }
+                };
+                let parent_pos = pos.clone();
+                if let Some(result) = find_next_in_steps(
+                    nested_steps,
+                    &|nested_i| parent_pos.child_from_index(nested_i),
+                    task_name,
+                    target_idx,
+                    environment,
+                ) {
+                    return Some(result);
+                }
+                // All nested steps done; continue to the next top-level step.
+            }
+        }
+    }
+    None
+}
+
 #[must_use]
 /// Determines the first step that has not already been completed successfully
 /// in the first target that has such a step and whose dependencies are all completed.
@@ -565,27 +699,22 @@ pub fn find_next_step<'a>(
         .collect();
 
     for (target_idx, target) in resolved_target_set.targets.iter().enumerate() {
-        if are_target_dependencies_completed(task_name, target, plan, &target_map, environment) {
-            for (step_idx, step) in plan.steps.iter().enumerate() {
-                let Some(step_number) = StepPosition::from_step_index(step_idx) else {
-                    continue;
-                };
-                if !is_step_completed(
-                    task_name,
-                    target_idx,
-                    step_number.clone(),
-                    step,
-                    environment,
-                ) {
-                    return Some(NextStep {
-                        step,
-                        manifest_dir: &target.manifest_dir,
-                        task_name,
-                        step_number,
-                        target_number: target_idx,
-                    });
-                }
-            }
+        if are_target_dependencies_completed(task_name, target, plan, &target_map, environment)
+            && let Some((step_number, step)) = find_next_in_steps(
+                &plan.steps,
+                &StepPosition::from_step_index,
+                task_name,
+                target_idx,
+                environment,
+            )
+        {
+            return Some(NextStep {
+                step,
+                manifest_dir: &target.manifest_dir,
+                task_name,
+                step_number,
+                target_number: target_idx,
+            });
         }
     }
     None
@@ -614,6 +743,8 @@ pub async fn run_single_step_command(
     let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
         .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
 
+    let config = Config::load(&environment)?;
+
     if let Some(next_step) = find_next_step(&params.name, &plan, &resolved_target_set, &environment)
     {
         println!(
@@ -628,6 +759,7 @@ pub async fn run_single_step_command(
             next_step.step_number,
             next_step.target_number,
             &environment,
+            &config,
         )
         .await
     } else {
@@ -658,6 +790,8 @@ pub async fn run_single_target_command(
         .map_err(|e| Error::CouldNotReadResolvedTargetSet(resolved_target_set_path.clone(), e))?;
     let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
         .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
+
+    let config = Config::load(&environment)?;
 
     let target_map: HashMap<PathBuf, usize> = resolved_target_set
         .targets
@@ -712,6 +846,7 @@ pub async fn run_single_target_command(
                 step_number,
                 target_idx,
                 &environment,
+                &config,
             )
             .await?;
         }
@@ -742,6 +877,7 @@ pub async fn run_all_targets_command(
     let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
         .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
 
+    let config = Arc::new(Config::load(&environment)?);
     let jobs = params.jobs.unwrap_or(1);
     let plan = Arc::new(plan);
     let resolved_target_set = Arc::new(resolved_target_set);
@@ -785,6 +921,7 @@ pub async fn run_all_targets_command(
             .map(|(target_idx, target)| {
                 let plan = Arc::clone(&plan);
                 let params = params.clone();
+                let config = Arc::clone(&config);
                 {
                     let environment = environment.clone();
                     async move {
@@ -805,6 +942,7 @@ pub async fn run_all_targets_command(
                                 step_number,
                                 target_idx,
                                 &environment,
+                                &config,
                             )
                             .await
                             {
@@ -1194,8 +1332,9 @@ mod tests {
 
     use super::{StepStatus, find_next_step, get_step_status, run_single_step};
     use crate::Environment;
+    use crate::condition::Condition;
     use crate::error::Error;
-    use crate::plans::{Plan, Step};
+    use crate::plans::{Branch, Plan, Step};
     use crate::step_position::StepPosition;
     use crate::target_sets::ResolvedTargetSet;
     use crate::targets::Target;
@@ -1566,6 +1705,7 @@ mod tests {
             command: "true".to_string(),
             args: vec![],
         };
+        let config = crate::Config::default();
         run_single_step(
             &step,
             manifest_dir,
@@ -1573,6 +1713,7 @@ mod tests {
             StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
             0,
             &env,
+            &config,
         )
         .await?;
 
@@ -1605,6 +1746,7 @@ mod tests {
             command: "false".to_string(),
             args: vec![],
         };
+        let config = crate::Config::default();
         let result = run_single_step(
             &step,
             manifest_dir,
@@ -1612,6 +1754,7 @@ mod tests {
             StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
             0,
             &env,
+            &config,
         )
         .await;
 
@@ -1632,6 +1775,407 @@ mod tests {
         let content = fs_err::read_to_string(&exit_status_path)?;
         let exit_code: i32 = content.trim().parse()?;
         assert!(exit_code != 0, "exit_status must contain a non-zero code");
+        Ok(())
+    }
+
+    // ── get_step_status: IfElseIf ─────────────────────────────────────────────
+
+    /// No state directory → NotRun.
+    #[test]
+    fn test_get_step_status_if_else_if_not_run_no_dir() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let step = Step::IfElseIf {
+            branches: vec![Branch {
+                condition: Condition::IsBinaryCrate {},
+                steps: vec![Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec![],
+                }],
+            }],
+            else_steps: vec![],
+        };
+        assert_eq!(
+            get_step_status(
+                "task",
+                0,
+                StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
+                &step,
+                &env
+            ),
+            StepStatus::NotRun
+        );
+        Ok(())
+    }
+
+    /// chosen_branch absent → NotRun.
+    #[test]
+    fn test_get_step_status_if_else_if_not_run_no_chosen_branch() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        make_state_dir(&env, "task", 0, &step_pos)?; // dir exists, no chosen_branch file
+        let step = Step::IfElseIf {
+            branches: vec![Branch {
+                condition: Condition::IsBinaryCrate {},
+                steps: vec![Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec![],
+                }],
+            }],
+            else_steps: vec![],
+        };
+        assert_eq!(
+            get_step_status("task", 0, step_pos, &step, &env),
+            StepStatus::NotRun
+        );
+        Ok(())
+    }
+
+    /// chosen_branch="none" with no nested steps → Completed.
+    #[test]
+    fn test_get_step_status_if_else_if_none_is_completed() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
+        fs_err::write(dir.join("chosen_branch"), "none")?;
+        let step = Step::IfElseIf {
+            branches: vec![Branch {
+                condition: Condition::IsBinaryCrate {},
+                steps: vec![Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec![],
+                }],
+            }],
+            else_steps: vec![],
+        };
+        assert_eq!(
+            get_step_status("task", 0, step_pos, &step, &env),
+            StepStatus::Completed
+        );
+        Ok(())
+    }
+
+    /// chosen_branch="1", nested step not done → NotRun.
+    #[test]
+    fn test_get_step_status_if_else_if_branch_chosen_nested_not_done() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
+        fs_err::write(dir.join("chosen_branch"), "1")?;
+        // Nested step state dir not created → NotRun for nested step
+        let step = Step::IfElseIf {
+            branches: vec![Branch {
+                condition: Condition::IsBinaryCrate {},
+                steps: vec![Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec![],
+                }],
+            }],
+            else_steps: vec![],
+        };
+        assert_eq!(
+            get_step_status("task", 0, step_pos, &step, &env),
+            StepStatus::NotRun
+        );
+        Ok(())
+    }
+
+    /// chosen_branch="1", nested step done → Completed.
+    #[test]
+    fn test_get_step_status_if_else_if_branch_chosen_nested_done() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
+        fs_err::write(dir.join("chosen_branch"), "1")?;
+        // Create nested step state dir (step 1.1) with completed exit_status
+        let nested_pos = step_pos
+            .child_from_index(0)
+            .ok_or("child index 0 is always valid")?;
+        let nested_dir = make_state_dir(&env, "task", 0, &nested_pos)?;
+        fs_err::write(nested_dir.join("exit_status"), "0")?;
+        let step = Step::IfElseIf {
+            branches: vec![Branch {
+                condition: Condition::IsBinaryCrate {},
+                steps: vec![Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec![],
+                }],
+            }],
+            else_steps: vec![],
+        };
+        assert_eq!(
+            get_step_status("task", 0, step_pos, &step, &env),
+            StepStatus::Completed
+        );
+        Ok(())
+    }
+
+    // ── run_single_step: IfElseIf ─────────────────────────────────────────────
+
+    /// IfElseIf with a matching branch writes chosen_branch and condition result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_single_step_if_else_if_writes_chosen_branch() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let manifest_dir = temp.path();
+        // Config with a bin crate at manifest_dir so IsBinaryCrate evaluates to true.
+        let config = crate::Config {
+            crates: vec![crate::Crate {
+                manifest_dir: manifest_dir.to_path_buf(),
+                workspace_manifest_dir: manifest_dir.to_path_buf(),
+                types: [crate::targets::CrateType::Bin].into(),
+            }],
+            workspaces: vec![],
+        };
+        let step = Step::IfElseIf {
+            branches: vec![Branch {
+                condition: Condition::IsBinaryCrate {},
+                steps: vec![Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec![],
+                }],
+            }],
+            else_steps: vec![Step::ManualStep {
+                title: "else".to_string(),
+                instructions: "else".to_string(),
+            }],
+        };
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        run_single_step(
+            &step,
+            manifest_dir,
+            "task",
+            step_pos.clone(),
+            0,
+            &env,
+            &config,
+        )
+        .await?;
+
+        let state_dir = env
+            .state_dir
+            .join("cargo-for-each")
+            .join("tasks")
+            .join("task")
+            .join("0")
+            .join("1");
+        let chosen = fs_err::read_to_string(state_dir.join("chosen_branch"))?;
+        assert_eq!(
+            chosen.trim(),
+            "1",
+            "branch 1 condition was true, should be chosen"
+        );
+        let result1 = fs_err::read_to_string(state_dir.join("branch_1_condition_result"))?;
+        assert_eq!(result1.trim(), "true");
+        Ok(())
+    }
+
+    /// IfElseIf with no matching branch and an else falls back to "else".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_single_step_if_else_if_falls_back_to_else() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let manifest_dir = temp.path();
+        // Empty config → IsBinaryCrate evaluates to false.
+        let config = crate::Config::default();
+        let step = Step::IfElseIf {
+            branches: vec![Branch {
+                condition: Condition::IsBinaryCrate {},
+                steps: vec![Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec![],
+                }],
+            }],
+            else_steps: vec![Step::ManualStep {
+                title: "else".to_string(),
+                instructions: "else".to_string(),
+            }],
+        };
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        run_single_step(&step, manifest_dir, "task", step_pos, 0, &env, &config).await?;
+
+        let state_dir = env
+            .state_dir
+            .join("cargo-for-each")
+            .join("tasks")
+            .join("task")
+            .join("0")
+            .join("1");
+        let chosen = fs_err::read_to_string(state_dir.join("chosen_branch"))?;
+        assert_eq!(chosen.trim(), "else");
+        let result1 = fs_err::read_to_string(state_dir.join("branch_1_condition_result"))?;
+        assert_eq!(result1.trim(), "false");
+        Ok(())
+    }
+
+    /// IfElseIf with no match and no else writes "none".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_single_step_if_else_if_no_match_no_else_writes_none() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let manifest_dir = temp.path();
+        let config = crate::Config::default(); // IsBinaryCrate → false
+        let step = Step::IfElseIf {
+            branches: vec![Branch {
+                condition: Condition::IsBinaryCrate {},
+                steps: vec![Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec![],
+                }],
+            }],
+            else_steps: vec![],
+        };
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        run_single_step(&step, manifest_dir, "task", step_pos, 0, &env, &config).await?;
+
+        let state_dir = env
+            .state_dir
+            .join("cargo-for-each")
+            .join("tasks")
+            .join("task")
+            .join("0")
+            .join("1");
+        let chosen = fs_err::read_to_string(state_dir.join("chosen_branch"))?;
+        assert_eq!(chosen.trim(), "none");
+        Ok(())
+    }
+
+    // ── find_next_step: IfElseIf ──────────────────────────────────────────────
+
+    /// No chosen_branch → find_next_step returns the IfElseIf step itself.
+    #[test]
+    fn test_find_next_step_if_else_if_returns_step_for_evaluation() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let if_step = Step::IfElseIf {
+            branches: vec![Branch {
+                condition: Condition::IsBinaryCrate {},
+                steps: vec![Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec![],
+                }],
+            }],
+            else_steps: vec![],
+        };
+        let plan = Plan {
+            steps: vec![if_step],
+        };
+        let resolved = ResolvedTargetSet {
+            targets: vec![Target {
+                manifest_dir: PathBuf::from("/tmp"),
+                dependencies: vec![],
+            }],
+        };
+        let next = find_next_step("task", &plan, &resolved, &env);
+        assert!(
+            next.is_some(),
+            "should return the IfElseIf step for evaluation"
+        );
+        let next = next.ok_or("expected Some")?;
+        assert_eq!(
+            next.step_number,
+            StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?
+        );
+        assert!(matches!(next.step, Step::IfElseIf { .. }));
+        Ok(())
+    }
+
+    /// chosen_branch="1", nested step not done → returns nested step at "1.1".
+    #[test]
+    fn test_find_next_step_if_else_if_returns_nested_step() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        // Write chosen_branch for step 1
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
+        fs_err::write(dir.join("chosen_branch"), "1")?;
+        // Nested step 1.1 not yet run (no state dir)
+
+        let if_step = Step::IfElseIf {
+            branches: vec![Branch {
+                condition: Condition::IsBinaryCrate {},
+                steps: vec![Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec![],
+                }],
+            }],
+            else_steps: vec![],
+        };
+        let plan = Plan {
+            steps: vec![if_step],
+        };
+        let resolved = ResolvedTargetSet {
+            targets: vec![Target {
+                manifest_dir: PathBuf::from("/tmp"),
+                dependencies: vec![],
+            }],
+        };
+        let next = find_next_step("task", &plan, &resolved, &env);
+        assert!(next.is_some(), "should return the nested step");
+        let next = next.ok_or("expected Some")?;
+        assert_eq!(
+            next.step_number,
+            step_pos
+                .child_from_index(0)
+                .ok_or("child index 0 is always valid")?
+        );
+        assert!(matches!(next.step, Step::RunCommand { .. }));
+        Ok(())
+    }
+
+    /// chosen_branch="1", nested step done → moves to step after IfElseIf.
+    #[test]
+    fn test_find_next_step_if_else_if_advances_after_completion() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
+        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
+        fs_err::write(dir.join("chosen_branch"), "1")?;
+        // Mark nested step 1.1 as completed
+        let nested_pos = step_pos
+            .child_from_index(0)
+            .ok_or("child index 0 is always valid")?;
+        let nested_dir = make_state_dir(&env, "task", 0, &nested_pos)?;
+        fs_err::write(nested_dir.join("exit_status"), "0")?;
+
+        let if_step = Step::IfElseIf {
+            branches: vec![Branch {
+                condition: Condition::IsBinaryCrate {},
+                steps: vec![Step::RunCommand {
+                    command: "echo".to_string(),
+                    args: vec![],
+                }],
+            }],
+            else_steps: vec![],
+        };
+        let next_cmd = Step::RunCommand {
+            command: "echo".to_string(),
+            args: vec!["after".to_string()],
+        };
+        let plan = Plan {
+            steps: vec![if_step, next_cmd],
+        };
+        let resolved = ResolvedTargetSet {
+            targets: vec![Target {
+                manifest_dir: PathBuf::from("/tmp"),
+                dependencies: vec![],
+            }],
+        };
+        let next = find_next_step("task", &plan, &resolved, &env);
+        assert!(next.is_some(), "should advance to the step after IfElseIf");
+        let next = next.ok_or("expected Some")?;
+        assert_eq!(
+            next.step_number,
+            StepPosition::from_one_based(2).ok_or("step position 2 is always valid")?
+        );
+        assert!(matches!(next.step, Step::RunCommand { .. }));
         Ok(())
     }
 }

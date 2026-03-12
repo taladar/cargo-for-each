@@ -304,8 +304,8 @@ mod tests {
     use super::*;
     use crate::{
         plans::{
-            AddStepParameters, CreatePlanParameters, Plan, PlanParameters, PlanStepParameters,
-            PlanStepSubCommand, PlanSubCommand, Step,
+            AddStepParameters, CliStep, CreatePlanParameters, Plan, PlanParameters,
+            PlanStepParameters, PlanStepSubCommand, PlanSubCommand, Step,
         },
         target_sets::{
             CreateTargetSetParameters, TargetSet, TargetSetParameters, TargetSetSubCommand,
@@ -479,7 +479,7 @@ mod tests {
                 sub_command: PlanSubCommand::Step(PlanStepParameters {
                     sub_command: PlanStepSubCommand::Add(AddStepParameters {
                         name: "test-plan".to_string(),
-                        step: Step::RunCommand {
+                        step: CliStep::RunCommand {
                             command: "cargo".to_string(),
                             args: vec!["build".to_string()],
                         },
@@ -721,7 +721,7 @@ mod tests {
                 sub_command: PlanSubCommand::Step(PlanStepParameters {
                     sub_command: PlanStepSubCommand::Add(AddStepParameters {
                         name: "test-plan".to_string(),
-                        step: Step::RunCommand {
+                        step: CliStep::RunCommand {
                             command: "cargo".to_string(),
                             args: vec!["build".to_string()],
                         },

@@ -92,6 +92,20 @@ impl StepPosition {
     pub const fn is_top_level(&self) -> bool {
         self.0.len() == 1
     }
+
+    /// Returns a child `StepPosition` by appending a 1-based index for `zero_based_idx`.
+    /// Returns `None` only if `zero_based_idx == usize::MAX` (impossible in practice).
+    #[must_use]
+    pub fn child_from_index(&self, zero_based_idx: usize) -> Option<Self> {
+        zero_based_idx
+            .checked_add(1)
+            .and_then(std::num::NonZeroUsize::new)
+            .map(|nz| {
+                let mut components = self.0.clone();
+                components.push(nz);
+                Self(components)
+            })
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +221,38 @@ mod tests {
             let pos: StepPosition = s.parse()?;
             assert_eq!(pos.to_string(), s);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_child_from_index_depth_1() -> TestResult {
+        let parent = StepPosition::from_one_based(3).ok_or("position 3 is always valid")?;
+        let child = parent
+            .child_from_index(0)
+            .ok_or("index 0 is always valid")?;
+        assert_eq!(child.to_string(), "3.1");
+        assert_eq!(child.depth(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_child_from_index_depth_2() -> TestResult {
+        let parent: StepPosition = "3.1".parse()?;
+        let child = parent
+            .child_from_index(1)
+            .ok_or("index 1 is always valid")?;
+        assert_eq!(child.to_string(), "3.1.2");
+        assert_eq!(child.depth(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_child_from_index_second_child() -> TestResult {
+        let parent = StepPosition::from_one_based(2).ok_or("position 2 is always valid")?;
+        let child = parent
+            .child_from_index(2)
+            .ok_or("index 2 is always valid")?;
+        assert_eq!(child.to_string(), "2.3");
         Ok(())
     }
 }
