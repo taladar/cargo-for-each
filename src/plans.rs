@@ -98,6 +98,8 @@ pub enum CliCondition {
         /// The file name to check for.
         filename: String,
     },
+    /// True if the working directory has no uncommitted changes.
+    WorkingDirectoryClean,
 }
 
 impl From<CliCondition> for crate::condition::Condition {
@@ -111,6 +113,7 @@ impl From<CliCondition> for crate::condition::Condition {
             CliCondition::IsStandaloneWorkspace => Self::IsStandaloneWorkspace {},
             CliCondition::IsWorkspaceWithMembers => Self::IsWorkspaceWithMembers {},
             CliCondition::FileExists { filename } => Self::FileExists { filename },
+            CliCondition::WorkingDirectoryClean => Self::WorkingDirectoryClean {},
         }
     }
 }

@@ -55,6 +55,10 @@ pub enum Condition {
         filename: String,
     },
 
+    // ── VCS conditions ────────────────────────────────────────────────────────
+    /// True if the working directory has no uncommitted changes (git status is clean).
+    WorkingDirectoryClean {},
+
     // ── Logical combinators ───────────────────────────────────────────────────
     /// True if the inner condition evaluates to false.
     Not {
@@ -130,6 +134,16 @@ impl Condition {
                 .iter()
                 .any(|w| w.manifest_dir == manifest_dir && !w.is_standalone)),
             Self::FileExists { filename } => Ok(manifest_dir.join(filename).exists()),
+            Self::WorkingDirectoryClean {} => {
+                if !crate::utils::command_is_executable("git", environment) {
+                    return Err(Error::CommandNotFound("git".to_owned()));
+                }
+                let mut cmd = std::process::Command::new("git");
+                cmd.args(["status", "--porcelain"])
+                    .current_dir(manifest_dir);
+                let output = crate::utils::execute_command(&mut cmd, environment, manifest_dir)?;
+                Ok(output.stdout.is_empty())
+            }
             Self::Not { condition } => {
                 Ok(!condition.evaluate(manifest_dir, environment, config)?)
             }
@@ -589,6 +603,75 @@ mod tests {
         assert!(
             matches!(deserialized, Condition::FileExists { filename } if filename == "foo.txt")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn working_directory_clean_true() -> TestResult {
+        let temp_dir = tempfile::tempdir()?;
+        let env = mock_environment(&temp_dir)?;
+        let dir = temp_dir.path();
+        // Initialize a git repo with an empty commit so git status works.
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()?;
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(dir)
+            .output()?;
+        let config = empty_config();
+        let result = Condition::WorkingDirectoryClean {}.evaluate(dir, &env, &config)?;
+        assert_eq!(result, true);
+        Ok(())
+    }
+
+    #[test]
+    fn working_directory_clean_false() -> TestResult {
+        let temp_dir = tempfile::tempdir()?;
+        let env = mock_environment(&temp_dir)?;
+        let dir = temp_dir.path();
+        // Initialize a git repo with an empty commit.
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()?;
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(dir)
+            .output()?;
+        // Create an untracked file to make the working directory dirty.
+        fs_err::write(dir.join("untracked.txt"), "dirty")?;
+        let config = empty_config();
+        let result = Condition::WorkingDirectoryClean {}.evaluate(dir, &env, &config)?;
+        assert_eq!(result, false);
+        Ok(())
+    }
+
+    #[test]
+    fn working_directory_clean_toml_roundtrip() -> TestResult {
+        let condition = Condition::WorkingDirectoryClean {};
+        let serialized = toml::to_string(&condition)?;
+        let deserialized: Condition = toml::from_str(&serialized)?;
+        assert!(matches!(deserialized, Condition::WorkingDirectoryClean {}));
         Ok(())
     }
 }
