@@ -48,73 +48,21 @@ pub enum Error {
     /// error reading config file
     #[error("error reading config file: {0}")]
     CouldNotReadConfigFile(#[source] std::io::Error),
-    /// could not check target set existence
-    #[error("could not check target set existence for {0}: {1}")]
-    CouldNotCheckTargetSetExistence(std::path::PathBuf, #[source] std::io::Error),
     /// error parsing config file
     #[error("error parsing config file: {0}")]
     CouldNotParseConfigFile(#[source] toml::de::Error),
     /// error serializing config file
     #[error("error serializing config file: {0}")]
     CouldNotSerializeConfigFile(#[source] toml::ser::Error),
-    /// error serializing target set file
-    #[error("error serializing target set file: {0}")]
-    CouldNotSerializeTargetSetFile(#[source] toml::ser::Error),
     /// could not create parent directories for config file
     #[error("could not create parent directories for config file: {0}")]
     CouldNotCreateConfigFileParentDirs(#[source] std::io::Error),
-    /// could not create parent directories for target set file
-    #[error("could not create parent directories for target set file: {0}")]
-    CouldNotCreateTargetSetFileParentDirs(#[source] std::io::Error),
     /// error writing config file
     #[error("error writing config file: {0}")]
     CouldNotWriteConfigFile(#[source] std::io::Error),
-    /// error writing target set file
-    #[error("error writing target set file: {0}")]
-    CouldNotWriteTargetSetFile(#[source] std::io::Error),
-    /// error removing target set file
-    #[error("error removing target set file: {0}")]
-    CouldNotRemoveTargetSetFile(#[source] std::io::Error),
-    /// error reading target sets dir
-    #[error("error reading target sets dir: {0}")]
-    CouldNotReadTargetSetsDir(#[source] std::io::Error),
-    /// error serializing plan file
-    #[error("error serializing plan file: {0}")]
-    CouldNotSerializePlanFile(#[source] toml::ser::Error),
-    /// could not create parent directories for plan file
-    #[error("could not create parent directories for plan file: {0}")]
-    CouldNotCreatePlanFileParentDirs(#[source] std::io::Error),
-    /// error writing plan file
-    #[error("error writing plan file: {0}")]
-    CouldNotWritePlanFile(#[source] std::io::Error),
-    /// error removing plan file
-    #[error("error removing plan file: {0}")]
-    CouldNotRemovePlanFile(#[source] std::io::Error),
-    /// error reading plan file
-    #[error("error reading plan file: {0}")]
-    CouldNotReadPlanFile(#[source] std::io::Error),
-    /// error parsing plan file
-    #[error("error parsing plan file: {0}")]
-    CouldNotParsePlanFile(#[source] toml::de::Error),
-    /// plan step is out of bounds
-    #[error("plan step {0} is out of bounds for plan with {1} steps (valid range is 1 to {1})")]
-    PlanStepOutOfBounds(crate::step_position::StepPosition, usize),
-    /// error parsing a step position string
-    #[error("error parsing step position: {0}")]
-    StepPositionParseError(
-        #[source]
-        #[from]
-        crate::step_position::StepPositionParseError,
-    ),
     /// the specified task was not found
     #[error("the specified task {0} was not found")]
     TaskNotFound(String),
-    /// the specified plan was not found
-    #[error("the specified plan {0} was not found")]
-    PlanNotFound(String),
-    /// the specified target set was not found
-    #[error("the specified target set {0} was not found")]
-    TargetSetNotFound(String),
     /// could not create task directory
     #[error("could not create task directory {0}: {1}")]
     CouldNotCreateTaskDir(std::path::PathBuf, #[source] std::io::Error),
@@ -134,21 +82,6 @@ pub enum Error {
     /// could not read tasks directory
     #[error("could not read tasks directory {0}: {1}")]
     CouldNotReadTasksDir(std::path::PathBuf, #[source] std::io::Error),
-    /// could not read resolved target set file
-    #[error("could not read resolved target set file {0}: {1}")]
-    CouldNotReadResolvedTargetSet(std::path::PathBuf, #[source] std::io::Error),
-    /// could not parse resolved target set file
-    #[error("could not parse resolved target set file {0}: {1}")]
-    CouldNotParseResolvedTargetSet(std::path::PathBuf, #[source] toml::de::Error),
-    /// error serializing resolved target set file
-    #[error("error serializing resolved target set file: {0}")]
-    CouldNotSerializeResolvedTargetSet(#[source] toml::ser::Error),
-    /// could not create parent directories for resolved target set file
-    #[error("could not create parent directories for resolved target set file: {0}")]
-    CouldNotCreateResolvedTargetSetParentDirs(#[source] std::io::Error),
-    /// error writing resolved target set file
-    #[error("error writing resolved target set file: {0}")]
-    CouldNotWriteResolvedTargetSet(#[source] std::io::Error),
     /// error running cargo-metadata
     #[error("error running cargo-metadata for {0}: {1}")]
     CargoMetadataError(std::path::PathBuf, #[source] cargo_metadata::Error),
@@ -161,7 +94,7 @@ pub enum Error {
     /// the given manifest path has no parent directory
     #[error("the given manifest path {0} has no parent directory")]
     ManifestPathHasNoParentDir(std::path::PathBuf),
-    /// the target set/plan/task of the given name already exists
+    /// the task of the given name already exists
     #[error("{0} already exists")]
     AlreadyExists(String),
     /// we called cargo metadata on a directory with a Cargo.toml
@@ -218,22 +151,25 @@ pub enum Error {
     /// circular dependency or deadlock detected
     #[error("circular dependency or deadlock detected")]
     CircularDependency,
-    /// the step at the given position is not an IfElseIf step
-    #[error("step at position {0} is not an if-else-if step")]
-    StepIsNotIfElseIf(crate::step_position::StepPosition),
-    /// a branch index is out of bounds for the IfElseIf step at the given position
-    #[error(
-        "branch {1} is out of bounds for the if-else-if step at position {0} which has {2} branch(es)"
-    )]
-    IfElseIfBranchOutOfBounds(
-        crate::step_position::StepPosition,
-        std::num::NonZeroUsize,
-        usize,
-    ),
-    /// the IfElseIf step already has an else block
-    #[error("if-else-if step at position {0} already has an else block")]
-    IfElseIfAlreadyHasElse(crate::step_position::StepPosition),
-    /// the IfElseIf step has no else block to remove
-    #[error("if-else-if step at position {0} has no else block")]
-    IfElseIfHasNoElse(crate::step_position::StepPosition),
+    /// the specified program file was not found
+    #[error("program file not found: {0}")]
+    ProgramNotFound(std::path::PathBuf),
+    /// error reading program file
+    #[error("error reading program file: {0}")]
+    CouldNotReadProgramFile(#[source] std::io::Error),
+    /// one or more parse errors in the program file
+    #[error("program parse errors:\n{0}")]
+    ProgramParseErrors(String),
+    /// error serializing resolved program snapshot
+    #[error("error serializing resolved program snapshot: {0}")]
+    CouldNotSerializeResolvedProgram(#[source] toml::ser::Error),
+    /// error writing resolved program snapshot file
+    #[error("error writing resolved program snapshot file: {0}")]
+    CouldNotWriteResolvedProgram(#[source] std::io::Error),
+    /// error reading resolved program snapshot file
+    #[error("error reading resolved program snapshot file {0}: {1}")]
+    CouldNotReadResolvedProgram(std::path::PathBuf, #[source] std::io::Error),
+    /// error parsing resolved program snapshot file
+    #[error("error parsing resolved program snapshot file {0}: {1}")]
+    CouldNotParseResolvedProgram(std::path::PathBuf, #[source] toml::de::Error),
 }

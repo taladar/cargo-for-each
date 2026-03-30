@@ -1,18 +1,14 @@
 //! `cargo-for-each` is a tool to run commands on multiple cargo projects.
 //!
-//! This library provides the core logic for managing workspaces, crates,
-//! target sets, plans, and tasks for the `cargo-for-each` CLI.
+//! This library provides the core logic for managing workspaces, crates, and
+//! tasks for the `cargo-for-each` CLI.  Programs are expressed as `.cfe`
+//! (cargo-for-each) text files and executed against registered target
+//! workspaces and crates.
 
-/// Defines the Condition type for evaluating boolean conditions in plan control flow.
-pub mod condition;
 /// Handles application-specific errors.
 pub mod error;
-/// Implements functionality for managing plans and their steps.
-pub mod plans;
-/// Defines the StepPosition type for addressing plan steps.
-pub mod step_position;
-/// Implements functionality for managing target sets.
-pub mod target_sets;
+/// Implements the `.cfe` program language: AST, parser, evaluation, and resolution.
+pub mod program;
 /// Defines target-related structures and resolution logic.
 pub mod targets;
 /// Implements functionality for managing tasks.
@@ -30,10 +26,6 @@ use serde::{Deserialize, Serialize};
 pub enum Command {
     /// Manage workspaces and crates (add, remove, list, refresh).
     Target(crate::targets::TargetParameters),
-    /// create a new target set
-    TargetSet(crate::target_sets::TargetSetParameters),
-    /// manage plans
-    Plan(crate::plans::PlanParameters),
     /// manage tasks
     Task(crate::tasks::TaskParameters),
 
@@ -149,12 +141,6 @@ pub async fn run_app(
     match options.command {
         Command::Target(target_parameters) => {
             crate::targets::target_command(target_parameters, environment).await?;
-        }
-        Command::TargetSet(target_set_parameters) => {
-            crate::target_sets::target_set_command(target_set_parameters, environment).await?;
-        }
-        Command::Plan(plan_parameters) => {
-            crate::plans::plan_command(plan_parameters, environment).await?;
         }
         Command::Task(task_parameters) => {
             crate::tasks::task_command(task_parameters, environment).await?;
@@ -303,16 +289,9 @@ pub fn config_file(environment: &Environment) -> Result<PathBuf, crate::error::E
 mod tests {
     use super::*;
     use crate::{
-        plans::{
-            AddStepParameters, CliStep, CreatePlanParameters, Plan, PlanParameters,
-            PlanStepParameters, PlanStepSubCommand, PlanSubCommand, Step,
-        },
-        target_sets::{
-            CreateTargetSetParameters, TargetSet, TargetSetParameters, TargetSetSubCommand,
-        },
         targets::{
-            AddParameters, CrateFilterParameters, ListParameters, TargetFilter, TargetParameters,
-            TargetSubCommand, WorkspaceFilterParameters,
+            AddParameters, ListParameters, TargetFilter, TargetParameters, TargetSubCommand,
+            WorkspaceFilterParameters,
         },
         tasks::{
             CreateTaskParameters, RunAllTargetsParameters, TaskParameters, TaskRunParameters,
@@ -432,78 +411,21 @@ mod tests {
             result.err()
         );
 
-        tracing::debug!("Creating target set test-target-set");
+        tracing::debug!("Writing test.cfe program file");
 
-        let options = Options {
-            command: Command::TargetSet(TargetSetParameters {
-                sub_command: TargetSetSubCommand::Create(CreateTargetSetParameters {
-                    name: "test-target-set".to_string(),
-                    target_set: TargetSet::Crates(CrateFilterParameters {
-                        r#type: None,
-                        standalone: None,
-                    }),
-                }),
-            }),
-        };
+        let cfe_path = temp_path.join("test.cfe");
+        fs_err::write(
+            &cfe_path,
+            "select crates;\nfor crate {\n    run \"cargo\" \"build\";\n}\n",
+        )?;
 
-        // Call run_app and assert it completes successfully
-        let result = run_app(options, environment.clone()).await;
-        assert!(
-            result.is_ok(),
-            "run_app for creating target set failed with error: {:?}",
-            result.err()
-        );
-
-        tracing::debug!("Creating plan test-plan");
-
-        let options = Options {
-            command: Command::Plan(PlanParameters {
-                sub_command: PlanSubCommand::Create(CreatePlanParameters {
-                    name: "test-plan".to_string(),
-                }),
-            }),
-        };
-
-        // Call run_app and assert it completes successfully
-        let result = run_app(options, environment.clone()).await;
-        assert!(
-            result.is_ok(),
-            "run_app for creating plan failed with error: {:?}",
-            result.err()
-        );
-
-        tracing::debug!("Adding run command cargo build step to test-plan");
-
-        let options = Options {
-            command: Command::Plan(PlanParameters {
-                sub_command: PlanSubCommand::Step(PlanStepParameters {
-                    sub_command: PlanStepSubCommand::Add(AddStepParameters {
-                        name: "test-plan".to_string(),
-                        step: CliStep::RunCommand {
-                            command: "cargo".to_string(),
-                            args: vec!["build".to_string()],
-                        },
-                    }),
-                }),
-            }),
-        };
-
-        // Call run_app and assert it completes successfully
-        let result = run_app(options, environment.clone()).await;
-        assert!(
-            result.is_ok(),
-            "run_app for creating plan failed with error: {:?}",
-            result.err()
-        );
-
-        tracing::debug!("Creating task test-task from test-target-set and test-plan");
+        tracing::debug!("Creating task test-task from test.cfe");
 
         let options = Options {
             command: Command::Task(TaskParameters {
                 sub_command: TaskSubCommand::Create(CreateTaskParameters {
                     name: "test-task".to_string(),
-                    plan: "test-plan".to_string(),
-                    target_set: "test-target-set".to_string(),
+                    program: cfe_path,
                 }),
             }),
         };
@@ -675,77 +597,21 @@ mod tests {
             result.err()
         );
 
-        tracing::debug!("Creating target set test-target-set");
+        tracing::debug!("Writing test.cfe program file");
 
-        let options = Options {
-            command: Command::TargetSet(TargetSetParameters {
-                sub_command: TargetSetSubCommand::Create(CreateTargetSetParameters {
-                    name: "test-target-set".to_string(),
-                    target_set: TargetSet::Workspaces(WorkspaceFilterParameters {
-                        no_standalone: false,
-                    }),
-                }),
-            }),
-        };
+        let cfe_path = temp_path.join("test.cfe");
+        fs_err::write(
+            &cfe_path,
+            "select workspaces;\nfor workspace {\n    run \"cargo\" \"build\";\n}\n",
+        )?;
 
-        // Call run_app and assert it completes successfully
-        let result = run_app(options, environment.clone()).await;
-        assert!(
-            result.is_ok(),
-            "run_app for creating target set failed with error: {:?}",
-            result.err()
-        );
-
-        tracing::debug!("Creating plan test-plan");
-
-        let options = Options {
-            command: Command::Plan(PlanParameters {
-                sub_command: PlanSubCommand::Create(CreatePlanParameters {
-                    name: "test-plan".to_string(),
-                }),
-            }),
-        };
-
-        // Call run_app and assert it completes successfully
-        let result = run_app(options, environment.clone()).await;
-        assert!(
-            result.is_ok(),
-            "run_app for creating plan failed with error: {:?}",
-            result.err()
-        );
-
-        tracing::debug!("Adding run command cargo build step to test-plan");
-
-        let options = Options {
-            command: Command::Plan(PlanParameters {
-                sub_command: PlanSubCommand::Step(PlanStepParameters {
-                    sub_command: PlanStepSubCommand::Add(AddStepParameters {
-                        name: "test-plan".to_string(),
-                        step: CliStep::RunCommand {
-                            command: "cargo".to_string(),
-                            args: vec!["build".to_string()],
-                        },
-                    }),
-                }),
-            }),
-        };
-
-        // Call run_app and assert it completes successfully
-        let result = run_app(options, environment.clone()).await;
-        assert!(
-            result.is_ok(),
-            "run_app for creating plan failed with error: {:?}",
-            result.err()
-        );
-
-        tracing::debug!("Creating task test-task from test-target-set and test-plan");
+        tracing::debug!("Creating task test-task from test.cfe");
 
         let options = Options {
             command: Command::Task(TaskParameters {
                 sub_command: TaskSubCommand::Create(CreateTaskParameters {
                     name: "test-task".to_string(),
-                    plan: "test-plan".to_string(),
-                    target_set: "test-target-set".to_string(),
+                    program: cfe_path,
                 }),
             }),
         };
@@ -789,10 +655,8 @@ mod tests {
     ///
     /// Regression test for Bug 1 (infinite loop) and Bug 3 (wrong error kind).
     ///
-    /// The plan is written directly via `Plan::save` with a nonexistent command so
-    /// that `run_single_step` returns `Err(CommandNotFound)` at execution time,
-    /// which is reliable regardless of the installed asciinema version's
-    /// exit-code propagation behaviour.
+    /// The `.cfe` program uses a nonexistent command so that execution fails at
+    /// run time reliably regardless of installed tooling.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_run_all_targets_keep_going_terminates_with_some_steps_failed()
@@ -819,37 +683,19 @@ mod tests {
         };
         run_app(options, environment.clone()).await?;
 
-        let options = Options {
-            command: Command::TargetSet(TargetSetParameters {
-                sub_command: TargetSetSubCommand::Create(CreateTargetSetParameters {
-                    name: "failing-set".to_string(),
-                    target_set: TargetSet::Crates(CrateFilterParameters {
-                        r#type: None,
-                        standalone: None,
-                    }),
-                }),
-            }),
-        };
-        run_app(options, environment.clone()).await?;
-
-        // Write the plan directly with a command that is guaranteed not to
-        // exist in environment.paths.  We bypass plan_step_command's
-        // command_is_executable check intentionally so we can produce a step
-        // that will fail at execution time.
-        let plan = Plan {
-            steps: vec![Step::RunCommand {
-                command: "nonexistent_command_cargo_for_each_test".to_string(),
-                args: vec![],
-            }],
-        };
-        plan.save("failing-plan", &environment)?;
+        // Write a .cfe program with a command that is guaranteed not to exist in
+        // environment.paths, so that execution fails at run time.
+        let cfe_path = temp_path.join("failing.cfe");
+        fs_err::write(
+            &cfe_path,
+            "select crates;\nfor crate {\n    run \"nonexistent_command_cargo_for_each_test\";\n}\n",
+        )?;
 
         let options = Options {
             command: Command::Task(TaskParameters {
                 sub_command: TaskSubCommand::Create(CreateTaskParameters {
                     name: "failing-task".to_string(),
-                    plan: "failing-plan".to_string(),
-                    target_set: "failing-set".to_string(),
+                    program: cfe_path,
                 }),
             }),
         };

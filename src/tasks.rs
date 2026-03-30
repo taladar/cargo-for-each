@@ -1,22 +1,34 @@
-//! This module defines the structures and functions for managing tasks.
+//! Task management: creation, execution, and state tracking.
+//!
+//! Tasks are created from `.cfe` program files, which describe the steps to
+//! run for each workspace and crate.  This module handles task creation,
+//! execution (sequential and parallel), rewinding, and status display.
+
+use std::collections::HashMap;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt as _};
-
 use tracing::instrument;
 
 use crate::error::Error;
-use crate::plans::Step;
-use crate::step_position::StepPosition;
-use crate::target_sets::load_target_set;
-
+use crate::program::ast::common::{ManualStepNode, RunStep};
+use crate::program::ast::crate_ctx::{CrateIfBlock, CrateStatement};
+use crate::program::ast::workspace_ctx::{WorkspaceIfBlock, WorkspaceStatement};
+use crate::program::cursor::{CursorSegment, ProgramCursor};
+use crate::program::evaluate::{evaluate_crate_condition, evaluate_workspace_condition};
+use crate::program::resolve::{
+    ResolvedCrateExecution, ResolvedProgram, ResolvedWorkspaceExecution,
+};
+use crate::program::{GlobalStatement, Program};
 use crate::{Config, Environment};
 use clap::Parser;
 
-/// returns the tasks dir path
+// ── Path helpers ───────────────────────────────────────────────────────────────
+
+/// Returns the tasks configuration directory path.
 ///
 /// # Errors
 ///
@@ -25,7 +37,7 @@ pub fn dir_path(environment: &crate::Environment) -> Result<PathBuf, Error> {
     Ok(crate::config_dir_path(environment)?.join("tasks"))
 }
 
-/// returns the path to a specific task directory
+/// Returns the path to a specific task's configuration directory.
 ///
 /// # Errors
 ///
@@ -34,11 +46,11 @@ pub fn named_dir_path(name: &str, environment: &crate::Environment) -> Result<Pa
     Ok(dir_path(environment)?.join(name))
 }
 
-/// returns the path to a specific task's state directory
+/// Returns the path to a specific task's execution state directory.
 ///
 /// # Errors
 ///
-/// Returns an error if the tasks directory path cannot be determined.
+/// Returns an error if the state directory path cannot be determined.
 pub fn state_dir_for_task(name: &str, environment: &crate::Environment) -> Result<PathBuf, Error> {
     Ok(environment
         .state_dir
@@ -46,186 +58,1258 @@ pub fn state_dir_for_task(name: &str, environment: &crate::Environment) -> Resul
         .join("tasks")
         .join(name))
 }
-/// Parameters for creating a new task
+
+// ── CLI parameter structs ──────────────────────────────────────────────────────
+
+/// Parameters for creating a new task.
 #[derive(Parser, Debug, Clone)]
 pub struct CreateTaskParameters {
-    /// the name of the task
+    /// The name of the task.
     #[clap(long)]
     pub name: String,
-    /// the name of the plan to use for the task
+    /// Path to the `.cfe` program file that defines the task steps.
     #[clap(long)]
-    pub plan: String,
-    /// the name of the target set to use for the task
-    #[clap(long)]
-    pub target_set: String,
+    pub program: PathBuf,
 }
 
-/// Parameters for running a single step of a task
+/// Parameters for running the next single uncompleted statement of a task.
 #[derive(Parser, Debug, Clone)]
 pub struct RunSingleStepParameters {
-    /// the name of the task
+    /// The name of the task.
     #[clap(long)]
     pub name: String,
 }
 
-/// Parameters for running a task on a single target
+/// Parameters for running all remaining statements for the first ready target.
 #[derive(Parser, Debug, Clone)]
 pub struct RunSingleTargetParameters {
-    /// the name of the task
+    /// The name of the task.
     #[clap(long)]
     pub name: String,
 }
 
-/// Parameters for running a task on all targets
+/// Parameters for running a task across all targets in dependency order.
 #[derive(Parser, Debug, Clone)]
 pub struct RunAllTargetsParameters {
-    /// the name of the task
+    /// The name of the task.
     #[clap(long)]
     pub name: String,
-    /// Number of parallel jobs to run (similar to make -j)
+    /// Number of parallel jobs (similar to `make -j`). Defaults to 1.
     #[clap(short = 'j', long)]
     pub jobs: Option<usize>,
-    /// Keep going when some targets fail (similar to make -k)
+    /// Continue running even when some targets fail (similar to `make -k`).
     #[clap(short = 'k', long)]
     pub keep_going: bool,
 }
 
-/// The `task run` subcommand
+/// The `task run` subcommand.
 #[derive(Parser, Debug, Clone)]
 pub enum TaskRunSubCommand {
-    /// Run a single step of a task
+    /// Run the next single uncompleted statement of the task.
     SingleStep(RunSingleStepParameters),
-    /// Run a task on a single target
+    /// Run all remaining statements for the first ready target.
     SingleTarget(RunSingleTargetParameters),
-    /// Run a task on all targets
+    /// Run all targets in dependency order.
     AllTargets(RunAllTargetsParameters),
 }
 
-/// Parameters for the `task run` subcommand
+/// Parameters for the `task run` subcommand.
 #[derive(Parser, Debug, Clone)]
 pub struct TaskRunParameters {
-    /// the `task run` subcommand to run
+    /// The `task run` subcommand to run.
     #[clap(subcommand)]
     pub sub_command: TaskRunSubCommand,
 }
 
-/// Parameters for rewinding a single step of a task
+/// Parameters for rewinding (undoing) the last completed statement of a task.
 #[derive(Parser, Debug, Clone)]
 pub struct RewindSingleStepParameters {
-    /// the name of the task
+    /// The name of the task.
     #[clap(long)]
     pub name: String,
 }
 
-/// Parameters for rewinding a task on a single target
+/// Parameters for rewinding the last completed target of a task.
 #[derive(Parser, Debug, Clone)]
 pub struct RewindSingleTargetParameters {
-    /// the name of the task
+    /// The name of the task.
     #[clap(long)]
     pub name: String,
 }
 
-/// Parameters for rewinding a task on all targets
+/// Parameters for rewinding all execution state of a task.
 #[derive(Parser, Debug, Clone)]
 pub struct RewindAllTargetsParameters {
-    /// the name of the task
+    /// The name of the task.
     #[clap(long)]
     pub name: String,
 }
 
-/// The `task rewind` subcommand
+/// The `task rewind` subcommand.
 #[derive(Parser, Debug, Clone)]
 pub enum TaskRewindSubCommand {
-    /// Rewind a single step of a task
+    /// Rewind the last completed statement.
     SingleStep(RewindSingleStepParameters),
-    /// Rewind a task on a single target
+    /// Rewind the last completed target.
     SingleTarget(RewindSingleTargetParameters),
-    /// Rewind a task on all targets
+    /// Rewind all execution state.
     AllTargets(RewindAllTargetsParameters),
 }
 
-/// Parameters for the `task rewind` subcommand
+/// Parameters for the `task rewind` subcommand.
 #[derive(Parser, Debug, Clone)]
 pub struct TaskRewindParameters {
-    /// the `task rewind` subcommand to run
+    /// The `task rewind` subcommand to run.
     #[clap(subcommand)]
     pub sub_command: TaskRewindSubCommand,
 }
 
-/// The `task` subcommand
+/// The `task` subcommand.
 #[derive(Parser, Debug, Clone)]
 pub enum TaskSubCommand {
-    /// List all tasks
+    /// List all tasks.
     List,
-    /// Create a new task
+    /// Create a new task.
     Create(CreateTaskParameters),
-    /// Remove a task
+    /// Remove a task.
     Remove(RemoveTaskParameters),
-    /// Describe a task
+    /// Describe a task and its current execution status.
     Describe(DescribeTaskParameters),
-    /// Run a task
+    /// Run a task.
     Run(TaskRunParameters),
-    /// Rewind a task
+    /// Rewind a task.
     Rewind(TaskRewindParameters),
 }
 
-/// Parameters for removing a task
+/// Parameters for removing a task.
 #[derive(Parser, Debug, Clone)]
 pub struct RemoveTaskParameters {
-    /// the name of the task
+    /// The name of the task.
     #[clap(long)]
     pub name: String,
 }
 
-/// Parameters for describing a task
+/// Parameters for describing a task and its current execution status.
 #[derive(Parser, Debug, Clone)]
 pub struct DescribeTaskParameters {
-    /// the name of the task
+    /// The name of the task.
     #[clap(long)]
     pub name: String,
 }
 
-/// Parameters for task subcommand
+/// Parameters for the `task` top-level subcommand.
 #[derive(Parser, Debug, Clone)]
 pub struct TaskParameters {
-    /// the `task` subcommand to run
+    /// The `task` subcommand to run.
     #[clap(subcommand)]
     pub sub_command: TaskSubCommand,
 }
 
-/// implementation of the task create subcommand
+// ── Program statement helpers ──────────────────────────────────────────────────
+
+/// Returns the workspace statement slice from the first `for workspace` block
+/// in the program, or an empty slice if there is none.
+fn first_workspace_stmts(program: &Program) -> &[WorkspaceStatement] {
+    program
+        .statements
+        .iter()
+        .find_map(|s| {
+            if let GlobalStatement::ForWorkspace(b) = s {
+                Some(b.statements.as_slice())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(&[])
+}
+
+/// Returns the crate statement slice from the first `for crate` block
+/// in the program, or an empty slice if there is none.
+fn first_crate_stmts(program: &Program) -> &[CrateStatement] {
+    program
+        .statements
+        .iter()
+        .find_map(|s| {
+            if let GlobalStatement::ForCrate(b) = s {
+                Some(b.statements.as_slice())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(&[])
+}
+
+// ── Statement completion checks ────────────────────────────────────────────────
+
+/// Returns `true` if the `run` statement recorded at `state_dir` succeeded.
+fn is_run_completed(state_dir: &Path) -> bool {
+    if !state_dir.exists() {
+        return false;
+    }
+    fs_err::read_to_string(state_dir.join("exit_status"))
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        == Some("0")
+}
+
+/// Returns `true` if the `manual_step` at `state_dir` was confirmed by the user.
+fn is_manual_completed(state_dir: &Path) -> bool {
+    if !state_dir.exists() {
+        return false;
+    }
+    fs_err::read_to_string(state_dir.join("manual_step_confirmed"))
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        == Some("y")
+}
+
+/// Returns `true` if all crate statements in `stmts` under `prefix` are completed.
+fn is_crate_stmts_completed(
+    stmts: &[CrateStatement],
+    prefix: &ProgramCursor,
+    state_base: &Path,
+) -> bool {
+    stmts.iter().enumerate().all(|(i, stmt)| {
+        let cursor = prefix.clone().with(CursorSegment::Statement(i));
+        is_crate_stmt_completed(stmt, &cursor, state_base)
+    })
+}
+
+/// Returns `true` if the given crate statement at `cursor` is completed.
+fn is_crate_stmt_completed(
+    stmt: &CrateStatement,
+    cursor: &ProgramCursor,
+    state_base: &Path,
+) -> bool {
+    let state_dir = state_base.join(cursor.to_path());
+    match stmt {
+        CrateStatement::Run(_) => is_run_completed(&state_dir),
+        CrateStatement::ManualStep(_) => is_manual_completed(&state_dir),
+        CrateStatement::If(block) => {
+            let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) else {
+                return false;
+            };
+            match chosen.trim() {
+                "none" => true,
+                "else" => {
+                    let p = cursor.clone().with(CursorSegment::ElseBranch);
+                    is_crate_stmts_completed(&block.else_statements, &p, state_base)
+                }
+                s => s.parse::<usize>().is_ok_and(|n| {
+                    block.branches.get(n).is_some_and(|branch| {
+                        let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                        is_crate_stmts_completed(&branch.statements, &p, state_base)
+                    })
+                }),
+            }
+        }
+    }
+}
+
+/// Returns `true` if all workspace statements in `stmts` under `prefix` are completed.
+///
+/// `member_crates` is required to evaluate `ForCrateInWorkspace` blocks.
+fn is_workspace_stmts_completed(
+    stmts: &[WorkspaceStatement],
+    prefix: &ProgramCursor,
+    member_crates: &[ResolvedCrateExecution],
+    state_base: &Path,
+) -> bool {
+    stmts.iter().enumerate().all(|(i, stmt)| {
+        let cursor = prefix.clone().with(CursorSegment::Statement(i));
+        is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base)
+    })
+}
+
+/// Returns `true` if the given workspace statement at `cursor` is completed.
+fn is_workspace_stmt_completed(
+    stmt: &WorkspaceStatement,
+    cursor: &ProgramCursor,
+    member_crates: &[ResolvedCrateExecution],
+    state_base: &Path,
+) -> bool {
+    let state_dir = state_base.join(cursor.to_path());
+    match stmt {
+        WorkspaceStatement::Run(_) => is_run_completed(&state_dir),
+        WorkspaceStatement::ManualStep(_) => is_manual_completed(&state_dir),
+        WorkspaceStatement::If(block) => {
+            let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) else {
+                return false;
+            };
+            match chosen.trim() {
+                "none" => true,
+                "else" => {
+                    let p = cursor.clone().with(CursorSegment::ElseBranch);
+                    is_workspace_stmts_completed(
+                        &block.else_statements,
+                        &p,
+                        member_crates,
+                        state_base,
+                    )
+                }
+                s => s.parse::<usize>().is_ok_and(|n| {
+                    block.branches.get(n).is_some_and(|branch| {
+                        let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                        is_workspace_stmts_completed(
+                            &branch.statements,
+                            &p,
+                            member_crates,
+                            state_base,
+                        )
+                    })
+                }),
+            }
+        }
+        WorkspaceStatement::ForCrateInWorkspace(block) => {
+            member_crates.iter().enumerate().all(|(c_idx, _)| {
+                let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
+                is_crate_stmts_completed(&block.statements, &c_prefix, state_base)
+            })
+        }
+    }
+}
+
+/// Returns `true` if all workspace statements for `ws_idx` are completed.
+fn is_workspace_completed(
+    ws_idx: usize,
+    ws_exec: &ResolvedWorkspaceExecution,
+    ws_stmts: &[WorkspaceStatement],
+    state_base: &Path,
+) -> bool {
+    let prefix = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
+    is_workspace_stmts_completed(ws_stmts, &prefix, &ws_exec.member_crates, state_base)
+}
+
+/// Returns `true` if all statements for standalone crate `c_idx` are completed.
+fn is_standalone_crate_completed(
+    c_idx: usize,
+    crate_stmts: &[CrateStatement],
+    state_base: &Path,
+) -> bool {
+    let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
+    is_crate_stmts_completed(crate_stmts, &prefix, state_base)
+}
+
+/// Returns `true` if all inter-workspace dependencies of `ws_exec` are completed.
+fn are_workspace_deps_completed(
+    ws_exec: &ResolvedWorkspaceExecution,
+    ws_map: &HashMap<PathBuf, usize>,
+    ws_stmts: &[WorkspaceStatement],
+    resolved: &ResolvedProgram,
+    state_base: &Path,
+) -> bool {
+    ws_exec.dependencies.iter().all(|dep_path| {
+        let Some(&dep_idx) = ws_map.get(dep_path) else {
+            return true; // Dep not in selected set — treat as satisfied.
+        };
+        let Some(dep_exec) = resolved.workspace_executions.get(dep_idx) else {
+            return true;
+        };
+        is_workspace_completed(dep_idx, dep_exec, ws_stmts, state_base)
+    })
+}
+
+/// Returns `true` if all dependencies of a standalone crate have completed.
+fn are_standalone_crate_deps_completed(
+    crate_exec: &ResolvedCrateExecution,
+    crate_map: &HashMap<PathBuf, usize>,
+    crate_stmts: &[CrateStatement],
+    state_base: &Path,
+) -> bool {
+    crate_exec.dependencies.iter().all(|dep_path| {
+        let Some(&dep_idx) = crate_map.get(dep_path) else {
+            return true;
+        };
+        is_standalone_crate_completed(dep_idx, crate_stmts, state_base)
+    })
+}
+
+/// Returns `true` if all intra-workspace dependencies of a member crate are
+/// completed for the given `for crate in workspace` block.
+fn are_member_crate_deps_completed(
+    crate_exec: &ResolvedCrateExecution,
+    crate_map: &HashMap<PathBuf, usize>,
+    for_crate_prefix: &ProgramCursor,
+    for_crate_stmts: &[CrateStatement],
+    state_base: &Path,
+) -> bool {
+    crate_exec.dependencies.iter().all(|dep_path| {
+        let Some(&dep_idx) = crate_map.get(dep_path) else {
+            return true;
+        };
+        let c_prefix = for_crate_prefix
+            .clone()
+            .with(CursorSegment::CrateIteration(dep_idx));
+        is_crate_stmts_completed(for_crate_stmts, &c_prefix, state_base)
+    })
+}
+
+// ── Find-next helpers ──────────────────────────────────────────────────────────
+
+/// The concrete action to take for a [`NextStatement`].
+#[derive(Debug)]
+pub enum StatementAction<'a> {
+    /// Execute a command in the target directory.
+    RunCommand(&'a RunStep),
+    /// Pause for a manual user action and confirm completion.
+    ManualStep(&'a ManualStepNode),
+    /// Evaluate the branch conditions of a workspace `if` block.
+    EvaluateWorkspaceIf(&'a WorkspaceIfBlock),
+    /// Evaluate the branch conditions of a crate `if` block.
+    EvaluateCrateIf(&'a CrateIfBlock),
+}
+
+/// The next statement that should be executed in a running task.
+#[derive(Debug)]
+pub struct NextStatement<'a> {
+    /// Cursor identifying this statement in the execution tree.
+    pub cursor: ProgramCursor,
+    /// The directory in which the statement executes.
+    pub manifest_dir: &'a Path,
+    /// What to do at this cursor position.
+    pub action: StatementAction<'a>,
+}
+
+/// Finds the first uncompleted crate statement in `stmts` starting at `prefix`.
+///
+/// Returns `None` if all statements are completed.
+fn find_next_in_crate_stmts<'a>(
+    stmts: &'a [CrateStatement],
+    prefix: &ProgramCursor,
+    manifest_dir: &'a Path,
+    state_base: &Path,
+) -> Option<NextStatement<'a>> {
+    for (i, stmt) in stmts.iter().enumerate() {
+        let cursor = prefix.clone().with(CursorSegment::Statement(i));
+        let state_dir = state_base.join(cursor.to_path());
+
+        match stmt {
+            CrateStatement::Run(step) => {
+                if !is_run_completed(&state_dir) {
+                    return Some(NextStatement {
+                        cursor,
+                        manifest_dir,
+                        action: StatementAction::RunCommand(step),
+                    });
+                }
+            }
+            CrateStatement::ManualStep(step) => {
+                if !is_manual_completed(&state_dir) {
+                    return Some(NextStatement {
+                        cursor,
+                        manifest_dir,
+                        action: StatementAction::ManualStep(step),
+                    });
+                }
+            }
+            CrateStatement::If(block) => {
+                match fs_err::read_to_string(state_dir.join("chosen_branch")) {
+                    Err(_) => {
+                        return Some(NextStatement {
+                            cursor,
+                            manifest_dir,
+                            action: StatementAction::EvaluateCrateIf(block),
+                        });
+                    }
+                    Ok(chosen) => {
+                        let nested = match chosen.trim() {
+                            "none" => None,
+                            "else" => {
+                                let p = cursor.clone().with(CursorSegment::ElseBranch);
+                                find_next_in_crate_stmts(
+                                    &block.else_statements,
+                                    &p,
+                                    manifest_dir,
+                                    state_base,
+                                )
+                            }
+                            s => s.parse::<usize>().ok().and_then(|n| {
+                                block.branches.get(n).and_then(|branch| {
+                                    let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                                    find_next_in_crate_stmts(
+                                        &branch.statements,
+                                        &p,
+                                        manifest_dir,
+                                        state_base,
+                                    )
+                                })
+                            }),
+                        };
+                        if nested.is_some() {
+                            return nested;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Finds the first uncompleted workspace statement in `stmts` starting at `prefix`.
+///
+/// Returns `None` if all statements (including nested `for crate in workspace`) are done.
+fn find_next_in_workspace_stmts<'a>(
+    stmts: &'a [WorkspaceStatement],
+    prefix: &ProgramCursor,
+    manifest_dir: &'a Path,
+    member_crates: &'a [ResolvedCrateExecution],
+    state_base: &Path,
+) -> Option<NextStatement<'a>> {
+    for (i, stmt) in stmts.iter().enumerate() {
+        let cursor = prefix.clone().with(CursorSegment::Statement(i));
+        let state_dir = state_base.join(cursor.to_path());
+
+        match stmt {
+            WorkspaceStatement::Run(step) => {
+                if !is_run_completed(&state_dir) {
+                    return Some(NextStatement {
+                        cursor,
+                        manifest_dir,
+                        action: StatementAction::RunCommand(step),
+                    });
+                }
+            }
+            WorkspaceStatement::ManualStep(step) => {
+                if !is_manual_completed(&state_dir) {
+                    return Some(NextStatement {
+                        cursor,
+                        manifest_dir,
+                        action: StatementAction::ManualStep(step),
+                    });
+                }
+            }
+            WorkspaceStatement::If(block) => {
+                match fs_err::read_to_string(state_dir.join("chosen_branch")) {
+                    Err(_) => {
+                        return Some(NextStatement {
+                            cursor,
+                            manifest_dir,
+                            action: StatementAction::EvaluateWorkspaceIf(block),
+                        });
+                    }
+                    Ok(chosen) => {
+                        let nested = match chosen.trim() {
+                            "none" => None,
+                            "else" => {
+                                let p = cursor.clone().with(CursorSegment::ElseBranch);
+                                find_next_in_workspace_stmts(
+                                    &block.else_statements,
+                                    &p,
+                                    manifest_dir,
+                                    member_crates,
+                                    state_base,
+                                )
+                            }
+                            s => s.parse::<usize>().ok().and_then(|n| {
+                                block.branches.get(n).and_then(|branch| {
+                                    let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                                    find_next_in_workspace_stmts(
+                                        &branch.statements,
+                                        &p,
+                                        manifest_dir,
+                                        member_crates,
+                                        state_base,
+                                    )
+                                })
+                            }),
+                        };
+                        if nested.is_some() {
+                            return nested;
+                        }
+                    }
+                }
+            }
+            WorkspaceStatement::ForCrateInWorkspace(block) => {
+                let crate_map: HashMap<PathBuf, usize> = member_crates
+                    .iter()
+                    .enumerate()
+                    .map(|(ci, c)| (c.manifest_dir.clone(), ci))
+                    .collect();
+
+                for (c_idx, crate_exec) in member_crates.iter().enumerate() {
+                    if !are_member_crate_deps_completed(
+                        crate_exec,
+                        &crate_map,
+                        &cursor,
+                        &block.statements,
+                        state_base,
+                    ) {
+                        continue;
+                    }
+                    let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
+                    let nested = find_next_in_crate_stmts(
+                        &block.statements,
+                        &c_prefix,
+                        &crate_exec.manifest_dir,
+                        state_base,
+                    );
+                    if nested.is_some() {
+                        return nested;
+                    }
+                }
+                // All member crates done — continue to next workspace statement.
+            }
+        }
+    }
+    None
+}
+
+/// Finds the next uncompleted statement across all workspaces and standalone crates,
+/// respecting inter-target dependency ordering.
+///
+/// Returns `None` when every statement in every target has been completed.
+#[must_use]
+pub fn find_next_statement<'a>(
+    program: &'a Program,
+    resolved: &'a ResolvedProgram,
+    state_base: &Path,
+) -> Option<NextStatement<'a>> {
+    let ws_stmts = first_workspace_stmts(program);
+    let ws_map: HashMap<PathBuf, usize> = resolved
+        .workspace_executions
+        .iter()
+        .enumerate()
+        .map(|(i, w)| (w.manifest_dir.clone(), i))
+        .collect();
+
+    for (ws_idx, ws_exec) in resolved.workspace_executions.iter().enumerate() {
+        if !are_workspace_deps_completed(ws_exec, &ws_map, ws_stmts, resolved, state_base) {
+            continue;
+        }
+        let prefix = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
+        let next = find_next_in_workspace_stmts(
+            ws_stmts,
+            &prefix,
+            &ws_exec.manifest_dir,
+            &ws_exec.member_crates,
+            state_base,
+        );
+        if next.is_some() {
+            return next;
+        }
+    }
+
+    let crate_stmts = first_crate_stmts(program);
+    let crate_map: HashMap<PathBuf, usize> = resolved
+        .crate_executions
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.manifest_dir.clone(), i))
+        .collect();
+
+    for (c_idx, crate_exec) in resolved.crate_executions.iter().enumerate() {
+        if !are_standalone_crate_deps_completed(crate_exec, &crate_map, crate_stmts, state_base) {
+            continue;
+        }
+        let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
+        let next =
+            find_next_in_crate_stmts(crate_stmts, &prefix, &crate_exec.manifest_dir, state_base);
+        if next.is_some() {
+            return next;
+        }
+    }
+
+    None
+}
+
+// ── Statement execution ────────────────────────────────────────────────────────
+
+/// Executes a `run` step using asciinema for recording.
 ///
 /// # Errors
 ///
-/// This command can fail if the configuration directory cannot be determined, if the specified plan or target set is not found, if the global configuration cannot be loaded, if there are issues resolving the target set (e.g., cargo metadata errors, package not found, path errors), if the task directory cannot be created (e.g., task already exists, file system errors), if plan or target set files cannot be copied, or if the resolved target set cannot be serialized or written.
+/// Returns an error if the command is not found, if asciinema fails to launch,
+/// or if the exit-status file cannot be written.
+async fn execute_run_step(
+    step: &RunStep,
+    cursor: &ProgramCursor,
+    manifest_dir: &Path,
+    state_base: &Path,
+    environment: &Environment,
+) -> Result<(), Error> {
+    let state_dir = state_base.join(cursor.to_path());
+    fs_err::create_dir_all(&state_dir)
+        .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+
+    let command = &step.command;
+    let args = &step.args;
+
+    if !crate::utils::command_is_executable(command, environment) {
+        return Err(Error::CommandNotFound(command.clone()));
+    }
+
+    let command_str = format!(
+        "{} {}",
+        command,
+        args.iter()
+            .map(|a| format!("\"{}\"", a.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    let wrapper_path = state_dir.join("run_wrapper.sh");
+    let exit_status_path = state_dir.join("exit_status");
+    let script = format!(
+        "#!/bin/sh\n{command_str}\nrc=$?\nprintf '%d' \"$rc\" > \"$CARGO_FOR_EACH_EXIT_STATUS_PATH\"\nexit \"$rc\"\n"
+    );
+    fs_err::write(&wrapper_path, &script)
+        .map_err(|e| Error::CouldNotWriteStateFile(wrapper_path.clone(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        fs_err::set_permissions(&wrapper_path, perms).map_err(Error::IoError)?;
+    }
+
+    let cast_path = state_dir.join("asciinema.cast");
+    let mut cmd = Command::new("asciinema");
+    cmd.arg("record");
+    if environment.suppress_subprocess_output {
+        cmd.arg("--headless");
+    }
+    cmd.arg("-q")
+        .arg("-c")
+        .arg(wrapper_path.to_string_lossy().as_ref())
+        .arg(&cast_path);
+    cmd.env("CARGO_FOR_EACH_EXIT_STATUS_PATH", &exit_status_path);
+    cmd.current_dir(manifest_dir);
+
+    match crate::utils::execute_command(&mut cmd, environment, manifest_dir) {
+        Err(e) => {
+            fs_err::write(&exit_status_path, "")
+                .map_err(|we| Error::CouldNotWriteStateFile(exit_status_path, we))?;
+            Err(e)
+        }
+        Ok(_) => {
+            let exit_code: i32 = fs_err::read_to_string(&exit_status_path)
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
+
+            if !exit_status_path.exists() {
+                fs_err::write(&exit_status_path, exit_code.to_string())
+                    .map_err(|e| Error::CouldNotWriteStateFile(exit_status_path, e))?;
+            }
+
+            if exit_code != 0 {
+                return Err(Error::CommandFailed(
+                    command_str,
+                    manifest_dir.to_path_buf(),
+                    exit_code,
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Executes a `manual_step` by launching an interactive asciinema recording session.
+///
+/// # Errors
+///
+/// Returns an error if asciinema fails, if I/O fails, if the confirmation file
+/// cannot be written, or if the user does not confirm completion.
+#[expect(
+    clippy::print_stdout,
+    reason = "ManualStep is part of the interactive UI"
+)]
+async fn execute_manual_step(
+    step: &ManualStepNode,
+    cursor: &ProgramCursor,
+    manifest_dir: &Path,
+    state_base: &Path,
+    environment: &Environment,
+) -> Result<(), Error> {
+    let state_dir = state_base.join(cursor.to_path());
+    fs_err::create_dir_all(&state_dir)
+        .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+
+    println!("--- Manual Step: {} ---", step.title);
+    println!("{}", step.instructions);
+    println!(
+        "Starting a recording shell in {}. Press Ctrl+D or type `exit` to continue.",
+        manifest_dir.display()
+    );
+
+    let cast_path = state_dir.join("asciinema.cast");
+    let mut cmd = Command::new("asciinema");
+    cmd.arg("record");
+    if environment.suppress_subprocess_output {
+        cmd.arg("--headless");
+    }
+    cmd.arg("-q").arg(&cast_path);
+    cmd.current_dir(manifest_dir);
+
+    let status = crate::utils::execute_command(&mut cmd, environment, manifest_dir)?.status;
+    if !status.success() {
+        println!("Shell exited with a non-zero status code: {status}");
+    }
+
+    print!("Was the manual step completed successfully? (y/N) ");
+    io::stdout().flush().map_err(Error::IoError)?;
+    let mut confirmation = String::new();
+    io::stdin()
+        .read_line(&mut confirmation)
+        .map_err(Error::IoError)?;
+
+    let confirmed = confirmation.trim().eq_ignore_ascii_case("y")
+        || confirmation.trim().eq_ignore_ascii_case("yes");
+    let manual_step_confirmed_path = state_dir.join("manual_step_confirmed");
+    fs_err::write(
+        &manual_step_confirmed_path,
+        if confirmed { "y" } else { "n" },
+    )
+    .map_err(|e| Error::CouldNotWriteStateFile(manual_step_confirmed_path, e))?;
+
+    if !confirmed {
+        return Err(Error::ManualStepNotConfirmed);
+    }
+    Ok(())
+}
+
+/// Evaluates the branch conditions of a workspace `if` block and writes `chosen_branch`.
+///
+/// The branch index written is 0-based; `"none"` means no branch matched and there
+/// is no else clause; `"else"` means no branch matched but there is an else clause.
+///
+/// # Errors
+///
+/// Returns an error if condition evaluation fails or the state file cannot be written.
+fn evaluate_workspace_if_block(
+    block: &WorkspaceIfBlock,
+    cursor: &ProgramCursor,
+    manifest_dir: &Path,
+    state_base: &Path,
+    environment: &Environment,
+    config: &Config,
+) -> Result<(), Error> {
+    let state_dir = state_base.join(cursor.to_path());
+    fs_err::create_dir_all(&state_dir)
+        .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+
+    let mut chosen: Option<usize> = None;
+    for (i, branch) in block.branches.iter().enumerate() {
+        if evaluate_workspace_condition(&branch.condition, manifest_dir, environment, config)?
+            && chosen.is_none()
+        {
+            chosen = Some(i);
+        }
+    }
+
+    let chosen_str = chosen.map_or_else(
+        || {
+            if block.else_statements.is_empty() {
+                "none".to_owned()
+            } else {
+                "else".to_owned()
+            }
+        },
+        |n| n.to_string(),
+    );
+    let chosen_branch_path = state_dir.join("chosen_branch");
+    fs_err::write(&chosen_branch_path, &chosen_str)
+        .map_err(|e| Error::CouldNotWriteStateFile(chosen_branch_path, e))?;
+    Ok(())
+}
+
+/// Evaluates the branch conditions of a crate `if` block and writes `chosen_branch`.
+///
+/// # Errors
+///
+/// Returns an error if condition evaluation fails or the state file cannot be written.
+fn evaluate_crate_if_block(
+    block: &CrateIfBlock,
+    cursor: &ProgramCursor,
+    manifest_dir: &Path,
+    state_base: &Path,
+    environment: &Environment,
+    config: &Config,
+) -> Result<(), Error> {
+    let state_dir = state_base.join(cursor.to_path());
+    fs_err::create_dir_all(&state_dir)
+        .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+
+    let mut chosen: Option<usize> = None;
+    for (i, branch) in block.branches.iter().enumerate() {
+        if evaluate_crate_condition(&branch.condition, manifest_dir, environment, config)?
+            && chosen.is_none()
+        {
+            chosen = Some(i);
+        }
+    }
+
+    let chosen_str = chosen.map_or_else(
+        || {
+            if block.else_statements.is_empty() {
+                "none".to_owned()
+            } else {
+                "else".to_owned()
+            }
+        },
+        |n| n.to_string(),
+    );
+    let chosen_branch_path = state_dir.join("chosen_branch");
+    fs_err::write(&chosen_branch_path, &chosen_str)
+        .map_err(|e| Error::CouldNotWriteStateFile(chosen_branch_path, e))?;
+    Ok(())
+}
+
+/// Runs all crate statements to completion, skipping already-completed ones.
+///
+/// Handles `if` blocks by evaluating conditions if not yet done, then running
+/// the chosen branch's statements recursively.
+///
+/// # Errors
+///
+/// Returns an error if any statement fails.
+async fn run_crate_stmts_to_completion(
+    stmts: &[CrateStatement],
+    prefix: &ProgramCursor,
+    manifest_dir: &Path,
+    state_base: &Path,
+    environment: &Environment,
+    config: &Config,
+) -> Result<(), Error> {
+    for (i, stmt) in stmts.iter().enumerate() {
+        let cursor = prefix.clone().with(CursorSegment::Statement(i));
+        let state_dir = state_base.join(cursor.to_path());
+
+        match stmt {
+            CrateStatement::Run(step) => {
+                if !is_run_completed(&state_dir) {
+                    execute_run_step(step, &cursor, manifest_dir, state_base, environment).await?;
+                }
+            }
+            CrateStatement::ManualStep(step) => {
+                if !is_manual_completed(&state_dir) {
+                    execute_manual_step(step, &cursor, manifest_dir, state_base, environment)
+                        .await?;
+                }
+            }
+            CrateStatement::If(block) => {
+                let chosen_branch_path = state_dir.join("chosen_branch");
+                if !chosen_branch_path.exists() {
+                    evaluate_crate_if_block(
+                        block,
+                        &cursor,
+                        manifest_dir,
+                        state_base,
+                        environment,
+                        config,
+                    )?;
+                }
+                let chosen = fs_err::read_to_string(&chosen_branch_path)
+                    .unwrap_or_else(|_| "none".to_owned());
+                match chosen.trim() {
+                    "none" => {}
+                    "else" => {
+                        let p = cursor.clone().with(CursorSegment::ElseBranch);
+                        Box::pin(run_crate_stmts_to_completion(
+                            &block.else_statements,
+                            &p,
+                            manifest_dir,
+                            state_base,
+                            environment,
+                            config,
+                        ))
+                        .await?;
+                    }
+                    s => {
+                        if let Ok(n) = s.trim().parse::<usize>()
+                            && let Some(branch) = block.branches.get(n)
+                        {
+                            let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                            Box::pin(run_crate_stmts_to_completion(
+                                &branch.statements,
+                                &p,
+                                manifest_dir,
+                                state_base,
+                                environment,
+                                config,
+                            ))
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runs all workspace statements to completion, including nested `for crate in workspace`.
+///
+/// Already-completed statements are skipped.
+///
+/// # Errors
+///
+/// Returns an error if any statement fails.
+async fn run_workspace_stmts_to_completion(
+    stmts: &[WorkspaceStatement],
+    prefix: &ProgramCursor,
+    manifest_dir: &Path,
+    member_crates: &[ResolvedCrateExecution],
+    state_base: &Path,
+    environment: &Environment,
+    config: &Config,
+) -> Result<(), Error> {
+    for (i, stmt) in stmts.iter().enumerate() {
+        let cursor = prefix.clone().with(CursorSegment::Statement(i));
+        let state_dir = state_base.join(cursor.to_path());
+
+        match stmt {
+            WorkspaceStatement::Run(step) => {
+                if !is_run_completed(&state_dir) {
+                    execute_run_step(step, &cursor, manifest_dir, state_base, environment).await?;
+                }
+            }
+            WorkspaceStatement::ManualStep(step) => {
+                if !is_manual_completed(&state_dir) {
+                    execute_manual_step(step, &cursor, manifest_dir, state_base, environment)
+                        .await?;
+                }
+            }
+            WorkspaceStatement::If(block) => {
+                let chosen_branch_path = state_dir.join("chosen_branch");
+                if !chosen_branch_path.exists() {
+                    evaluate_workspace_if_block(
+                        block,
+                        &cursor,
+                        manifest_dir,
+                        state_base,
+                        environment,
+                        config,
+                    )?;
+                }
+                let chosen = fs_err::read_to_string(&chosen_branch_path)
+                    .unwrap_or_else(|_| "none".to_owned());
+                match chosen.trim() {
+                    "none" => {}
+                    "else" => {
+                        let p = cursor.clone().with(CursorSegment::ElseBranch);
+                        Box::pin(run_workspace_stmts_to_completion(
+                            &block.else_statements,
+                            &p,
+                            manifest_dir,
+                            member_crates,
+                            state_base,
+                            environment,
+                            config,
+                        ))
+                        .await?;
+                    }
+                    s => {
+                        if let Ok(n) = s.trim().parse::<usize>()
+                            && let Some(branch) = block.branches.get(n)
+                        {
+                            let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                            Box::pin(run_workspace_stmts_to_completion(
+                                &branch.statements,
+                                &p,
+                                manifest_dir,
+                                member_crates,
+                                state_base,
+                                environment,
+                                config,
+                            ))
+                            .await?;
+                        }
+                    }
+                }
+            }
+            WorkspaceStatement::ForCrateInWorkspace(block) => {
+                // Member crates are already in intra-workspace dependency order.
+                for (c_idx, crate_exec) in member_crates.iter().enumerate() {
+                    let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
+                    run_crate_stmts_to_completion(
+                        &block.statements,
+                        &c_prefix,
+                        &crate_exec.manifest_dir,
+                        state_base,
+                        environment,
+                        config,
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Load helpers ───────────────────────────────────────────────────────────────
+
+/// Loads the parsed program and resolved snapshot for the given task.
+///
+/// # Errors
+///
+/// Returns an error if the task directory does not exist, if the program source
+/// file cannot be read or parsed, or if the resolved program snapshot cannot be
+/// read or parsed.
+fn load_task_data(
+    task_name: &str,
+    environment: &Environment,
+) -> Result<(Program, ResolvedProgram), Error> {
+    let task_dir = named_dir_path(task_name, environment)?;
+    if !task_dir.exists() {
+        return Err(Error::TaskNotFound(task_name.to_owned()));
+    }
+
+    let program_source_path = task_dir.join("program.cfe");
+    let source =
+        fs_err::read_to_string(&program_source_path).map_err(Error::CouldNotReadProgramFile)?;
+    let program = crate::program::parser::parse(&source, "program.cfe").map_err(|errors| {
+        let msgs = errors
+            .iter()
+            .map(|e| e.as_str().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Error::ProgramParseErrors(msgs)
+    })?;
+
+    let resolved_path = task_dir.join("resolved-program.toml");
+    let resolved_src = fs_err::read_to_string(&resolved_path)
+        .map_err(|e| Error::CouldNotReadResolvedProgram(resolved_path.clone(), e))?;
+    let resolved: ResolvedProgram = toml::from_str(&resolved_src)
+        .map_err(|e| Error::CouldNotParseResolvedProgram(resolved_path.clone(), e))?;
+
+    Ok((program, resolved))
+}
+
+// ── Rewind helpers ─────────────────────────────────────────────────────────────
+
+/// Finds the cursor of the last completed crate statement (searched in reverse).
+fn find_last_completed_crate_stmt(
+    stmts: &[CrateStatement],
+    prefix: &ProgramCursor,
+    state_base: &Path,
+) -> Option<ProgramCursor> {
+    for (i, stmt) in stmts.iter().enumerate().rev() {
+        let cursor = prefix.clone().with(CursorSegment::Statement(i));
+        // Check inside IfBlocks for nested completed statements first.
+        if let CrateStatement::If(block) = stmt {
+            let state_dir = state_base.join(cursor.to_path());
+            if let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) {
+                let nested = match chosen.trim() {
+                    "else" => {
+                        let p = cursor.clone().with(CursorSegment::ElseBranch);
+                        find_last_completed_crate_stmt(&block.else_statements, &p, state_base)
+                    }
+                    s => s.parse::<usize>().ok().and_then(|n| {
+                        block.branches.get(n).and_then(|branch| {
+                            let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                            find_last_completed_crate_stmt(&branch.statements, &p, state_base)
+                        })
+                    }),
+                };
+                if nested.is_some() {
+                    return nested;
+                }
+            }
+        }
+        if is_crate_stmt_completed(stmt, &cursor, state_base) {
+            return Some(cursor);
+        }
+    }
+    None
+}
+
+/// Finds the cursor of the last completed workspace statement (searched in reverse).
+fn find_last_completed_workspace_stmt(
+    stmts: &[WorkspaceStatement],
+    prefix: &ProgramCursor,
+    member_crates: &[ResolvedCrateExecution],
+    state_base: &Path,
+) -> Option<ProgramCursor> {
+    for (i, stmt) in stmts.iter().enumerate().rev() {
+        let cursor = prefix.clone().with(CursorSegment::Statement(i));
+        match stmt {
+            WorkspaceStatement::If(block) => {
+                let state_dir = state_base.join(cursor.to_path());
+                if let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) {
+                    let nested = match chosen.trim() {
+                        "else" => {
+                            let p = cursor.clone().with(CursorSegment::ElseBranch);
+                            find_last_completed_workspace_stmt(
+                                &block.else_statements,
+                                &p,
+                                member_crates,
+                                state_base,
+                            )
+                        }
+                        s => s.parse::<usize>().ok().and_then(|n| {
+                            block.branches.get(n).and_then(|branch| {
+                                let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                                find_last_completed_workspace_stmt(
+                                    &branch.statements,
+                                    &p,
+                                    member_crates,
+                                    state_base,
+                                )
+                            })
+                        }),
+                    };
+                    if nested.is_some() {
+                        return nested;
+                    }
+                }
+            }
+            WorkspaceStatement::ForCrateInWorkspace(block) => {
+                for (c_idx, _) in member_crates.iter().enumerate().rev() {
+                    let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
+                    let nested =
+                        find_last_completed_crate_stmt(&block.statements, &c_prefix, state_base);
+                    if nested.is_some() {
+                        return nested;
+                    }
+                }
+            }
+            WorkspaceStatement::Run(_) | WorkspaceStatement::ManualStep(_) => {}
+        }
+        if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base) {
+            return Some(cursor);
+        }
+    }
+    None
+}
+
+// ── Command implementations ────────────────────────────────────────────────────
+
+/// Creates a new task by parsing and resolving the given `.cfe` program file.
+///
+/// # Errors
+///
+/// Returns an error if the program file cannot be read or parsed, if the
+/// configuration cannot be loaded, if the program cannot be resolved, if the
+/// task directory already exists or cannot be created, or if the task files
+/// cannot be written.
 #[instrument]
 pub async fn task_create_command(
     params: CreateTaskParameters,
     environment: crate::Environment,
 ) -> Result<(), Error> {
-    // 1. Validate plan and target-set existence.
-    let plan_file_path =
-        crate::plans::Plan::dir_path(&environment)?.join(format!("{}.toml", params.plan));
-    if !plan_file_path.exists() {
-        return Err(Error::PlanNotFound(params.plan));
+    if !params.program.exists() {
+        return Err(Error::ProgramNotFound(params.program.clone()));
     }
+    let source = fs_err::read_to_string(&params.program).map_err(Error::CouldNotReadProgramFile)?;
+    let program = crate::program::parser::parse(&source, &params.program.to_string_lossy())
+        .map_err(|errors| {
+            let msgs = errors
+                .iter()
+                .map(|e| e.as_str().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Error::ProgramParseErrors(msgs)
+        })?;
 
-    let target_set_file_path =
-        crate::target_sets::dir_path(&environment)?.join(format!("{}.toml", params.target_set));
-    if !target_set_file_path.exists() {
-        return Err(Error::TargetSetNotFound(params.target_set));
-    }
-
-    // 2. Load the Config
     let config = Config::load(&environment)?;
+    let resolved = crate::program::resolve::resolve_program(&program, &config)?;
 
-    // 3. Load the TargetSet.
-    let target_set = load_target_set(&params.target_set, &environment)?;
-
-    // 4. Resolve the TargetSet.
-    let resolved_target_set = crate::target_sets::resolve_target_set(&target_set, &config)?;
-
-    // 5. Create the task directory.
     let task_dir = named_dir_path(&params.name, &environment)?;
     if task_dir.exists() {
         return Err(Error::AlreadyExists(format!("task {}", params.name)));
@@ -233,767 +1317,393 @@ pub async fn task_create_command(
     fs_err::create_dir_all(&task_dir)
         .map_err(|e| Error::CouldNotCreateTaskDir(task_dir.clone(), e))?;
 
-    // 6. Copy plan and target-set files.
-    fs_err::copy(&plan_file_path, task_dir.join("plan.toml")).map_err(|e| {
-        Error::CouldNotCopyFile(plan_file_path.clone(), task_dir.join("plan.toml"), e)
+    fs_err::copy(&params.program, task_dir.join("program.cfe")).map_err(|e| {
+        Error::CouldNotCopyFile(params.program.clone(), task_dir.join("program.cfe"), e)
     })?;
 
-    fs_err::copy(&target_set_file_path, task_dir.join("target-set.toml")).map_err(|e| {
-        Error::CouldNotCopyFile(
-            target_set_file_path.clone(),
-            task_dir.join("target-set.toml"),
-            e,
-        )
-    })?;
-
-    // 7. Save the resolved target set to `resolved-target-set.toml`.
-    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
+    let resolved_path = task_dir.join("resolved-program.toml");
     fs_err::write(
-        &resolved_target_set_path,
-        toml::to_string(&resolved_target_set).map_err(Error::CouldNotSerializeResolvedTargetSet)?,
+        &resolved_path,
+        toml::to_string(&resolved).map_err(Error::CouldNotSerializeResolvedProgram)?,
     )
-    .map_err(Error::CouldNotWriteResolvedTargetSet)?;
+    .map_err(Error::CouldNotWriteResolvedProgram)?;
 
     Ok(())
 }
 
-/// Runs a single step.
+/// Finds and executes the next uncompleted statement in a task.
 ///
 /// # Errors
 ///
-/// Returns an error if the state directory cannot be determined or created, if a 'run command' step's command is not found or fails to execute, if the command's exit status cannot be written, if the shell's output cannot be flushed or input read during a 'manual step', if the manual step's confirmation cannot be written, or if the manual step is not confirmed by the user.
-#[instrument]
-#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
-pub async fn run_single_step(
-    step: &Step,
-    manifest_dir: &Path,
-    task_name: &str,
-    step_number: StepPosition,
-    target_number: usize,
-    environment: &Environment,
-    config: &Config,
-) -> Result<(), Error> {
-    let state_dir = environment
-        .state_dir
-        .join("cargo-for-each")
-        .join("tasks")
-        .join(task_name)
-        .join(target_number.to_string())
-        .join(step_number.to_string());
-
-    fs_err::create_dir_all(&state_dir)
-        .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
-
-    let cast_path = state_dir.join("asciinema.cast");
-
-    match step {
-        Step::RunCommand { command, args } => {
-            if !crate::utils::command_is_executable(command, environment) {
-                return Err(crate::error::Error::CommandNotFound(command.to_owned()));
-            }
-
-            let command_str = format!(
-                "{} {}",
-                command,
-                args.iter()
-                    .map(|arg| format!("\"{}\"", arg.replace('"', "\\\"")))
-                    .collect::<Vec<String>>()
-                    .join(" ")
-            );
-
-            // Write a wrapper script so the real exit code of the inner command
-            // is captured independently of asciinema's exit code.
-            // asciinema v3 in --headless mode always exits with code 0,
-            // so we cannot rely on asciinema's own exit code.
-            let wrapper_path = state_dir.join("run_wrapper.sh");
-            let exit_status_path = state_dir.join("exit_status");
-            let script = format!(
-                "#!/bin/sh\n{command_str}\nrc=$?\nprintf '%d' \"$rc\" > \"$CARGO_FOR_EACH_EXIT_STATUS_PATH\"\nexit \"$rc\"\n"
-            );
-            fs_err::write(&wrapper_path, &script)
-                .map_err(|e| Error::CouldNotWriteStateFile(wrapper_path.clone(), e))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                let perms = std::fs::Permissions::from_mode(0o755);
-                fs_err::set_permissions(&wrapper_path, perms).map_err(Error::IoError)?;
-            }
-
-            let mut cmd = Command::new("asciinema");
-            cmd.arg("record");
-            if environment.suppress_subprocess_output {
-                cmd.arg("--headless");
-            }
-            cmd.arg("-q")
-                .arg("-c")
-                .arg(wrapper_path.to_string_lossy().as_ref())
-                .arg(&cast_path);
-            cmd.env("CARGO_FOR_EACH_EXIT_STATUS_PATH", &exit_status_path);
-            cmd.current_dir(manifest_dir);
-
-            match crate::utils::execute_command(&mut cmd, environment, manifest_dir) {
-                Err(e) => {
-                    // asciinema failed to launch; write an empty exit_status so
-                    // get_step_status sees Failed rather than NotRun.
-                    fs_err::write(&exit_status_path, "")
-                        .map_err(|we| Error::CouldNotWriteStateFile(exit_status_path, we))?;
-                    return Err(e);
-                }
-                Ok(_output) => {
-                    // Read the real exit code written by the wrapper script.
-                    // If the file is missing or unparsable (wrapper crashed),
-                    // treat as failure (-1).
-                    let exit_code: i32 = fs_err::read_to_string(&exit_status_path)
-                        .ok()
-                        .as_deref()
-                        .map(str::trim)
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(-1);
-
-                    // Ensure exit_status is always written so get_step_status
-                    // never returns NotRun for a step that was executed.
-                    if !exit_status_path.exists() {
-                        fs_err::write(&exit_status_path, exit_code.to_string())
-                            .map_err(|e| Error::CouldNotWriteStateFile(exit_status_path, e))?;
-                    }
-
-                    if exit_code != 0 {
-                        return Err(Error::CommandFailed(
-                            command_str,
-                            manifest_dir.to_path_buf(),
-                            exit_code,
-                        ));
-                    }
-                }
-            }
-        }
-        Step::ManualStep {
-            title,
-            instructions,
-        } => {
-            println!("--- Manual Step: {title} ---");
-            println!("{instructions}");
-            println!(
-                "Starting a recording shell in {}. Press Ctrl+D or type `exit` to continue.",
-                manifest_dir.display()
-            );
-
-            let mut cmd = Command::new("asciinema");
-            cmd.arg("record");
-            if environment.suppress_subprocess_output {
-                cmd.arg("--headless");
-            }
-            cmd.arg("-q").arg(&cast_path);
-            cmd.current_dir(manifest_dir);
-
-            let status = crate::utils::execute_command(&mut cmd, environment, manifest_dir)?.status;
-
-            if !status.success() {
-                println!("Shell exited with a non-zero status code: {status}");
-            }
-
-            print!("Was the manual step completed successfully? (y/N) ");
-            io::stdout().flush().map_err(Error::IoError)?;
-            let mut confirmation = String::new();
-            io::stdin()
-                .read_line(&mut confirmation)
-                .map_err(Error::IoError)?;
-
-            let manual_step_confirmed_path = state_dir.join("manual_step_confirmed");
-            let confirmed = confirmation.trim().to_lowercase() == "y"
-                || confirmation.trim().to_lowercase() == "yes";
-
-            fs_err::write(
-                &manual_step_confirmed_path,
-                if confirmed { "y" } else { "n" },
-            )
-            .map_err(|e| Error::CouldNotWriteStateFile(manual_step_confirmed_path, e))?;
-
-            if !confirmed {
-                return Err(Error::ManualStepNotConfirmed);
-            }
-        }
-        Step::IfElseIf {
-            branches,
-            else_steps,
-        } => {
-            // state_dir already created above; evaluate each branch condition
-            let chosen_branch_path = state_dir.join("chosen_branch");
-
-            let mut chosen: Option<String> = None;
-            for (i, branch) in branches.iter().enumerate() {
-                let branch_num = i.saturating_add(1);
-                let result = branch
-                    .condition
-                    .evaluate(manifest_dir, environment, config)?;
-                crate::condition::Condition::save_result(
-                    result,
-                    &state_dir.join(format!("branch_{branch_num}_condition_result")),
-                )?;
-                if result && chosen.is_none() {
-                    chosen = Some(format!("{branch_num}"));
-                }
-            }
-
-            let chosen_str = chosen.unwrap_or_else(|| {
-                if else_steps.is_empty() {
-                    "none".to_string()
-                } else {
-                    "else".to_string()
-                }
-            });
-            fs_err::write(&chosen_branch_path, &chosen_str)
-                .map_err(|e| Error::CouldNotWriteStateFile(chosen_branch_path, e))?;
-        }
-    }
-    Ok(())
-}
-
-use std::collections::HashMap;
-
-use crate::plans::Plan;
-use crate::target_sets::ResolvedTargetSet;
-use crate::targets::Target;
-
-/// Represents the next uncompleted step in a task for a specific target.
-#[derive(Debug)]
-pub struct NextStep<'a> {
-    /// The step to be executed.
-    pub step: &'a Step,
-    /// The manifest directory of the target.
-    pub manifest_dir: &'a Path,
-    /// The name of the task.
-    pub task_name: &'a str,
-    /// The 1-based index of the step within the plan.
-    pub step_number: StepPosition,
-    /// The 0-based index of the target within the resolved target set.
-    pub target_number: usize,
-}
-
-/// The status of a step.
-#[derive(Debug, PartialEq, Eq)]
-pub enum StepStatus {
-    /// The step has been completed successfully.
-    Completed,
-    /// The step failed.
-    Failed,
-    /// The step has not yet been run.
-    NotRun,
-}
-
-/// Determines the status of a given step for a specific target in a task.
-fn get_step_status(
-    task_name: &str,
-    target_number: usize,
-    step_number: StepPosition,
-    step: &Step,
-    environment: &Environment,
-) -> StepStatus {
-    let state_dir = environment
-        .state_dir
-        .join("cargo-for-each")
-        .join("tasks")
-        .join(task_name)
-        .join(target_number.to_string())
-        .join(step_number.to_string());
-
-    if !state_dir.exists() {
-        return StepStatus::NotRun;
-    }
-
-    match step {
-        Step::RunCommand { .. } => {
-            let exit_status_path = state_dir.join("exit_status");
-            if let Ok(content) = fs_err::read_to_string(exit_status_path) {
-                if content.trim() == "0" {
-                    StepStatus::Completed
-                } else {
-                    StepStatus::Failed
-                }
-            } else {
-                StepStatus::NotRun
-            }
-        }
-        Step::ManualStep { .. } => {
-            let manual_step_confirmed_path = state_dir.join("manual_step_confirmed");
-            if let Ok(content) = fs_err::read_to_string(manual_step_confirmed_path) {
-                if content.trim() == "y" {
-                    StepStatus::Completed
-                } else {
-                    StepStatus::Failed
-                }
-            } else {
-                StepStatus::NotRun
-            }
-        }
-        Step::IfElseIf {
-            branches,
-            else_steps,
-        } => {
-            let chosen_branch_path = state_dir.join("chosen_branch");
-            let Ok(chosen) = fs_err::read_to_string(&chosen_branch_path) else {
-                return StepStatus::NotRun;
-            };
-            let nested_steps: &[Step] = match chosen.trim() {
-                "none" => &[],
-                "else" => else_steps,
-                n => {
-                    let parsed = n
-                        .parse::<usize>()
-                        .ok()
-                        .filter(|&i| i >= 1 && i <= branches.len());
-                    match parsed.and_then(|i| i.checked_sub(1).and_then(|idx| branches.get(idx))) {
-                        Some(b) => &b.steps,
-                        None => return StepStatus::Failed,
-                    }
-                }
-            };
-            let all_done = nested_steps.iter().enumerate().all(|(i, s)| {
-                step_number.child_from_index(i).is_some_and(|pos| {
-                    is_step_completed(task_name, target_number, pos, s, environment)
-                })
-            });
-            if all_done {
-                StepStatus::Completed
-            } else {
-                StepStatus::NotRun
-            }
-        }
-    }
-}
-
-/// Checks if a given step for a specific target in a task has been completed.
-fn is_step_completed(
-    task_name: &str,
-    target_number: usize,
-    step_number: StepPosition,
-    step: &Step,
-    environment: &Environment,
-) -> bool {
-    matches!(
-        get_step_status(task_name, target_number, step_number, step, environment),
-        StepStatus::Completed
-    )
-}
-
-/// Checks if a given target has completed all steps in a plan.
-fn is_target_completed(
-    task_name: &str,
-    target_idx: usize,
-    plan: &Plan,
-    environment: &Environment,
-) -> bool {
-    plan.steps.iter().enumerate().all(|(step_idx, step)| {
-        if let Some(step_number) = StepPosition::from_step_index(step_idx) {
-            is_step_completed(task_name, target_idx, step_number, step, environment)
-        } else {
-            false // impossible: step_idx overflow
-        }
-    })
-}
-
-/// Checks if all dependencies of a given target have completed all steps in a plan.
-fn are_target_dependencies_completed(
-    task_name: &str,
-    target: &Target,
-    plan: &Plan,
-    target_map: &HashMap<PathBuf, usize>,
-    environment: &Environment,
-) -> bool {
-    target.dependencies.iter().all(|dep_path| {
-        if let Some(&dep_target_idx) = target_map.get(dep_path) {
-            is_target_completed(task_name, dep_target_idx, plan, environment)
-        } else {
-            // This case should ideally not happen if the resolved_target_set is consistent.
-            // Assuming that if a dependency isn't in the target map, it's not part of the
-            // current task, so we don't need to check its status.
-            true
-        }
-    })
-}
-
-/// Finds the next incomplete step within a slice of steps, supporting nested `IfElseIf` steps.
-///
-/// `make_pos` maps a 0-based index into the slice to a `StepPosition`.
-/// Returns the position and reference of the first incomplete step, or `None` if all are done.
-fn find_next_in_steps<'a>(
-    steps: &'a [Step],
-    make_pos: &dyn Fn(usize) -> Option<StepPosition>,
-    task_name: &str,
-    target_idx: usize,
-    environment: &Environment,
-) -> Option<(StepPosition, &'a Step)> {
-    for (i, step) in steps.iter().enumerate() {
-        let Some(pos) = make_pos(i) else { continue };
-        match step {
-            Step::RunCommand { .. } | Step::ManualStep { .. } => {
-                if !is_step_completed(task_name, target_idx, pos.clone(), step, environment) {
-                    return Some((pos, step));
-                }
-            }
-            Step::IfElseIf {
-                branches,
-                else_steps,
-            } => {
-                let state_dir = environment
-                    .state_dir
-                    .join("cargo-for-each")
-                    .join("tasks")
-                    .join(task_name)
-                    .join(target_idx.to_string())
-                    .join(pos.to_string());
-                let chosen_branch_path = state_dir.join("chosen_branch");
-                let Ok(chosen) = fs_err::read_to_string(&chosen_branch_path) else {
-                    // Not yet evaluated — return this IfElseIf step for condition evaluation.
-                    return Some((pos, step));
-                };
-                let nested_steps: &[Step] = match chosen.trim() {
-                    "none" => continue, // trivially done, no nested steps
-                    "else" => else_steps,
-                    n => {
-                        let parsed = n
-                            .parse::<usize>()
-                            .ok()
-                            .filter(|&idx| idx >= 1 && idx <= branches.len());
-                        match parsed
-                            .and_then(|idx| idx.checked_sub(1).and_then(|i| branches.get(i)))
-                        {
-                            Some(b) => &b.steps,
-                            None => continue, // invalid value, treat as done
-                        }
-                    }
-                };
-                let parent_pos = pos.clone();
-                if let Some(result) = find_next_in_steps(
-                    nested_steps,
-                    &|nested_i| parent_pos.child_from_index(nested_i),
-                    task_name,
-                    target_idx,
-                    environment,
-                ) {
-                    return Some(result);
-                }
-                // All nested steps done; continue to the next top-level step.
-            }
-        }
-    }
-    None
-}
-
-#[must_use]
-/// Determines the first step that has not already been completed successfully
-/// in the first target that has such a step and whose dependencies are all completed.
-///
-/// Returns the values required to call the `run_single_step()` utility function on it.
-pub fn find_next_step<'a>(
-    task_name: &'a str,
-    plan: &'a Plan,
-    resolved_target_set: &'a ResolvedTargetSet,
-    environment: &Environment,
-) -> Option<NextStep<'a>> {
-    let target_map: HashMap<PathBuf, usize> = resolved_target_set
-        .targets
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (t.manifest_dir.clone(), i))
-        .collect();
-
-    for (target_idx, target) in resolved_target_set.targets.iter().enumerate() {
-        if are_target_dependencies_completed(task_name, target, plan, &target_map, environment)
-            && let Some((step_number, step)) = find_next_in_steps(
-                &plan.steps,
-                &StepPosition::from_step_index,
-                task_name,
-                target_idx,
-                environment,
-            )
-        {
-            return Some(NextStep {
-                step,
-                manifest_dir: &target.manifest_dir,
-                task_name,
-                step_number,
-                target_number: target_idx,
-            });
-        }
-    }
-    None
-}
-
-/// implementation of the task run single-step subcommand
-///
-/// # Errors
-///
-/// This command can fail if the task directory cannot be determined, if the plan or resolved target set files cannot be read or parsed, or if an individual step fails during execution.
+/// Returns an error if the task cannot be loaded or if the statement fails.
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
 pub async fn run_single_step_command(
     params: RunSingleStepParameters,
     environment: crate::Environment,
 ) -> Result<(), Error> {
-    let task_dir = named_dir_path(&params.name, &environment)?;
-
-    let plan_path = task_dir.join("plan.toml");
-    let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
-    let plan: Plan = toml::from_str(&plan_content).map_err(Error::CouldNotParsePlanFile)?;
-
-    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
-    let resolved_target_set_content = fs_err::read_to_string(&resolved_target_set_path)
-        .map_err(|e| Error::CouldNotReadResolvedTargetSet(resolved_target_set_path.clone(), e))?;
-    let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
-        .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
-
+    let (program, resolved) = load_task_data(&params.name, &environment)?;
     let config = Config::load(&environment)?;
+    let state_base = state_dir_for_task(&params.name, &environment)?;
 
-    if let Some(next_step) = find_next_step(&params.name, &plan, &resolved_target_set, &environment)
-    {
+    if let Some(next) = find_next_statement(&program, &resolved, &state_base) {
         println!(
-            "Running step {} for target {}",
-            next_step.step_number,
-            next_step.manifest_dir.display()
+            "Running statement at {} for {}",
+            next.cursor,
+            next.manifest_dir.display()
         );
-        run_single_step(
-            next_step.step,
-            next_step.manifest_dir,
-            next_step.task_name,
-            next_step.step_number,
-            next_step.target_number,
-            &environment,
-            &config,
-        )
-        .await
+        match next.action {
+            StatementAction::RunCommand(step) => {
+                execute_run_step(
+                    step,
+                    &next.cursor,
+                    next.manifest_dir,
+                    &state_base,
+                    &environment,
+                )
+                .await?;
+            }
+            StatementAction::ManualStep(step) => {
+                execute_manual_step(
+                    step,
+                    &next.cursor,
+                    next.manifest_dir,
+                    &state_base,
+                    &environment,
+                )
+                .await?;
+            }
+            StatementAction::EvaluateWorkspaceIf(block) => {
+                evaluate_workspace_if_block(
+                    block,
+                    &next.cursor,
+                    next.manifest_dir,
+                    &state_base,
+                    &environment,
+                    &config,
+                )?;
+            }
+            StatementAction::EvaluateCrateIf(block) => {
+                evaluate_crate_if_block(
+                    block,
+                    &next.cursor,
+                    next.manifest_dir,
+                    &state_base,
+                    &environment,
+                    &config,
+                )?;
+            }
+        }
     } else {
-        println!("All steps for all targets completed successfully.");
-        Ok(())
+        println!("All statements for all targets completed successfully.");
     }
+    Ok(())
 }
 
-/// implementation of the task run single-target subcommand
+/// Runs all remaining statements for the first ready workspace or standalone crate.
 ///
 /// # Errors
 ///
-/// This command can fail if the task directory cannot be determined, if the plan or resolved target set files cannot be read or parsed, or if any of the individual steps for the selected target fail during execution.
+/// Returns an error if the task cannot be loaded or if any statement fails.
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
 pub async fn run_single_target_command(
     params: RunSingleTargetParameters,
     environment: crate::Environment,
 ) -> Result<(), Error> {
-    let task_dir = named_dir_path(&params.name, &environment)?;
-
-    let plan_path = task_dir.join("plan.toml");
-    let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
-    let plan: Plan = toml::from_str(&plan_content).map_err(Error::CouldNotParsePlanFile)?;
-
-    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
-    let resolved_target_set_content = fs_err::read_to_string(&resolved_target_set_path)
-        .map_err(|e| Error::CouldNotReadResolvedTargetSet(resolved_target_set_path.clone(), e))?;
-    let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
-        .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
-
+    let (program, resolved) = load_task_data(&params.name, &environment)?;
     let config = Config::load(&environment)?;
+    let state_base = state_dir_for_task(&params.name, &environment)?;
 
-    let target_map: HashMap<PathBuf, usize> = resolved_target_set
-        .targets
+    let ws_stmts = first_workspace_stmts(&program);
+    let ws_map: HashMap<PathBuf, usize> = resolved
+        .workspace_executions
         .iter()
         .enumerate()
-        .map(|(i, t)| (t.manifest_dir.clone(), i))
+        .map(|(i, w)| (w.manifest_dir.clone(), i))
         .collect();
 
-    // Find the first target with at least one incomplete step whose dependencies are met.
-    let Some((target_idx, target)) =
-        resolved_target_set
-            .targets
-            .iter()
-            .enumerate()
-            .find(|(target_idx, target)| {
-                !is_target_completed(&params.name, *target_idx, &plan, &environment)
-                    && are_target_dependencies_completed(
-                        &params.name,
-                        target,
-                        &plan,
-                        &target_map,
-                        &environment,
-                    )
-            })
-    else {
-        println!(
-            "All steps for all targets completed successfully or no targets are ready to be processed."
-        );
-        return Ok(());
-    };
-
-    println!(
-        "Found ready target with incomplete steps: {}, running all remaining steps for it.",
-        target.manifest_dir.display()
-    );
-
-    for (step_idx, step) in plan.steps.iter().enumerate() {
-        let Some(step_number) = StepPosition::from_step_index(step_idx) else {
+    for (ws_idx, ws_exec) in resolved.workspace_executions.iter().enumerate() {
+        if !are_workspace_deps_completed(ws_exec, &ws_map, ws_stmts, &resolved, &state_base) {
             continue;
-        };
-        if !is_step_completed(
-            &params.name,
-            target_idx,
-            step_number.clone(),
-            step,
-            &environment,
-        ) {
-            run_single_step(
-                step,
-                &target.manifest_dir,
-                &params.name,
-                step_number,
-                target_idx,
-                &environment,
-                &config,
-            )
-            .await?;
         }
+        if is_workspace_completed(ws_idx, ws_exec, ws_stmts, &state_base) {
+            continue;
+        }
+        println!(
+            "Running all statements for workspace {}.",
+            ws_exec.manifest_dir.display()
+        );
+        let prefix = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
+        run_workspace_stmts_to_completion(
+            ws_stmts,
+            &prefix,
+            &ws_exec.manifest_dir,
+            &ws_exec.member_crates,
+            &state_base,
+            &environment,
+            &config,
+        )
+        .await?;
+        return Ok(());
     }
 
+    let crate_stmts = first_crate_stmts(&program);
+    let crate_map: HashMap<PathBuf, usize> = resolved
+        .crate_executions
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.manifest_dir.clone(), i))
+        .collect();
+
+    for (c_idx, crate_exec) in resolved.crate_executions.iter().enumerate() {
+        if !are_standalone_crate_deps_completed(crate_exec, &crate_map, crate_stmts, &state_base) {
+            continue;
+        }
+        if is_standalone_crate_completed(c_idx, crate_stmts, &state_base) {
+            continue;
+        }
+        println!(
+            "Running all statements for crate {}.",
+            crate_exec.manifest_dir.display()
+        );
+        let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
+        run_crate_stmts_to_completion(
+            crate_stmts,
+            &prefix,
+            &crate_exec.manifest_dir,
+            &state_base,
+            &environment,
+            &config,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    println!("All targets are either completed or waiting for dependencies.");
     Ok(())
 }
 
-/// implementation of the task run all-targets subcommand
+/// Runs all targets in dependency order with optional parallelism.
+///
+/// Workspaces are executed first (in dependency order), followed by standalone
+/// crates.
 ///
 /// # Errors
 ///
-/// This command can fail if the task directory cannot be determined, if the plan or resolved target set files cannot be read or parsed, if any individual step fails during execution (unless 'keep_going' is enabled), if a circular dependency is detected between targets, or if 'keep_going' is enabled and some steps failed.
+/// Returns an error if the task cannot be loaded, if a statement fails (unless
+/// `keep_going` is set), if some steps failed with `keep_going`, or if a
+/// circular dependency is detected.
 #[instrument]
 pub async fn run_all_targets_command(
     params: RunAllTargetsParameters,
     environment: crate::Environment,
 ) -> Result<(), Error> {
-    let task_dir = named_dir_path(&params.name, &environment)?;
-
-    let plan_path = task_dir.join("plan.toml");
-    let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
-    let plan: Plan = toml::from_str(&plan_content).map_err(Error::CouldNotParsePlanFile)?;
-
-    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
-    let resolved_target_set_content = fs_err::read_to_string(&resolved_target_set_path)
-        .map_err(|e| Error::CouldNotReadResolvedTargetSet(resolved_target_set_path.clone(), e))?;
-    let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
-        .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
-
+    let (program, resolved) = load_task_data(&params.name, &environment)?;
     let config = Arc::new(Config::load(&environment)?);
+    let state_base = Arc::new(state_dir_for_task(&params.name, &environment)?);
+    let keep_going = params.keep_going;
     let jobs = params.jobs.unwrap_or(1);
-    let plan = Arc::new(plan);
-    let resolved_target_set = Arc::new(resolved_target_set);
+    let resolved = Arc::new(resolved);
 
-    let target_map: Arc<HashMap<PathBuf, usize>> = Arc::new(
-        resolved_target_set
-            .targets
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.manifest_dir.clone(), i))
-            .collect(),
-    );
+    let ws_stmts: Arc<Vec<WorkspaceStatement>> = Arc::new(first_workspace_stmts(&program).to_vec());
+    let crate_stmts: Arc<Vec<CrateStatement>> = Arc::new(first_crate_stmts(&program).to_vec());
 
-    let mut completed_targets = vec![false; resolved_target_set.targets.len()];
-    let mut failed_targets = vec![false; resolved_target_set.targets.len()];
-    let mut has_errors = false;
+    // Phase 1: workspaces
+    {
+        let n = resolved.workspace_executions.len();
+        let mut completed = vec![false; n];
+        let mut failed = vec![false; n];
+        let mut has_errors = false;
 
-    loop {
-        let ready_targets: Vec<_> = resolved_target_set
-            .targets
-            .iter()
-            .enumerate()
-            .filter(|(target_idx, target)| {
-                completed_targets.get(*target_idx).is_none_or(|&c| !c)
-                    && !failed_targets.get(*target_idx).is_some_and(|&f| f)
-                    && are_target_dependencies_completed(
-                        &params.name,
-                        target,
-                        &plan,
-                        &target_map,
-                        &environment,
+        loop {
+            let ws_map: HashMap<PathBuf, usize> = resolved
+                .workspace_executions
+                .iter()
+                .enumerate()
+                .map(|(i, w)| (w.manifest_dir.clone(), i))
+                .collect();
+
+            let ready: Vec<(usize, PathBuf, Vec<ResolvedCrateExecution>)> = resolved
+                .workspace_executions
+                .iter()
+                .enumerate()
+                .filter(|(idx, ws_exec)| {
+                    !completed.get(*idx).copied().unwrap_or(false)
+                        && !failed.get(*idx).copied().unwrap_or(false)
+                        && ws_exec.dependencies.iter().all(|dep| {
+                            ws_map.get(dep).is_none_or(|&dep_idx| {
+                                completed.get(dep_idx).copied().unwrap_or(false)
+                            })
+                        })
+                })
+                .map(|(idx, ws_exec)| {
+                    (
+                        idx,
+                        ws_exec.manifest_dir.clone(),
+                        ws_exec.member_crates.clone(),
                     )
-            })
-            .collect();
+                })
+                .collect();
 
-        if ready_targets.is_empty() {
-            break;
-        }
+            if ready.is_empty() {
+                break;
+            }
 
-        let batch_results = stream::iter(ready_targets)
-            .map(|(target_idx, target)| {
-                let plan = Arc::clone(&plan);
-                let params = params.clone();
-                let config = Arc::clone(&config);
-                {
+            let results: Vec<(usize, Result<(), Error>)> = stream::iter(ready)
+                .map(|(ws_idx, manifest_dir, member_crates)| {
+                    let ws_stmts = Arc::clone(&ws_stmts);
+                    let config = Arc::clone(&config);
+                    let state_base = Arc::clone(&state_base);
                     let environment = environment.clone();
                     async move {
-                        for (step_idx, step) in plan.steps.iter().enumerate() {
-                            let Some(step_number) = StepPosition::from_step_index(step_idx) else {
-                                continue;
-                            };
-                            if !is_step_completed(
-                                &params.name,
-                                target_idx,
-                                step_number.clone(),
-                                step,
-                                &environment,
-                            ) && let Err(e) = run_single_step(
-                                step,
-                                &target.manifest_dir,
-                                &params.name,
-                                step_number,
-                                target_idx,
-                                &environment,
-                                &config,
-                            )
-                            .await
-                            {
-                                return (target_idx, Err(e));
+                        let prefix =
+                            ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
+                        let result = run_workspace_stmts_to_completion(
+                            &ws_stmts,
+                            &prefix,
+                            &manifest_dir,
+                            &member_crates,
+                            &state_base,
+                            &environment,
+                            &config,
+                        )
+                        .await;
+                        (ws_idx, result)
+                    }
+                })
+                .buffer_unordered(jobs)
+                .collect()
+                .await;
+
+            for (idx, result) in results {
+                match result {
+                    Ok(()) => {
+                        if let Some(slot) = completed.get_mut(idx) {
+                            *slot = true;
+                        }
+                    }
+                    Err(e) => {
+                        if keep_going {
+                            tracing::error!("Workspace failed: {}", e);
+                            if let Some(slot) = failed.get_mut(idx) {
+                                *slot = true;
                             }
+                            has_errors = true;
+                        } else {
+                            return Err(e);
                         }
-                        (target_idx, Ok(()))
-                    }
-                }
-            })
-            .buffer_unordered(jobs)
-            .collect::<Vec<(usize, Result<(), Error>)>>()
-            .await;
-        for (target_idx, result) in batch_results {
-            match result {
-                Ok(()) => {
-                    if let Some(c) = completed_targets.get_mut(target_idx) {
-                        *c = true;
-                    }
-                }
-                Err(e) => {
-                    if params.keep_going {
-                        tracing::error!("A step failed: {}", e);
-                        if let Some(f) = failed_targets.get_mut(target_idx) {
-                            *f = true;
-                        }
-                        has_errors = true;
-                    } else {
-                        return Err(e);
                     }
                 }
             }
         }
+
+        if has_errors {
+            return Err(Error::SomeStepsFailed);
+        }
+        if !completed.iter().all(|&c| c) {
+            return Err(Error::CircularDependency);
+        }
     }
 
-    if has_errors {
-        return Err(Error::SomeStepsFailed);
-    }
+    // Phase 2: standalone crates
+    {
+        let n = resolved.crate_executions.len();
+        let mut completed = vec![false; n];
+        let mut failed = vec![false; n];
+        let mut has_errors = false;
 
-    if !completed_targets.iter().all(|&c| c) {
-        return Err(Error::CircularDependency);
+        loop {
+            let crate_map: HashMap<PathBuf, usize> = resolved
+                .crate_executions
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.manifest_dir.clone(), i))
+                .collect();
+
+            let ready: Vec<(usize, PathBuf)> = resolved
+                .crate_executions
+                .iter()
+                .enumerate()
+                .filter(|(idx, crate_exec)| {
+                    !completed.get(*idx).copied().unwrap_or(false)
+                        && !failed.get(*idx).copied().unwrap_or(false)
+                        && crate_exec.dependencies.iter().all(|dep| {
+                            crate_map.get(dep).is_none_or(|&dep_idx| {
+                                completed.get(dep_idx).copied().unwrap_or(false)
+                            })
+                        })
+                })
+                .map(|(idx, crate_exec)| (idx, crate_exec.manifest_dir.clone()))
+                .collect();
+
+            if ready.is_empty() {
+                break;
+            }
+
+            let results: Vec<(usize, Result<(), Error>)> = stream::iter(ready)
+                .map(|(c_idx, manifest_dir)| {
+                    let crate_stmts = Arc::clone(&crate_stmts);
+                    let config = Arc::clone(&config);
+                    let state_base = Arc::clone(&state_base);
+                    let environment = environment.clone();
+                    async move {
+                        let prefix =
+                            ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
+                        let result = run_crate_stmts_to_completion(
+                            &crate_stmts,
+                            &prefix,
+                            &manifest_dir,
+                            &state_base,
+                            &environment,
+                            &config,
+                        )
+                        .await;
+                        (c_idx, result)
+                    }
+                })
+                .buffer_unordered(jobs)
+                .collect()
+                .await;
+
+            for (idx, result) in results {
+                match result {
+                    Ok(()) => {
+                        if let Some(slot) = completed.get_mut(idx) {
+                            *slot = true;
+                        }
+                    }
+                    Err(e) => {
+                        if keep_going {
+                            tracing::error!("Crate execution failed: {}", e);
+                            if let Some(slot) = failed.get_mut(idx) {
+                                *slot = true;
+                            }
+                            has_errors = true;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_errors {
+            return Err(Error::SomeStepsFailed);
+        }
+        if !completed.iter().all(|&c| c) {
+            return Err(Error::CircularDependency);
+        }
     }
 
     Ok(())
 }
 
-/// implementation of the task run subcommand
+/// Dispatches the `task run` subcommand.
 ///
 /// # Errors
 ///
-/// This command can fail due to errors in its subcommands (run single step, run single target, run all targets).
+/// Propagates errors from the chosen subcommand.
 #[instrument]
 pub async fn task_run_command(
     params: TaskRunParameters,
@@ -1006,11 +1716,13 @@ pub async fn task_run_command(
     }
 }
 
-/// implementation of the task rewind all-targets subcommand
+// ── Rewind commands ────────────────────────────────────────────────────────────
+
+/// Removes all execution state for a task.
 ///
 /// # Errors
 ///
-/// This command can fail if the task's state directory cannot be determined, or if the directory cannot be removed.
+/// Returns an error if the state directory cannot be removed.
 #[instrument]
 pub async fn rewind_all_targets_command(
     params: RewindAllTargetsParameters,
@@ -1020,89 +1732,77 @@ pub async fn rewind_all_targets_command(
     if state_dir.exists() {
         fs_err::remove_dir_all(&state_dir)
             .map_err(|e| Error::CouldNotRemoveTaskStateDir(state_dir.clone(), e))?;
-        tracing::info!("Removed state for task '{}' for all targets.", params.name);
+        tracing::info!("Removed all state for task '{}'.", params.name);
     } else {
         tracing::info!(
-            "No state found for task '{}' for all targets, nothing to rewind.",
+            "No state found for task '{}', nothing to rewind.",
             params.name
         );
     }
     Ok(())
 }
 
-/// implementation of the task rewind single-target subcommand
+/// Removes the state for the last completed workspace or standalone crate.
+///
+/// Standalone crates are checked first (they execute after workspaces).
 ///
 /// # Errors
 ///
-/// This command can fail if the task directory cannot be determined, if the resolved target set file cannot be read or parsed, if the state directory for a target cannot be removed.
+/// Returns an error if the task cannot be loaded or if the state cannot be removed.
 #[instrument]
 pub async fn rewind_single_target_command(
     params: RewindSingleTargetParameters,
     environment: crate::Environment,
 ) -> Result<(), Error> {
-    let task_dir = named_dir_path(&params.name, &environment)?;
-    if !task_dir.exists() {
-        return Err(Error::TaskNotFound(params.name));
-    }
+    let (program, resolved) = load_task_data(&params.name, &environment)?;
+    let state_base = state_dir_for_task(&params.name, &environment)?;
 
-    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
-    let resolved_target_set_content = fs_err::read_to_string(&resolved_target_set_path)
-        .map_err(|e| Error::CouldNotReadResolvedTargetSet(resolved_target_set_path.clone(), e))?;
-    let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
-        .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
+    let ws_stmts = first_workspace_stmts(&program);
+    let crate_stmts = first_crate_stmts(&program);
 
-    let plan_path = task_dir.join("plan.toml");
-    let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
-    let plan: Plan = toml::from_str(&plan_content).map_err(Error::CouldNotParsePlanFile)?;
-
-    // Find the last completed target to rewind.
-    // We iterate in reverse to find the "most recently completed" target.
-    if let Some((target_idx, target)) = resolved_target_set
-        .targets
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(target_idx, _)| is_target_completed(&params.name, *target_idx, &plan, &environment))
-    {
-        let target_state_dir = environment
-            .state_dir
-            .join("cargo-for-each")
-            .join("tasks")
-            .join(&params.name)
-            .join(target_idx.to_string());
-
-        if target_state_dir.exists() {
-            fs_err::remove_dir_all(&target_state_dir)
-                .map_err(|e| Error::CouldNotRemoveTaskStateDir(target_state_dir.clone(), e))?;
+    // Standalone crates execute last — search them in reverse first.
+    for (c_idx, _) in resolved.crate_executions.iter().enumerate().rev() {
+        if is_standalone_crate_completed(c_idx, crate_stmts, &state_base) {
+            let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
+            let target_state_dir = state_base.join(prefix.to_path());
+            if target_state_dir.exists() {
+                fs_err::remove_dir_all(&target_state_dir)
+                    .map_err(|e| Error::CouldNotRemoveTaskStateDir(target_state_dir.clone(), e))?;
+            }
             tracing::info!(
-                "Removed state for target '{}' (index {}) in task '{}'.",
-                target.manifest_dir.display(),
-                target_idx,
+                "Rewound standalone crate {} in task '{}'.",
+                c_idx,
                 params.name
             );
-        } else {
-            tracing::info!(
-                "No state found for target '{}' (index {}) in task '{}', nothing to rewind.",
-                target.manifest_dir.display(),
-                target_idx,
-                params.name
-            );
+            return Ok(());
         }
-    } else {
-        tracing::info!(
-            "No completed targets found for task '{}', nothing to rewind.",
-            params.name
-        );
     }
 
+    for (ws_idx, ws_exec) in resolved.workspace_executions.iter().enumerate().rev() {
+        if is_workspace_completed(ws_idx, ws_exec, ws_stmts, &state_base) {
+            let prefix = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
+            let target_state_dir = state_base.join(prefix.to_path());
+            if target_state_dir.exists() {
+                fs_err::remove_dir_all(&target_state_dir)
+                    .map_err(|e| Error::CouldNotRemoveTaskStateDir(target_state_dir.clone(), e))?;
+            }
+            tracing::info!("Rewound workspace {} in task '{}'.", ws_idx, params.name);
+            return Ok(());
+        }
+    }
+
+    tracing::info!(
+        "No completed targets found for task '{}', nothing to rewind.",
+        params.name
+    );
     Ok(())
 }
 
-/// implementation of the task rewind single-step subcommand
+/// Removes the state directory for the last completed statement in a task.
 ///
 /// # Errors
 ///
-/// This command can fail if the task directory cannot be determined, if the plan or resolved target set files cannot be read or parsed, or if the state directory for a step cannot be removed.
+/// Returns an error if the task cannot be loaded or if the state cannot be removed.
 #[instrument]
 pub async fn rewind_single_step_command(
     params: RewindSingleStepParameters,
@@ -1112,84 +1812,56 @@ pub async fn rewind_single_step_command(
     if !task_dir.exists() {
         return Err(Error::TaskNotFound(params.name));
     }
+    let (program, resolved) = load_task_data(&params.name, &environment)?;
+    let state_base = state_dir_for_task(&params.name, &environment)?;
 
-    let plan_path = task_dir.join("plan.toml");
-    let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
-    let plan: Plan = toml::from_str(&plan_content).map_err(Error::CouldNotParsePlanFile)?;
+    let crate_stmts = first_crate_stmts(&program);
+    let ws_stmts = first_workspace_stmts(&program);
 
-    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
-    let resolved_target_set_content = fs_err::read_to_string(&resolved_target_set_path)
-        .map_err(|e| Error::CouldNotReadResolvedTargetSet(resolved_target_set_path.clone(), e))?;
-    let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
-        .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
-
-    // We need to find the "last" completed step. This is the last step within the last target
-    // that has any completed steps. Or, more precisely, the step with the highest step_number
-    // within the target with the highest target_number, that is completed.
-    let mut last_completed_step_info: Option<(usize, StepPosition)> = None; // (target_idx, step_number)
-
-    for (target_idx, _target) in resolved_target_set.targets.iter().enumerate().rev() {
-        for (step_idx, _step) in plan.steps.iter().enumerate().rev() {
-            let Some(step_number) = StepPosition::from_step_index(step_idx) else {
-                continue;
-            };
-            if is_step_completed(
-                &params.name,
-                target_idx,
-                step_number.clone(),
-                _step,
-                &environment,
-            ) {
-                last_completed_step_info = Some((target_idx, step_number));
-                break; // Found the last completed step for this target, move to next target
+    // Standalone crates execute last — search in reverse first.
+    for (c_idx, _) in resolved.crate_executions.iter().enumerate().rev() {
+        let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
+        if let Some(cursor) = find_last_completed_crate_stmt(crate_stmts, &prefix, &state_base) {
+            let step_state_dir = state_base.join(cursor.to_path());
+            if step_state_dir.exists() {
+                fs_err::remove_dir_all(&step_state_dir)
+                    .map_err(|e| Error::CouldNotRemoveTaskStateDir(step_state_dir.clone(), e))?;
             }
-        }
-        if last_completed_step_info.is_some() {
-            break; // Found the last completed step overall, stop searching
+            tracing::info!("Rewound statement {} in task '{}'.", cursor, params.name);
+            return Ok(());
         }
     }
 
-    if let Some((target_idx, step_number)) = last_completed_step_info {
-        let step_state_dir = environment
-            .state_dir
-            .join("cargo-for-each")
-            .join("tasks")
-            .join(&params.name)
-            .join(target_idx.to_string())
-            .join(step_number.to_string());
-
-        if step_state_dir.exists() {
-            fs_err::remove_dir_all(&step_state_dir)
-                .map_err(|e| Error::CouldNotRemoveTaskStateDir(step_state_dir.clone(), e))?;
-            tracing::info!(
-                "Removed state for step {} of target index {} in task '{}'.",
-                step_number,
-                target_idx,
-                params.name
-            );
-        } else {
-            tracing::info!(
-                "No state found for step {} of target index {} in task '{}', nothing to rewind.",
-                step_number,
-                target_idx,
-                params.name
-            );
+    for (ws_idx, ws_exec) in resolved.workspace_executions.iter().enumerate().rev() {
+        let prefix = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
+        if let Some(cursor) = find_last_completed_workspace_stmt(
+            ws_stmts,
+            &prefix,
+            &ws_exec.member_crates,
+            &state_base,
+        ) {
+            let step_state_dir = state_base.join(cursor.to_path());
+            if step_state_dir.exists() {
+                fs_err::remove_dir_all(&step_state_dir)
+                    .map_err(|e| Error::CouldNotRemoveTaskStateDir(step_state_dir.clone(), e))?;
+            }
+            tracing::info!("Rewound statement {} in task '{}'.", cursor, params.name);
+            return Ok(());
         }
-    } else {
-        tracing::info!(
-            "No completed steps found for task '{}', nothing to rewind.",
-            params.name
-        );
     }
 
+    tracing::info!(
+        "No completed statements found for task '{}', nothing to rewind.",
+        params.name
+    );
     Ok(())
 }
 
-/// implementation of the task rewind subcommand
+/// Dispatches the `task rewind` subcommand.
 ///
 /// # Errors
 ///
-/// This command can fail due to errors in its subcommands (rewind single step, rewind single target, rewind all targets).
+/// Propagates errors from the chosen subcommand.
 #[instrument]
 pub async fn task_rewind_command(
     params: TaskRewindParameters,
@@ -1202,67 +1874,52 @@ pub async fn task_rewind_command(
     }
 }
 
-/// implementation of the task describe subcommand
+// ── Describe and list commands ─────────────────────────────────────────────────
+
+/// Displays the current execution status of every target in a task.
 ///
 /// # Errors
 ///
-/// This command can fail if the task directory cannot be determined, if the plan or resolved target set files cannot be read or parsed.
+/// Returns an error if the task cannot be loaded.
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
 pub async fn task_describe_command(
     params: DescribeTaskParameters,
     environment: crate::Environment,
 ) -> Result<(), Error> {
-    let task_dir = named_dir_path(&params.name, &environment)?;
-    if !task_dir.exists() {
-        return Err(Error::TaskNotFound(params.name));
-    }
-
-    let plan_path = task_dir.join("plan.toml");
-    let plan_content = fs_err::read_to_string(plan_path).map_err(Error::CouldNotReadPlanFile)?;
-    let plan: Plan = toml::from_str(&plan_content).map_err(Error::CouldNotParsePlanFile)?;
-
-    let resolved_target_set_path = task_dir.join("resolved-target-set.toml");
-    let resolved_target_set_content = fs_err::read_to_string(&resolved_target_set_path)
-        .map_err(|e| Error::CouldNotReadResolvedTargetSet(resolved_target_set_path.clone(), e))?;
-    let resolved_target_set: ResolvedTargetSet = toml::from_str(&resolved_target_set_content)
-        .map_err(|e| Error::CouldNotParseResolvedTargetSet(resolved_target_set_path.clone(), e))?;
+    let (program, resolved) = load_task_data(&params.name, &environment)?;
+    let state_base = state_dir_for_task(&params.name, &environment)?;
 
     println!("Task: {}", params.name);
-    println!("Targets:");
 
-    for (target_idx, target) in resolved_target_set.targets.iter().enumerate() {
-        println!("  - Target: {}", target.manifest_dir.display());
-        println!("    Path: {}", target.manifest_dir.display());
-        println!("    Steps:");
-        for (step_idx, step) in plan.steps.iter().enumerate() {
-            let Some(step_number) = StepPosition::from_step_index(step_idx) else {
-                continue;
-            };
-            let status = get_step_status(
-                &params.name,
-                target_idx,
-                step_number.clone(),
-                step,
-                &environment,
-            );
-            let status_icon = match status {
-                StepStatus::Completed => "\u{2705}", // Green checkmark
-                StepStatus::Failed => "\u{274C}",    // Red 'X'
-                StepStatus::NotRun => "\u{2B1C}",    // White large square (empty checkbox)
-            };
-            println!("      {step_number}. {status_icon} {step:?}");
+    let ws_stmts = first_workspace_stmts(&program);
+    if !resolved.workspace_executions.is_empty() {
+        println!("Workspaces:");
+        for (ws_idx, ws_exec) in resolved.workspace_executions.iter().enumerate() {
+            let done = is_workspace_completed(ws_idx, ws_exec, ws_stmts, &state_base);
+            let icon = if done { "\u{2705}" } else { "\u{2B1C}" };
+            println!("  {} {}", icon, ws_exec.manifest_dir.display());
+        }
+    }
+
+    let crate_stmts = first_crate_stmts(&program);
+    if !resolved.crate_executions.is_empty() {
+        println!("Standalone crates:");
+        for (c_idx, crate_exec) in resolved.crate_executions.iter().enumerate() {
+            let done = is_standalone_crate_completed(c_idx, crate_stmts, &state_base);
+            let icon = if done { "\u{2705}" } else { "\u{2B1C}" };
+            println!("  {} {}", icon, crate_exec.manifest_dir.display());
         }
     }
 
     Ok(())
 }
 
-/// implementation of the task list subcommand
+/// Lists all tasks found in the tasks configuration directory.
 ///
 /// # Errors
 ///
-/// This command can fail if the tasks directory cannot be determined or read.
+/// Returns an error if the tasks directory cannot be read.
 #[instrument]
 #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
 pub async fn task_list_command(environment: crate::Environment) -> Result<(), Error> {
@@ -1288,11 +1945,11 @@ pub async fn task_list_command(environment: crate::Environment) -> Result<(), Er
     Ok(())
 }
 
-/// implementation of the task subcommand
+/// Dispatches the `task` subcommand.
 ///
 /// # Errors
 ///
-/// This command can fail due to errors in its subcommands (create, remove, run), such as issues with task creation, removal (e.g., file system errors), or execution.
+/// Propagates errors from the chosen subcommand.
 #[instrument]
 pub async fn task_command(
     task_parameters: TaskParameters,
@@ -1325,23 +1982,27 @@ pub async fn task_command(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
-    use super::{StepStatus, find_next_step, get_step_status, run_single_step};
+    use super::{find_next_statement, is_crate_stmt_completed, is_run_completed};
     use crate::Environment;
-    use crate::condition::Condition;
-    use crate::error::Error;
-    use crate::plans::{Branch, Plan, Step};
-    use crate::step_position::StepPosition;
-    use crate::target_sets::ResolvedTargetSet;
-    use crate::targets::Target;
+    use crate::program::ast::common::RunStep;
+    use crate::program::ast::crate_ctx::CrateStatement;
+    use crate::program::ast::crate_ctx::ForCrateBlock;
+    use crate::program::ast::workspace_ctx::ForWorkspaceBlock;
+    use crate::program::ast::workspace_ctx::WorkspaceStatement;
+    use crate::program::cursor::{CursorSegment, ProgramCursor};
+    use crate::program::resolve::{
+        ResolvedCrateExecution, ResolvedProgram, ResolvedWorkspaceExecution,
+    };
+    use crate::program::{GlobalStatement, Program};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    /// Build a minimal test environment pointing into `temp_dir`.
+    /// Build a minimal test environment pointing at `temp_dir`.
     fn make_environment(temp_dir: &tempfile::TempDir) -> Environment {
         Environment {
             config_dir: temp_dir.path().join("config"),
@@ -1351,831 +2012,272 @@ mod tests {
         }
     }
 
-    /// Build a test environment that includes the real system PATH so that
-    /// commands like `true` and `false` can be found by `run_single_step`.
-    fn make_environment_with_system_paths(temp_dir: &tempfile::TempDir) -> Environment {
-        let system_paths: Vec<PathBuf> = std::env::var("PATH")
-            .unwrap_or_default()
-            .split(':')
-            .map(PathBuf::from)
-            .collect();
-        Environment {
-            config_dir: temp_dir.path().join("config"),
-            state_dir: temp_dir.path().join("state"),
-            paths: system_paths,
-            suppress_subprocess_output: true,
-        }
-    }
-
-    /// Create the step state directory for `(task, target_idx, step_number)` and return its path.
-    fn make_state_dir(
-        env: &Environment,
-        task_name: &str,
-        target_idx: usize,
-        step_number: &StepPosition,
+    /// Create the state directory for the given cursor and return its path.
+    fn make_cursor_state_dir(
+        state_base: &Path,
+        cursor: &ProgramCursor,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let dir = env
-            .state_dir
-            .join("cargo-for-each")
-            .join("tasks")
-            .join(task_name)
-            .join(target_idx.to_string())
-            .join(step_number.to_string());
+        let dir = state_base.join(cursor.to_path());
         fs_err::create_dir_all(&dir)?;
         Ok(dir)
     }
 
-    // ── get_step_status: RunCommand ────────────────────────────────────────────
-
-    /// No state directory → NotRun.
-    #[test]
-    fn test_get_step_status_run_command_not_run_no_dir() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step = Step::RunCommand {
-            command: "echo".to_string(),
-            args: vec![],
-        };
-        assert_eq!(
-            get_step_status(
-                "task",
-                0,
-                StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
-                &step,
-                &env
-            ),
-            StepStatus::NotRun
-        );
-        Ok(())
+    /// Build a simple program containing one `for crate` block.
+    fn crate_program(stmts: Vec<CrateStatement>) -> Program {
+        Program {
+            statements: vec![GlobalStatement::ForCrate(ForCrateBlock {
+                statements: stmts,
+            })],
+        }
     }
 
-    /// State directory exists but exit_status file is absent → NotRun.
-    ///
-    /// This is the pre-condition that Bug 2's fix prevents from occurring at
-    /// runtime: after the fix, `run_single_step` always writes exit_status
-    /// before returning, so the file will never be absent once the dir exists.
-    #[test]
-    fn test_get_step_status_run_command_not_run_no_file() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        make_state_dir(&env, "task", 0, &step_pos)?; // dir exists, no file
-        let step = Step::RunCommand {
-            command: "echo".to_string(),
-            args: vec![],
-        };
-        assert_eq!(
-            get_step_status("task", 0, step_pos, &step, &env),
-            StepStatus::NotRun
-        );
-        Ok(())
+    /// Build a simple program containing one `for workspace` block.
+    fn workspace_program(stmts: Vec<WorkspaceStatement>) -> Program {
+        Program {
+            statements: vec![GlobalStatement::ForWorkspace(ForWorkspaceBlock {
+                statements: stmts,
+            })],
+        }
     }
 
-    /// exit_status = "0" → Completed.
-    #[test]
-    fn test_get_step_status_run_command_completed() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("exit_status"), "0")?;
-        let step = Step::RunCommand {
-            command: "echo".to_string(),
-            args: vec![],
-        };
-        assert_eq!(
-            get_step_status("task", 0, step_pos, &step, &env),
-            StepStatus::Completed
-        );
-        Ok(())
-    }
-
-    /// exit_status = "1" (command exited non-zero) → Failed.
-    #[test]
-    fn test_get_step_status_run_command_failed_nonzero() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("exit_status"), "1")?;
-        let step = Step::RunCommand {
-            command: "echo".to_string(),
-            args: vec![],
-        };
-        assert_eq!(
-            get_step_status("task", 0, step_pos, &step, &env),
-            StepStatus::Failed
-        );
-        Ok(())
-    }
-
-    /// exit_status = "" (written by Bug 2 fix when execute_command itself errors) → Failed.
-    ///
-    /// Regression test for Bug 2: an empty exit_status file (written when the
-    /// OS-level command launch fails) must be read as Failed, not as NotRun.
-    #[test]
-    fn test_get_step_status_run_command_failed_empty_means_failed_not_notrun() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("exit_status"), "")?;
-        let step = Step::RunCommand {
-            command: "echo".to_string(),
-            args: vec![],
-        };
-        assert_eq!(
-            get_step_status("task", 0, step_pos, &step, &env),
-            StepStatus::Failed
-        );
-        Ok(())
-    }
-
-    // ── get_step_status: ManualStep ───────────────────────────────────────────
-
-    /// No state directory → NotRun.
-    #[test]
-    fn test_get_step_status_manual_step_not_run() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step = Step::ManualStep {
-            title: "t".to_string(),
-            instructions: "i".to_string(),
-        };
-        assert_eq!(
-            get_step_status(
-                "task",
-                0,
-                StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
-                &step,
-                &env
-            ),
-            StepStatus::NotRun
-        );
-        Ok(())
-    }
-
-    /// manual_step_confirmed = "y" → Completed.
-    #[test]
-    fn test_get_step_status_manual_step_completed() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("manual_step_confirmed"), "y")?;
-        let step = Step::ManualStep {
-            title: "t".to_string(),
-            instructions: "i".to_string(),
-        };
-        assert_eq!(
-            get_step_status("task", 0, step_pos, &step, &env),
-            StepStatus::Completed
-        );
-        Ok(())
-    }
-
-    /// manual_step_confirmed = "n" → Failed.
-    #[test]
-    fn test_get_step_status_manual_step_failed() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("manual_step_confirmed"), "n")?;
-        let step = Step::ManualStep {
-            title: "t".to_string(),
-            instructions: "i".to_string(),
-        };
-        assert_eq!(
-            get_step_status("task", 0, step_pos, &step, &env),
-            StepStatus::Failed
-        );
-        Ok(())
-    }
-
-    // ── find_next_step ────────────────────────────────────────────────────────
-
-    /// All steps completed → None returned.
-    #[test]
-    fn test_find_next_step_returns_none_when_all_completed() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("exit_status"), "0")?;
-
-        let plan = Plan {
-            steps: vec![Step::RunCommand {
-                command: "echo".to_string(),
-                args: vec![],
-            }],
-        };
-        let resolved = ResolvedTargetSet {
-            targets: vec![Target {
-                manifest_dir: PathBuf::from("/tmp"),
+    /// Build a `ResolvedProgram` with a single standalone crate at `manifest_dir`.
+    fn resolved_with_one_crate(manifest_dir: PathBuf) -> ResolvedProgram {
+        ResolvedProgram {
+            workspace_executions: vec![],
+            crate_executions: vec![ResolvedCrateExecution {
+                manifest_dir,
                 dependencies: vec![],
             }],
-        };
-        assert!(find_next_step("task", &plan, &resolved, &env).is_none());
+        }
+    }
+
+    /// Build a `ResolvedProgram` with a single workspace at `manifest_dir`.
+    fn resolved_with_one_workspace(manifest_dir: PathBuf) -> ResolvedProgram {
+        ResolvedProgram {
+            workspace_executions: vec![ResolvedWorkspaceExecution {
+                manifest_dir,
+                dependencies: vec![],
+                member_crates: vec![],
+            }],
+            crate_executions: vec![],
+        }
+    }
+
+    // ── is_run_completed ──────────────────────────────────────────────────────
+
+    #[test]
+    fn run_completed_no_state_dir() -> TestResult {
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("w0").join("s0");
+        assert!(!is_run_completed(&state_dir));
         Ok(())
     }
 
-    /// A failed step (exit_status != "0") is NOT skipped by find_next_step —
-    /// it is returned as the next step so it can be retried.
     #[test]
-    fn test_find_next_step_returns_failed_step_for_retry() -> TestResult {
+    fn run_completed_no_exit_status_file() -> TestResult {
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("w0").join("s0");
+        fs_err::create_dir_all(&state_dir)?;
+        assert!(!is_run_completed(&state_dir));
+        Ok(())
+    }
+
+    #[test]
+    fn run_completed_exit_status_zero() -> TestResult {
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("w0").join("s0");
+        fs_err::create_dir_all(&state_dir)?;
+        fs_err::write(state_dir.join("exit_status"), "0")?;
+        assert!(is_run_completed(&state_dir));
+        Ok(())
+    }
+
+    #[test]
+    fn run_completed_exit_status_nonzero() -> TestResult {
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("w0").join("s0");
+        fs_err::create_dir_all(&state_dir)?;
+        fs_err::write(state_dir.join("exit_status"), "1")?;
+        assert!(!is_run_completed(&state_dir));
+        Ok(())
+    }
+
+    #[test]
+    fn run_completed_exit_status_empty_is_failed() -> TestResult {
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("w0").join("s0");
+        fs_err::create_dir_all(&state_dir)?;
+        fs_err::write(state_dir.join("exit_status"), "")?;
+        assert!(!is_run_completed(&state_dir));
+        Ok(())
+    }
+
+    // ── is_crate_stmt_completed ───────────────────────────────────────────────
+
+    #[test]
+    fn crate_run_stmt_completed_when_exit_zero() -> TestResult {
+        let temp = tempdir()?;
+        let cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        let state_dir = temp.path().join(cursor.to_path());
+        fs_err::create_dir_all(&state_dir)?;
+        fs_err::write(state_dir.join("exit_status"), "0")?;
+
+        let stmt = CrateStatement::Run(RunStep {
+            command: "echo".to_owned(),
+            args: vec![],
+        });
+        assert!(is_crate_stmt_completed(&stmt, &cursor, temp.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn crate_run_stmt_not_completed_when_no_dir() -> TestResult {
+        let temp = tempdir()?;
+        let cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+
+        let stmt = CrateStatement::Run(RunStep {
+            command: "echo".to_owned(),
+            args: vec![],
+        });
+        assert!(!is_crate_stmt_completed(&stmt, &cursor, temp.path()));
+        Ok(())
+    }
+
+    // ── find_next_statement ───────────────────────────────────────────────────
+
+    #[test]
+    fn find_next_returns_none_when_all_completed() -> TestResult {
         let temp = tempdir()?;
         let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("exit_status"), "1")?;
+        let state_base = env.state_dir.join("cargo-for-each").join("tasks").join("t");
+        let dir = PathBuf::from("/tmp");
+        let cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        let stmt_dir = make_cursor_state_dir(&state_base, &cursor)?;
+        fs_err::write(stmt_dir.join("exit_status"), "0")?;
 
-        let plan = Plan {
-            steps: vec![Step::RunCommand {
-                command: "echo".to_string(),
-                args: vec![],
-            }],
-        };
-        let resolved = ResolvedTargetSet {
-            targets: vec![Target {
-                manifest_dir: PathBuf::from("/tmp"),
-                dependencies: vec![],
-            }],
-        };
-        let next = find_next_step("task", &plan, &resolved, &env);
+        let program = crate_program(vec![CrateStatement::Run(RunStep {
+            command: "echo".to_owned(),
+            args: vec![],
+        })]);
+        let resolved = resolved_with_one_crate(dir);
+        assert!(find_next_statement(&program, &resolved, &state_base).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn find_next_returns_first_stmt_when_nothing_run() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let state_base = env.state_dir.join("cargo-for-each").join("tasks").join("t");
+        let dir = PathBuf::from("/tmp");
+
+        let program = crate_program(vec![CrateStatement::Run(RunStep {
+            command: "echo".to_owned(),
+            args: vec![],
+        })]);
+        let resolved = resolved_with_one_crate(dir);
+        let next = find_next_statement(&program, &resolved, &state_base);
+        assert!(next.is_some());
+        let next = next.ok_or("expected Some")?;
+        assert_eq!(
+            next.cursor,
+            ProgramCursor::new()
+                .with(CursorSegment::CrateIteration(0))
+                .with(CursorSegment::Statement(0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn find_next_skips_completed_and_returns_second() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let state_base = env.state_dir.join("cargo-for-each").join("tasks").join("t");
+        let dir = PathBuf::from("/tmp");
+
+        // Mark first statement completed.
+        let cursor0 = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        let stmt0_dir = make_cursor_state_dir(&state_base, &cursor0)?;
+        fs_err::write(stmt0_dir.join("exit_status"), "0")?;
+
+        let program = crate_program(vec![
+            CrateStatement::Run(RunStep {
+                command: "echo".to_owned(),
+                args: vec!["a".to_owned()],
+            }),
+            CrateStatement::Run(RunStep {
+                command: "echo".to_owned(),
+                args: vec!["b".to_owned()],
+            }),
+        ]);
+        let resolved = resolved_with_one_crate(dir);
+        let next = find_next_statement(&program, &resolved, &state_base);
+        assert!(next.is_some());
+        let next = next.ok_or("expected Some")?;
+        assert_eq!(
+            next.cursor,
+            ProgramCursor::new()
+                .with(CursorSegment::CrateIteration(0))
+                .with(CursorSegment::Statement(1))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn find_next_returns_failed_stmt_for_retry() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let state_base = env.state_dir.join("cargo-for-each").join("tasks").join("t");
+        let dir = PathBuf::from("/tmp");
+
+        let cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        let stmt_dir = make_cursor_state_dir(&state_base, &cursor)?;
+        fs_err::write(stmt_dir.join("exit_status"), "1")?; // failed
+
+        let program = crate_program(vec![CrateStatement::Run(RunStep {
+            command: "echo".to_owned(),
+            args: vec![],
+        })]);
+        let resolved = resolved_with_one_crate(dir);
+        let next = find_next_statement(&program, &resolved, &state_base);
         assert!(
             next.is_some(),
-            "Failed step should be returned for retry, not skipped"
-        );
-        let next = next.ok_or("expected Some next step")?;
-        assert_eq!(
-            next.step_number,
-            StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?
+            "Failed statement should be returned for retry"
         );
         Ok(())
     }
 
-    /// No state at all → first step is returned.
     #[test]
-    fn test_find_next_step_returns_first_step_when_nothing_run() -> TestResult {
+    fn find_next_workspace_stmt() -> TestResult {
         let temp = tempdir()?;
         let env = make_environment(&temp);
+        let state_base = env.state_dir.join("cargo-for-each").join("tasks").join("t");
+        let dir = PathBuf::from("/tmp");
 
-        let plan = Plan {
-            steps: vec![
-                Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec!["a".to_string()],
-                },
-                Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec!["b".to_string()],
-                },
-            ],
-        };
-        let resolved = ResolvedTargetSet {
-            targets: vec![Target {
-                manifest_dir: PathBuf::from("/tmp"),
-                dependencies: vec![],
-            }],
-        };
-        let next = find_next_step("task", &plan, &resolved, &env);
+        let program = workspace_program(vec![WorkspaceStatement::Run(RunStep {
+            command: "cargo".to_owned(),
+            args: vec!["build".to_owned()],
+        })]);
+        let resolved = resolved_with_one_workspace(dir);
+        let next = find_next_statement(&program, &resolved, &state_base);
         assert!(next.is_some());
-        let next = next.ok_or("expected Some next step")?;
-        assert_eq!(
-            next.step_number,
-            StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
-            "Should return step 1 first"
-        );
-        Ok(())
-    }
-
-    /// Step 1 completed, step 2 not yet run → step 2 is returned.
-    #[test]
-    fn test_find_next_step_skips_completed_steps() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("exit_status"), "0")?; // step 1 done
-
-        let plan = Plan {
-            steps: vec![
-                Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec!["a".to_string()],
-                },
-                Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec!["b".to_string()],
-                },
-            ],
-        };
-        let resolved = ResolvedTargetSet {
-            targets: vec![Target {
-                manifest_dir: PathBuf::from("/tmp"),
-                dependencies: vec![],
-            }],
-        };
-        let next = find_next_step("task", &plan, &resolved, &env);
-        assert!(next.is_some());
-        let next = next.ok_or("expected Some next step")?;
-        assert_eq!(
-            next.step_number,
-            StepPosition::from_one_based(2).ok_or("step position 2 is always valid")?,
-            "Step 1 is done; step 2 should be next"
-        );
-        Ok(())
-    }
-
-    // ── run_single_step: wrapper script captures real exit code ───────────────
-
-    /// A successful command (exit code 0) writes "0" to exit_status.
-    ///
-    /// Regression test for Bug 7: previously asciinema in --headless mode
-    /// always exited with code 0, so run_single_step would read asciinema's
-    /// exit code instead of the inner command's real exit code.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_run_single_step_success_writes_zero_exit_status() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment_with_system_paths(&temp);
-        let manifest_dir = temp.path();
-        let step = Step::RunCommand {
-            command: "true".to_string(),
-            args: vec![],
-        };
-        let config = crate::Config::default();
-        run_single_step(
-            &step,
-            manifest_dir,
-            "test-task",
-            StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
-            0,
-            &env,
-            &config,
-        )
-        .await?;
-
-        let exit_status_path = env
-            .state_dir
-            .join("cargo-for-each")
-            .join("tasks")
-            .join("test-task")
-            .join("0")
-            .join("1")
-            .join("exit_status");
-        let content = fs_err::read_to_string(&exit_status_path)?;
-        assert_eq!(content.trim(), "0");
-        Ok(())
-    }
-
-    /// A failing command (non-zero exit code) writes a non-zero code to
-    /// exit_status and causes run_single_step to return CommandFailed.
-    ///
-    /// Regression test for Bug 7: without the wrapper script fix, asciinema
-    /// in --headless mode would always exit 0 and run_single_step would
-    /// incorrectly write "0" to exit_status and return Ok(()).
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_run_single_step_failure_writes_nonzero_exit_status() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment_with_system_paths(&temp);
-        let manifest_dir = temp.path();
-        let step = Step::RunCommand {
-            command: "false".to_string(),
-            args: vec![],
-        };
-        let config = crate::Config::default();
-        let result = run_single_step(
-            &step,
-            manifest_dir,
-            "test-task",
-            StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
-            0,
-            &env,
-            &config,
-        )
-        .await;
-
-        assert!(result.is_err(), "failing command should return Err");
-        assert!(
-            matches!(result, Err(Error::CommandFailed(..))),
-            "expected CommandFailed error"
-        );
-
-        let exit_status_path = env
-            .state_dir
-            .join("cargo-for-each")
-            .join("tasks")
-            .join("test-task")
-            .join("0")
-            .join("1")
-            .join("exit_status");
-        let content = fs_err::read_to_string(&exit_status_path)?;
-        let exit_code: i32 = content.trim().parse()?;
-        assert!(exit_code != 0, "exit_status must contain a non-zero code");
-        Ok(())
-    }
-
-    // ── get_step_status: IfElseIf ─────────────────────────────────────────────
-
-    /// No state directory → NotRun.
-    #[test]
-    fn test_get_step_status_if_else_if_not_run_no_dir() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step = Step::IfElseIf {
-            branches: vec![Branch {
-                condition: Condition::IsBinaryCrate {},
-                steps: vec![Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec![],
-                }],
-            }],
-            else_steps: vec![],
-        };
-        assert_eq!(
-            get_step_status(
-                "task",
-                0,
-                StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?,
-                &step,
-                &env
-            ),
-            StepStatus::NotRun
-        );
-        Ok(())
-    }
-
-    /// chosen_branch absent → NotRun.
-    #[test]
-    fn test_get_step_status_if_else_if_not_run_no_chosen_branch() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        make_state_dir(&env, "task", 0, &step_pos)?; // dir exists, no chosen_branch file
-        let step = Step::IfElseIf {
-            branches: vec![Branch {
-                condition: Condition::IsBinaryCrate {},
-                steps: vec![Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec![],
-                }],
-            }],
-            else_steps: vec![],
-        };
-        assert_eq!(
-            get_step_status("task", 0, step_pos, &step, &env),
-            StepStatus::NotRun
-        );
-        Ok(())
-    }
-
-    /// chosen_branch="none" with no nested steps → Completed.
-    #[test]
-    fn test_get_step_status_if_else_if_none_is_completed() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("chosen_branch"), "none")?;
-        let step = Step::IfElseIf {
-            branches: vec![Branch {
-                condition: Condition::IsBinaryCrate {},
-                steps: vec![Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec![],
-                }],
-            }],
-            else_steps: vec![],
-        };
-        assert_eq!(
-            get_step_status("task", 0, step_pos, &step, &env),
-            StepStatus::Completed
-        );
-        Ok(())
-    }
-
-    /// chosen_branch="1", nested step not done → NotRun.
-    #[test]
-    fn test_get_step_status_if_else_if_branch_chosen_nested_not_done() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("chosen_branch"), "1")?;
-        // Nested step state dir not created → NotRun for nested step
-        let step = Step::IfElseIf {
-            branches: vec![Branch {
-                condition: Condition::IsBinaryCrate {},
-                steps: vec![Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec![],
-                }],
-            }],
-            else_steps: vec![],
-        };
-        assert_eq!(
-            get_step_status("task", 0, step_pos, &step, &env),
-            StepStatus::NotRun
-        );
-        Ok(())
-    }
-
-    /// chosen_branch="1", nested step done → Completed.
-    #[test]
-    fn test_get_step_status_if_else_if_branch_chosen_nested_done() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("chosen_branch"), "1")?;
-        // Create nested step state dir (step 1.1) with completed exit_status
-        let nested_pos = step_pos
-            .child_from_index(0)
-            .ok_or("child index 0 is always valid")?;
-        let nested_dir = make_state_dir(&env, "task", 0, &nested_pos)?;
-        fs_err::write(nested_dir.join("exit_status"), "0")?;
-        let step = Step::IfElseIf {
-            branches: vec![Branch {
-                condition: Condition::IsBinaryCrate {},
-                steps: vec![Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec![],
-                }],
-            }],
-            else_steps: vec![],
-        };
-        assert_eq!(
-            get_step_status("task", 0, step_pos, &step, &env),
-            StepStatus::Completed
-        );
-        Ok(())
-    }
-
-    // ── run_single_step: IfElseIf ─────────────────────────────────────────────
-
-    /// IfElseIf with a matching branch writes chosen_branch and condition result.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_run_single_step_if_else_if_writes_chosen_branch() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let manifest_dir = temp.path();
-        // Config with a bin crate at manifest_dir so IsBinaryCrate evaluates to true.
-        let config = crate::Config {
-            crates: vec![crate::Crate {
-                manifest_dir: manifest_dir.to_path_buf(),
-                workspace_manifest_dir: manifest_dir.to_path_buf(),
-                types: [crate::targets::CrateType::Bin].into(),
-            }],
-            workspaces: vec![],
-        };
-        let step = Step::IfElseIf {
-            branches: vec![Branch {
-                condition: Condition::IsBinaryCrate {},
-                steps: vec![Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec![],
-                }],
-            }],
-            else_steps: vec![Step::ManualStep {
-                title: "else".to_string(),
-                instructions: "else".to_string(),
-            }],
-        };
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        run_single_step(
-            &step,
-            manifest_dir,
-            "task",
-            step_pos.clone(),
-            0,
-            &env,
-            &config,
-        )
-        .await?;
-
-        let state_dir = env
-            .state_dir
-            .join("cargo-for-each")
-            .join("tasks")
-            .join("task")
-            .join("0")
-            .join("1");
-        let chosen = fs_err::read_to_string(state_dir.join("chosen_branch"))?;
-        assert_eq!(
-            chosen.trim(),
-            "1",
-            "branch 1 condition was true, should be chosen"
-        );
-        let result1 = fs_err::read_to_string(state_dir.join("branch_1_condition_result"))?;
-        assert_eq!(result1.trim(), "true");
-        Ok(())
-    }
-
-    /// IfElseIf with no matching branch and an else falls back to "else".
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_run_single_step_if_else_if_falls_back_to_else() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let manifest_dir = temp.path();
-        // Empty config → IsBinaryCrate evaluates to false.
-        let config = crate::Config::default();
-        let step = Step::IfElseIf {
-            branches: vec![Branch {
-                condition: Condition::IsBinaryCrate {},
-                steps: vec![Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec![],
-                }],
-            }],
-            else_steps: vec![Step::ManualStep {
-                title: "else".to_string(),
-                instructions: "else".to_string(),
-            }],
-        };
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        run_single_step(&step, manifest_dir, "task", step_pos, 0, &env, &config).await?;
-
-        let state_dir = env
-            .state_dir
-            .join("cargo-for-each")
-            .join("tasks")
-            .join("task")
-            .join("0")
-            .join("1");
-        let chosen = fs_err::read_to_string(state_dir.join("chosen_branch"))?;
-        assert_eq!(chosen.trim(), "else");
-        let result1 = fs_err::read_to_string(state_dir.join("branch_1_condition_result"))?;
-        assert_eq!(result1.trim(), "false");
-        Ok(())
-    }
-
-    /// IfElseIf with no match and no else writes "none".
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_run_single_step_if_else_if_no_match_no_else_writes_none() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let manifest_dir = temp.path();
-        let config = crate::Config::default(); // IsBinaryCrate → false
-        let step = Step::IfElseIf {
-            branches: vec![Branch {
-                condition: Condition::IsBinaryCrate {},
-                steps: vec![Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec![],
-                }],
-            }],
-            else_steps: vec![],
-        };
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        run_single_step(&step, manifest_dir, "task", step_pos, 0, &env, &config).await?;
-
-        let state_dir = env
-            .state_dir
-            .join("cargo-for-each")
-            .join("tasks")
-            .join("task")
-            .join("0")
-            .join("1");
-        let chosen = fs_err::read_to_string(state_dir.join("chosen_branch"))?;
-        assert_eq!(chosen.trim(), "none");
-        Ok(())
-    }
-
-    // ── find_next_step: IfElseIf ──────────────────────────────────────────────
-
-    /// No chosen_branch → find_next_step returns the IfElseIf step itself.
-    #[test]
-    fn test_find_next_step_if_else_if_returns_step_for_evaluation() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let if_step = Step::IfElseIf {
-            branches: vec![Branch {
-                condition: Condition::IsBinaryCrate {},
-                steps: vec![Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec![],
-                }],
-            }],
-            else_steps: vec![],
-        };
-        let plan = Plan {
-            steps: vec![if_step],
-        };
-        let resolved = ResolvedTargetSet {
-            targets: vec![Target {
-                manifest_dir: PathBuf::from("/tmp"),
-                dependencies: vec![],
-            }],
-        };
-        let next = find_next_step("task", &plan, &resolved, &env);
-        assert!(
-            next.is_some(),
-            "should return the IfElseIf step for evaluation"
-        );
         let next = next.ok_or("expected Some")?;
         assert_eq!(
-            next.step_number,
-            StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?
+            next.cursor,
+            ProgramCursor::new()
+                .with(CursorSegment::WorkspaceIteration(0))
+                .with(CursorSegment::Statement(0))
         );
-        assert!(matches!(next.step, Step::IfElseIf { .. }));
-        Ok(())
-    }
-
-    /// chosen_branch="1", nested step not done → returns nested step at "1.1".
-    #[test]
-    fn test_find_next_step_if_else_if_returns_nested_step() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        // Write chosen_branch for step 1
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("chosen_branch"), "1")?;
-        // Nested step 1.1 not yet run (no state dir)
-
-        let if_step = Step::IfElseIf {
-            branches: vec![Branch {
-                condition: Condition::IsBinaryCrate {},
-                steps: vec![Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec![],
-                }],
-            }],
-            else_steps: vec![],
-        };
-        let plan = Plan {
-            steps: vec![if_step],
-        };
-        let resolved = ResolvedTargetSet {
-            targets: vec![Target {
-                manifest_dir: PathBuf::from("/tmp"),
-                dependencies: vec![],
-            }],
-        };
-        let next = find_next_step("task", &plan, &resolved, &env);
-        assert!(next.is_some(), "should return the nested step");
-        let next = next.ok_or("expected Some")?;
-        assert_eq!(
-            next.step_number,
-            step_pos
-                .child_from_index(0)
-                .ok_or("child index 0 is always valid")?
-        );
-        assert!(matches!(next.step, Step::RunCommand { .. }));
-        Ok(())
-    }
-
-    /// chosen_branch="1", nested step done → moves to step after IfElseIf.
-    #[test]
-    fn test_find_next_step_if_else_if_advances_after_completion() -> TestResult {
-        let temp = tempdir()?;
-        let env = make_environment(&temp);
-        let step_pos = StepPosition::from_one_based(1).ok_or("step position 1 is always valid")?;
-        let dir = make_state_dir(&env, "task", 0, &step_pos)?;
-        fs_err::write(dir.join("chosen_branch"), "1")?;
-        // Mark nested step 1.1 as completed
-        let nested_pos = step_pos
-            .child_from_index(0)
-            .ok_or("child index 0 is always valid")?;
-        let nested_dir = make_state_dir(&env, "task", 0, &nested_pos)?;
-        fs_err::write(nested_dir.join("exit_status"), "0")?;
-
-        let if_step = Step::IfElseIf {
-            branches: vec![Branch {
-                condition: Condition::IsBinaryCrate {},
-                steps: vec![Step::RunCommand {
-                    command: "echo".to_string(),
-                    args: vec![],
-                }],
-            }],
-            else_steps: vec![],
-        };
-        let next_cmd = Step::RunCommand {
-            command: "echo".to_string(),
-            args: vec!["after".to_string()],
-        };
-        let plan = Plan {
-            steps: vec![if_step, next_cmd],
-        };
-        let resolved = ResolvedTargetSet {
-            targets: vec![Target {
-                manifest_dir: PathBuf::from("/tmp"),
-                dependencies: vec![],
-            }],
-        };
-        let next = find_next_step("task", &plan, &resolved, &env);
-        assert!(next.is_some(), "should advance to the step after IfElseIf");
-        let next = next.ok_or("expected Some")?;
-        assert_eq!(
-            next.step_number,
-            StepPosition::from_one_based(2).ok_or("step position 2 is always valid")?
-        );
-        assert!(matches!(next.step, Step::RunCommand { .. }));
         Ok(())
     }
 }
