@@ -166,6 +166,7 @@ dependencies = [
  "log-panics",
  "pretty_assertions",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "time",

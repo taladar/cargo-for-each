@@ -1,6 +1,8 @@
 //! AST node types for the workspace execution context.
 
-use super::common::{Branch, CommonCondition, IfBlock, ManualStepNode, RunStep};
+use super::common::{
+    Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
+};
 use super::crate_ctx::CrateStatement;
 
 /// A block that iterates over all member crates of the current workspace in
@@ -30,6 +32,8 @@ pub enum WorkspaceStatement {
     If(IfBlock<WorkspaceCondition, Self>),
     /// Iterate over member crates of the current workspace in dependency order.
     ForCrateInWorkspace(ForCrateInWorkspaceBlock),
+    /// Capture and store cargo metadata for the current workspace under a name.
+    SnapshotMetadata(SnapshotMetadataNode),
 }
 
 /// A boolean condition available in the workspace execution context.

@@ -4,7 +4,7 @@ pub mod common;
 pub mod crate_ctx;
 pub mod workspace_ctx;
 
-pub use common::{Branch, CommonCondition, IfBlock, ManualStepNode, RunStep};
+pub use common::{Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode};
 pub use crate_ctx::{
     CrateBranch, CrateCondition, CrateFilter, CrateIfBlock, CrateSelectCondition, CrateStatement,
     CrateTypeFilter, ForCrateBlock,

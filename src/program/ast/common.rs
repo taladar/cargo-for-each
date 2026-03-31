@@ -39,6 +39,18 @@ pub struct Branch<C, S> {
     pub statements: Vec<S>,
 }
 
+/// A step that captures the current workspace's cargo metadata under a user-specified name.
+///
+/// The captured metadata can be referenced in later steps using `${name.field}` syntax
+/// in command arguments and manual step text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotMetadataNode {
+    /// The name under which the captured metadata is stored.
+    ///
+    /// This name is used to reference the snapshot in `${name.field}` interpolations.
+    pub name: String,
+}
+
 /// A boolean condition available in all execution contexts.
 ///
 /// This represents the subset of conditions that do not depend on workspace- or

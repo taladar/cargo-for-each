@@ -1,6 +1,8 @@
 //! AST node types for the crate execution context.
 
-use super::common::{Branch, CommonCondition, IfBlock, ManualStepNode, RunStep};
+use super::common::{
+    Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
+};
 
 /// The type of a Rust crate, used as a filter in crate-context conditions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +32,8 @@ pub enum CrateStatement {
     ManualStep(ManualStepNode),
     /// Conditional branching using crate-level conditions.
     If(IfBlock<CrateCondition, Self>),
+    /// Capture and store cargo metadata for the current workspace under a name.
+    SnapshotMetadata(SnapshotMetadataNode),
 }
 
 /// A boolean condition available in the crate execution context.

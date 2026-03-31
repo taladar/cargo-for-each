@@ -151,6 +151,26 @@ pub enum Error {
     /// circular dependency or deadlock detected
     #[error("circular dependency or deadlock detected")]
     CircularDependency,
+    /// error serializing cargo metadata snapshot to JSON
+    #[error("error serializing cargo metadata snapshot: {0}")]
+    CouldNotSerializeMetadataSnapshot(#[source] serde_json::Error),
+    /// error deserializing a cargo metadata snapshot from JSON
+    #[error("error deserializing cargo metadata snapshot: {0}")]
+    CouldNotDeserializeMetadataSnapshot(#[source] serde_json::Error),
+    /// a snapshot with the given name was not found
+    #[error("snapshot '{0}' not found; was `snapshot_metadata \"{0}\"` executed before this step?")]
+    SnapshotNotFound(String),
+    /// the current crate's package was not found in the named snapshot
+    #[error("package for {1} not found in snapshot '{0}'")]
+    SnapshotPackageNotFound(String, std::path::PathBuf),
+    /// the given field path was not found in the package JSON
+    #[error("field '{1}' not found in package for snapshot '{0}'")]
+    SnapshotFieldNotFound(String, String),
+    /// a `${{...}}` interpolation reference is malformed
+    #[error(
+        "invalid interpolation reference '{0}': must be '${{name.field}}' with at least one field after the name"
+    )]
+    InvalidInterpolation(String),
     /// the specified program file was not found
     #[error("program file not found: {0}")]
     ProgramNotFound(std::path::PathBuf),

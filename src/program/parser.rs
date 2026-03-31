@@ -5,7 +5,9 @@
 
 use chumsky::prelude::*;
 
-use super::ast::common::{Branch, CommonCondition, IfBlock, ManualStepNode, RunStep};
+use super::ast::common::{
+    Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
+};
 use super::ast::crate_ctx::{
     CrateCondition, CrateFilter, CrateSelectCondition, CrateStatement, CrateTypeFilter,
     ForCrateBlock,
@@ -384,6 +386,15 @@ fn crate_select_condition_parser<'src>()
 
 // ─── Shared leaf statements ───────────────────────────────────────────────────
 
+/// Parses a `snapshot_metadata "name";` statement into a [`SnapshotMetadataNode`].
+fn snapshot_metadata_parser<'src>()
+-> impl Parser<'src, &'src str, SnapshotMetadataNode, extra::Err<Rich<'src, char>>> + Clone {
+    kw("snapshot_metadata")
+        .ignore_then(string_literal())
+        .then_ignore(sym(";"))
+        .map(|name| SnapshotMetadataNode { name })
+}
+
 /// Parses a `run "cmd" "args"...;` statement into a [`RunStep`].
 fn run_step_parser<'src>()
 -> impl Parser<'src, &'src str, RunStep, extra::Err<Rich<'src, char>>> + Clone {
@@ -417,13 +428,14 @@ fn crate_statement_parser<'src>()
     recursive(|stmt| {
         let run = run_step_parser().map(CrateStatement::Run);
         let manual = manual_step_parser().map(CrateStatement::ManualStep);
+        let snapshot_metadata = snapshot_metadata_parser().map(CrateStatement::SnapshotMetadata);
 
         let crate_cond = crate_condition_parser();
         let body = stmt.repeated().collect::<Vec<_>>();
 
         let if_stmt = crate_if_parser(crate_cond, body).map(CrateStatement::If);
 
-        choice((run, manual, if_stmt))
+        choice((run, manual, if_stmt, snapshot_metadata))
     })
 }
 
@@ -473,6 +485,8 @@ fn workspace_statement_parser<'src>()
     recursive(|stmt| {
         let run = run_step_parser().map(WorkspaceStatement::Run);
         let manual = manual_step_parser().map(WorkspaceStatement::ManualStep);
+        let snapshot_metadata =
+            snapshot_metadata_parser().map(WorkspaceStatement::SnapshotMetadata);
 
         let ws_cond = workspace_condition_parser();
         let ws_body = stmt.repeated().collect::<Vec<_>>();
@@ -493,7 +507,7 @@ fn workspace_statement_parser<'src>()
                 WorkspaceStatement::ForCrateInWorkspace(ForCrateInWorkspaceBlock { statements })
             });
 
-        choice((run, manual, if_stmt, for_crate_in_ws))
+        choice((run, manual, if_stmt, for_crate_in_ws, snapshot_metadata))
     })
 }
 
@@ -868,6 +882,56 @@ mod tests {
                     assert_eq!(m.instructions, r#"Say "hello"."#);
                 }
                 _ => panic!("expected ManualStep"),
+            },
+            _ => panic!("expected ForWorkspace"),
+        }
+    }
+
+    #[test]
+    fn snapshot_metadata_in_crate_context() {
+        let prog = parse_ok(r#"for crate { snapshot_metadata "before"; }"#);
+        assert_eq!(
+            prog.statements,
+            vec![GlobalStatement::ForCrate(ForCrateBlock {
+                statements: vec![CrateStatement::SnapshotMetadata(SnapshotMetadataNode {
+                    name: "before".to_owned(),
+                })]
+            })]
+        );
+    }
+
+    #[test]
+    fn snapshot_metadata_in_workspace_context() {
+        let prog = parse_ok(r#"for workspace { snapshot_metadata "after"; }"#);
+        assert_eq!(
+            prog.statements,
+            vec![GlobalStatement::ForWorkspace(ForWorkspaceBlock {
+                statements: vec![WorkspaceStatement::SnapshotMetadata(SnapshotMetadataNode {
+                    name: "after".to_owned(),
+                })]
+            })]
+        );
+    }
+
+    #[test]
+    fn snapshot_metadata_before_and_after_in_loop() {
+        let prog = parse_ok(
+            r#"for workspace { for crate in workspace { snapshot_metadata "before"; run "cargo" "upgrade"; snapshot_metadata "after"; } }"#,
+        );
+        match &prog.statements[0] {
+            GlobalStatement::ForWorkspace(b) => match &b.statements[0] {
+                WorkspaceStatement::ForCrateInWorkspace(fc) => {
+                    assert!(matches!(
+                        &fc.statements[0],
+                        CrateStatement::SnapshotMetadata(n) if n.name == "before"
+                    ));
+                    assert!(matches!(&fc.statements[1], CrateStatement::Run(_)));
+                    assert!(matches!(
+                        &fc.statements[2],
+                        CrateStatement::SnapshotMetadata(n) if n.name == "after"
+                    ));
+                }
+                _ => panic!("expected ForCrateInWorkspace"),
             },
             _ => panic!("expected ForWorkspace"),
         }

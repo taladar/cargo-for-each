@@ -10,11 +10,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use cargo_metadata::MetadataCommand;
 use futures::stream::{self, StreamExt as _};
 use tracing::instrument;
 
 use crate::error::Error;
-use crate::program::ast::common::{ManualStepNode, RunStep};
+use crate::program::ast::common::{ManualStepNode, RunStep, SnapshotMetadataNode};
 use crate::program::ast::crate_ctx::{CrateIfBlock, CrateStatement};
 use crate::program::ast::workspace_ctx::{WorkspaceIfBlock, WorkspaceStatement};
 use crate::program::cursor::{CursorSegment, ProgramCursor};
@@ -265,6 +266,11 @@ fn is_manual_completed(state_dir: &Path) -> bool {
         == Some("y")
 }
 
+/// Returns `true` if the `snapshot_metadata` step at `state_dir` has completed.
+fn is_snapshot_metadata_completed(state_dir: &Path) -> bool {
+    state_dir.exists() && state_dir.join("snapshot_metadata_completed").exists()
+}
+
 /// Returns `true` if all crate statements in `stmts` under `prefix` are completed.
 fn is_crate_stmts_completed(
     stmts: &[CrateStatement],
@@ -287,6 +293,7 @@ fn is_crate_stmt_completed(
     match stmt {
         CrateStatement::Run(_) => is_run_completed(&state_dir),
         CrateStatement::ManualStep(_) => is_manual_completed(&state_dir),
+        CrateStatement::SnapshotMetadata(_) => is_snapshot_metadata_completed(&state_dir),
         CrateStatement::If(block) => {
             let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) else {
                 return false;
@@ -334,6 +341,7 @@ fn is_workspace_stmt_completed(
     match stmt {
         WorkspaceStatement::Run(_) => is_run_completed(&state_dir),
         WorkspaceStatement::ManualStep(_) => is_manual_completed(&state_dir),
+        WorkspaceStatement::SnapshotMetadata(_) => is_snapshot_metadata_completed(&state_dir),
         WorkspaceStatement::If(block) => {
             let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) else {
                 return false;
@@ -459,6 +467,8 @@ pub enum StatementAction<'a> {
     EvaluateWorkspaceIf(&'a WorkspaceIfBlock),
     /// Evaluate the branch conditions of a crate `if` block.
     EvaluateCrateIf(&'a CrateIfBlock),
+    /// Capture and store cargo metadata under the given name.
+    SnapshotMetadata(&'a SnapshotMetadataNode),
 }
 
 /// The next statement that should be executed in a running task.
@@ -501,6 +511,15 @@ fn find_next_in_crate_stmts<'a>(
                         cursor,
                         manifest_dir,
                         action: StatementAction::ManualStep(step),
+                    });
+                }
+            }
+            CrateStatement::SnapshotMetadata(step) => {
+                if !is_snapshot_metadata_completed(&state_dir) {
+                    return Some(NextStatement {
+                        cursor,
+                        manifest_dir,
+                        action: StatementAction::SnapshotMetadata(step),
                     });
                 }
             }
@@ -578,6 +597,15 @@ fn find_next_in_workspace_stmts<'a>(
                         cursor,
                         manifest_dir,
                         action: StatementAction::ManualStep(step),
+                    });
+                }
+            }
+            WorkspaceStatement::SnapshotMetadata(step) => {
+                if !is_snapshot_metadata_completed(&state_dir) {
+                    return Some(NextStatement {
+                        cursor,
+                        manifest_dir,
+                        action: StatementAction::SnapshotMetadata(step),
                     });
                 }
             }
@@ -717,6 +745,164 @@ pub fn find_next_statement<'a>(
 
 // ── Statement execution ────────────────────────────────────────────────────────
 
+/// Expands `${name.field}` interpolations in `s` using named metadata snapshots.
+///
+/// Each `${name.field1.field2...}` reference is replaced with the value of the
+/// given field path in the current crate's package entry within the named snapshot.
+/// If `s` contains no `${` sequences, it is returned unchanged without any
+/// filesystem access.
+///
+/// # Errors
+///
+/// Returns an error if any interpolation reference is malformed (e.g. missing
+/// the closing `}` or the dot-separated field), if the named snapshot does not
+/// exist, if the current crate's package cannot be found in the snapshot, or if
+/// the given field path does not exist in the package.
+fn expand_interpolations(s: &str, manifest_dir: &Path, state_base: &Path) -> Result<String, Error> {
+    if !s.contains("${") {
+        return Ok(s.to_owned());
+    }
+    let mut result = String::with_capacity(s.len());
+    let mut parts = s.split("${");
+    if let Some(first) = parts.next() {
+        result.push_str(first);
+    }
+    for part in parts {
+        let (reference, rest) = part
+            .split_once('}')
+            .ok_or_else(|| Error::InvalidInterpolation(format!("${{{part}")))?;
+        let (name, field_path) = reference
+            .split_once('.')
+            .ok_or_else(|| Error::InvalidInterpolation(reference.to_owned()))?;
+        let value = resolve_interpolation(name, field_path, manifest_dir, state_base)?;
+        result.push_str(&value);
+        result.push_str(rest);
+    }
+    Ok(result)
+}
+
+/// Looks up a single `${name.field_path}` reference and returns its string value.
+///
+/// The lookup first checks for a per-manifest snapshot captured when the current
+/// `manifest_dir` ran the step, then falls back to `latest.json` for cross-context
+/// scenarios.  The package for the current crate is found in the snapshot by matching
+/// its `manifest_path` against `manifest_dir/Cargo.toml`, and the dot-separated
+/// `field_path` is then navigated within that package's JSON.
+///
+/// # Errors
+///
+/// Returns an error if no snapshot named `snapshot_name` exists, if the current
+/// crate's package cannot be found in the snapshot, or if `field_path` does not
+/// exist or is not navigable within the package JSON.
+fn resolve_interpolation(
+    snapshot_name: &str,
+    field_path: &str,
+    manifest_dir: &Path,
+    state_base: &Path,
+) -> Result<String, Error> {
+    let name_dir = state_base.join("snapshots").join(snapshot_name);
+    let hex_key: String = manifest_dir
+        .to_string_lossy()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .concat();
+    let mut filename = hex_key;
+    filename.push_str(".json");
+    let per_manifest_path = name_dir.join("by_manifest").join(&filename);
+    let latest_path = name_dir.join("latest.json");
+    let json_path = if per_manifest_path.exists() {
+        per_manifest_path
+    } else if latest_path.exists() {
+        latest_path
+    } else {
+        return Err(Error::SnapshotNotFound(snapshot_name.to_owned()));
+    };
+    let json = fs_err::read_to_string(&json_path).map_err(Error::IoError)?;
+    let root: serde_json::Value =
+        serde_json::from_str(&json).map_err(Error::CouldNotDeserializeMetadataSnapshot)?;
+    let target_manifest = manifest_dir.join("Cargo.toml");
+    let packages = root
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            Error::SnapshotPackageNotFound(snapshot_name.to_owned(), manifest_dir.to_path_buf())
+        })?;
+    let package = packages
+        .iter()
+        .find(|p| {
+            p.get("manifest_path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|mp| std::path::Path::new(mp) == target_manifest)
+        })
+        .ok_or_else(|| {
+            Error::SnapshotPackageNotFound(snapshot_name.to_owned(), manifest_dir.to_path_buf())
+        })?;
+    let mut current: &serde_json::Value = package;
+    for segment in field_path.split('.') {
+        current = current.get(segment).ok_or_else(|| {
+            Error::SnapshotFieldNotFound(snapshot_name.to_owned(), field_path.to_owned())
+        })?;
+    }
+    Ok(match current {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    })
+}
+
+/// Captures cargo metadata for the workspace rooted at `manifest_dir` and
+/// stores it under the name given in `step`.
+///
+/// The snapshot is written to two locations within `state_base/snapshots/{name}/`:
+/// - `by_manifest/{hex_encoded_manifest_dir}.json`: for exact per-context lookup.
+/// - `latest.json`: overwritten on every capture to serve as a cross-context fallback.
+///
+/// A completion marker is written to `state_dir/snapshot_metadata_completed`.
+///
+/// # Errors
+///
+/// Returns an error if `cargo metadata` fails, if the JSON cannot be serialized,
+/// or if any filesystem operation fails.
+async fn execute_snapshot_metadata_step(
+    step: &SnapshotMetadataNode,
+    cursor: &ProgramCursor,
+    manifest_dir: &Path,
+    state_base: &Path,
+) -> Result<(), Error> {
+    let state_dir = state_base.join(cursor.to_path());
+    fs_err::create_dir_all(&state_dir)
+        .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+    let metadata = MetadataCommand::new()
+        .manifest_path(manifest_dir.join("Cargo.toml"))
+        .exec()
+        .map_err(|e| Error::CargoMetadataError(manifest_dir.to_path_buf(), e))?;
+    let json = serde_json::to_string_pretty(&metadata)
+        .map_err(Error::CouldNotSerializeMetadataSnapshot)?;
+    let name_dir = state_base.join("snapshots").join(&step.name);
+    let by_manifest_dir = name_dir.join("by_manifest");
+    fs_err::create_dir_all(&by_manifest_dir)
+        .map_err(|e| Error::CouldNotCreateStateDir(by_manifest_dir.clone(), e))?;
+    let hex_key: String = manifest_dir
+        .to_string_lossy()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .concat();
+    let mut filename = hex_key;
+    filename.push_str(".json");
+    let per_manifest_path = by_manifest_dir.join(&filename);
+    fs_err::write(&per_manifest_path, &json)
+        .map_err(|e| Error::CouldNotWriteStateFile(per_manifest_path.clone(), e))?;
+    let latest_path = name_dir.join("latest.json");
+    fs_err::write(&latest_path, &json)
+        .map_err(|e| Error::CouldNotWriteStateFile(latest_path.clone(), e))?;
+    let marker = state_dir.join("snapshot_metadata_completed");
+    fs_err::write(&marker, "done").map_err(|e| Error::CouldNotWriteStateFile(marker.clone(), e))?;
+    Ok(())
+}
+
 /// Executes a `run` step using asciinema for recording.
 ///
 /// # Errors
@@ -734,10 +920,14 @@ async fn execute_run_step(
     fs_err::create_dir_all(&state_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
 
-    let command = &step.command;
-    let args = &step.args;
+    let command = expand_interpolations(&step.command, manifest_dir, state_base)?;
+    let args = step
+        .args
+        .iter()
+        .map(|a| expand_interpolations(a, manifest_dir, state_base))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    if !crate::utils::command_is_executable(command, environment) {
+    if !crate::utils::command_is_executable(&command, environment) {
         return Err(Error::CommandNotFound(command.clone()));
     }
 
@@ -829,8 +1019,10 @@ async fn execute_manual_step(
     fs_err::create_dir_all(&state_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
 
-    println!("--- Manual Step: {} ---", step.title);
-    println!("{}", step.instructions);
+    let title = expand_interpolations(&step.title, manifest_dir, state_base)?;
+    let instructions = expand_interpolations(&step.instructions, manifest_dir, state_base)?;
+    println!("--- Manual Step: {title} ---");
+    println!("{instructions}");
     println!(
         "Starting a recording shell in {}. Press Ctrl+D or type `exit` to continue.",
         manifest_dir.display()
@@ -991,6 +1183,11 @@ async fn run_crate_stmts_to_completion(
                         .await?;
                 }
             }
+            CrateStatement::SnapshotMetadata(step) => {
+                if !is_snapshot_metadata_completed(&state_dir) {
+                    execute_snapshot_metadata_step(step, &cursor, manifest_dir, state_base).await?;
+                }
+            }
             CrateStatement::If(block) => {
                 let chosen_branch_path = state_dir.join("chosen_branch");
                 if !chosen_branch_path.exists() {
@@ -1072,6 +1269,11 @@ async fn run_workspace_stmts_to_completion(
                 if !is_manual_completed(&state_dir) {
                     execute_manual_step(step, &cursor, manifest_dir, state_base, environment)
                         .await?;
+                }
+            }
+            WorkspaceStatement::SnapshotMetadata(step) => {
+                if !is_snapshot_metadata_completed(&state_dir) {
+                    execute_snapshot_metadata_step(step, &cursor, manifest_dir, state_base).await?;
                 }
             }
             WorkspaceStatement::If(block) => {
@@ -1269,7 +1471,9 @@ fn find_last_completed_workspace_stmt(
                     }
                 }
             }
-            WorkspaceStatement::Run(_) | WorkspaceStatement::ManualStep(_) => {}
+            WorkspaceStatement::Run(_)
+            | WorkspaceStatement::ManualStep(_)
+            | WorkspaceStatement::SnapshotMetadata(_) => {}
         }
         if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base) {
             return Some(cursor);
@@ -1392,6 +1596,10 @@ pub async fn run_single_step_command(
                     &environment,
                     &config,
                 )?;
+            }
+            StatementAction::SnapshotMetadata(step) => {
+                execute_snapshot_metadata_step(step, &next.cursor, next.manifest_dir, &state_base)
+                    .await?;
             }
         }
     } else {

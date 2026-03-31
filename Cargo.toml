@@ -55,6 +55,7 @@ futures = "0.3.32"
 humantime = "2.3.0"
 log-panics = { version = "2.1.0", features = ["with-backtrace"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["macros", "parsing"] }
 tokio = { version = "1.50.0", features = ["full"] }
