@@ -956,7 +956,7 @@ async fn execute_run_step(
 
     let cast_path = state_dir.join("asciinema.cast");
     let mut cmd = Command::new("asciinema");
-    cmd.arg("record");
+    cmd.arg("record").arg("--overwrite");
     if environment.suppress_subprocess_output {
         cmd.arg("--headless");
     }
