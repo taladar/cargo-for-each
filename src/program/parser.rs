@@ -75,7 +75,7 @@ fn format_error(error: Rich<'_, char>, source: &str, filename: &str) -> ParseErr
     let range = span.start..span.end;
 
     let mut buf = Vec::new();
-    Report::build(ReportKind::Error, filename, span.start)
+    Report::build(ReportKind::Error, (filename, range.clone()))
         .with_message(error.to_string())
         .with_label(
             Label::new((filename, range))
