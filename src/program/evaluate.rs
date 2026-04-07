@@ -62,9 +62,21 @@ pub fn evaluate_common_condition(
                 return Err(Error::CommandNotFound("git".to_owned()));
             }
             let mut cmd = std::process::Command::new("git");
+            // do not use the util function here since we need to capture output to evaluate
+            // if it is empty
             cmd.args(["status", "--porcelain"])
-                .current_dir(manifest_dir);
-            let output = crate::utils::execute_command(&mut cmd, environment, manifest_dir)?;
+                .current_dir(manifest_dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let output = cmd.output().map_err(|e| {
+                Error::CommandExecutionFailed(
+                    "git status -porcelain".to_string(),
+                    manifest_dir.to_path_buf(),
+                    e,
+                )
+            })?;
+
             Ok(output.stdout.is_empty())
         }
         CommonCondition::Not(inner) => Ok(!evaluate_common_condition(
