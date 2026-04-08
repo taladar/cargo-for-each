@@ -51,6 +51,19 @@ pub struct SnapshotMetadataNode {
     pub name: String,
 }
 
+/// A block that applies environment variables from a file to all nested statements.
+///
+/// The env file is read at execution time, relative to the target's manifest directory.
+/// Variables from nested `with_env_file` blocks extend (and override, for duplicate keys)
+/// variables from outer blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WithEnvFileBlock<S> {
+    /// Path to the env file, relative to the target's manifest directory.
+    pub env_file: String,
+    /// Statements to execute with the env file's variables applied.
+    pub statements: Vec<S>,
+}
+
 /// A boolean condition available in all execution contexts.
 ///
 /// This represents the subset of conditions that do not depend on workspace- or

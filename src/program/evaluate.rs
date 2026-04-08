@@ -37,6 +37,7 @@ pub fn evaluate_common_condition(
     manifest_dir: &Path,
     environment: &crate::Environment,
     config: &crate::Config,
+    extra_env: &[(String, String)],
 ) -> Result<bool, Error> {
     match cond {
         CommonCondition::AskUser(question) => {
@@ -55,6 +56,9 @@ pub fn evaluate_common_condition(
             }
             let mut cmd = std::process::Command::new(command);
             cmd.args(args).current_dir(manifest_dir);
+            for (k, v) in extra_env {
+                cmd.env(k, v);
+            }
             let output = crate::utils::execute_command(&mut cmd, environment, manifest_dir)?;
             Ok(output.status.success())
         }
@@ -86,10 +90,11 @@ pub fn evaluate_common_condition(
             manifest_dir,
             environment,
             config,
+            extra_env,
         )?),
         CommonCondition::And(conditions) => {
             for c in conditions {
-                if !evaluate_common_condition(c, manifest_dir, environment, config)? {
+                if !evaluate_common_condition(c, manifest_dir, environment, config, extra_env)? {
                     return Ok(false);
                 }
             }
@@ -97,7 +102,7 @@ pub fn evaluate_common_condition(
         }
         CommonCondition::Or(conditions) => {
             for c in conditions {
-                if evaluate_common_condition(c, manifest_dir, environment, config)? {
+                if evaluate_common_condition(c, manifest_dir, environment, config, extra_env)? {
                     return Ok(true);
                 }
             }
@@ -134,10 +139,11 @@ pub fn evaluate_workspace_condition(
     manifest_dir: &Path,
     environment: &crate::Environment,
     config: &crate::Config,
+    extra_env: &[(String, String)],
 ) -> Result<bool, Error> {
     match cond {
         WorkspaceCondition::Common(inner) => {
-            evaluate_common_condition(inner, manifest_dir, environment, config)
+            evaluate_common_condition(inner, manifest_dir, environment, config, extra_env)
         }
         WorkspaceCondition::Standalone => Ok(config
             .workspaces
@@ -152,10 +158,11 @@ pub fn evaluate_workspace_condition(
             manifest_dir,
             environment,
             config,
+            extra_env,
         )?),
         WorkspaceCondition::And(conditions) => {
             for c in conditions {
-                if !evaluate_workspace_condition(c, manifest_dir, environment, config)? {
+                if !evaluate_workspace_condition(c, manifest_dir, environment, config, extra_env)? {
                     return Ok(false);
                 }
             }
@@ -163,7 +170,7 @@ pub fn evaluate_workspace_condition(
         }
         WorkspaceCondition::Or(conditions) => {
             for c in conditions {
-                if evaluate_workspace_condition(c, manifest_dir, environment, config)? {
+                if evaluate_workspace_condition(c, manifest_dir, environment, config, extra_env)? {
                     return Ok(true);
                 }
             }
@@ -186,10 +193,11 @@ pub fn evaluate_crate_condition(
     manifest_dir: &Path,
     environment: &crate::Environment,
     config: &crate::Config,
+    extra_env: &[(String, String)],
 ) -> Result<bool, Error> {
     match cond {
         CrateCondition::Common(inner) => {
-            evaluate_common_condition(inner, manifest_dir, environment, config)
+            evaluate_common_condition(inner, manifest_dir, environment, config, extra_env)
         }
         CrateCondition::CrateType(filter) => {
             let required = match filter {
@@ -222,10 +230,11 @@ pub fn evaluate_crate_condition(
             manifest_dir,
             environment,
             config,
+            extra_env,
         )?),
         CrateCondition::And(conditions) => {
             for c in conditions {
-                if !evaluate_crate_condition(c, manifest_dir, environment, config)? {
+                if !evaluate_crate_condition(c, manifest_dir, environment, config, extra_env)? {
                     return Ok(false);
                 }
             }
@@ -233,7 +242,7 @@ pub fn evaluate_crate_condition(
         }
         CrateCondition::Or(conditions) => {
             for c in conditions {
-                if evaluate_crate_condition(c, manifest_dir, environment, config)? {
+                if evaluate_crate_condition(c, manifest_dir, environment, config, extra_env)? {
                     return Ok(true);
                 }
             }
@@ -296,6 +305,7 @@ mod tests {
             dir,
             &env,
             &config,
+            &[],
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
     }
@@ -310,6 +320,7 @@ mod tests {
             temp.path(),
             &env,
             &config,
+            &[],
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), false);
     }
@@ -324,6 +335,7 @@ mod tests {
             temp.path(),
             &env,
             &config,
+            &[],
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
     }
@@ -341,6 +353,7 @@ mod tests {
             temp.path(),
             &env,
             &config,
+            &[],
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), false);
     }
@@ -360,6 +373,7 @@ mod tests {
             dir,
             &env,
             &config,
+            &[],
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
     }
@@ -386,6 +400,7 @@ mod tests {
             dir,
             &env,
             &config,
+            &[],
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
     }
@@ -411,6 +426,7 @@ mod tests {
             dir,
             &env,
             &config,
+            &[],
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), false);
     }
@@ -430,6 +446,7 @@ mod tests {
             dir,
             &env,
             &config,
+            &[],
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), false);
     }
@@ -450,6 +467,7 @@ mod tests {
             dir,
             &env,
             &config,
+            &[],
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), false);
     }
@@ -469,7 +487,7 @@ mod tests {
             crates: vec![],
         };
         let result =
-            evaluate_workspace_condition(&WorkspaceCondition::Standalone, dir, &env, &config);
+            evaluate_workspace_condition(&WorkspaceCondition::Standalone, dir, &env, &config, &[]);
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
     }
 
@@ -486,7 +504,7 @@ mod tests {
             crates: vec![],
         };
         let result =
-            evaluate_workspace_condition(&WorkspaceCondition::HasMembers, dir, &env, &config);
+            evaluate_workspace_condition(&WorkspaceCondition::HasMembers, dir, &env, &config, &[]);
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
     }
 
@@ -503,6 +521,7 @@ mod tests {
             dir,
             &env,
             &config,
+            &[],
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
     }
@@ -518,6 +537,7 @@ mod tests {
             dir,
             &env,
             &config,
+            &[],
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), false);
     }
@@ -528,7 +548,7 @@ mod tests {
         let dir = temp.path();
         let env = mock_env(&temp);
         let config = config_with_bin_crate(dir);
-        let result = evaluate_crate_condition(&CrateCondition::Standalone, dir, &env, &config);
+        let result = evaluate_crate_condition(&CrateCondition::Standalone, dir, &env, &config, &[]);
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
     }
 }

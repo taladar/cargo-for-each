@@ -178,6 +178,9 @@ pub enum Error {
         "invalid interpolation reference '{0}': must be '${{name.field}}' with at least one field after the name"
     )]
     InvalidInterpolation(String),
+    /// the env file specified in a `with_env_file` block could not be read
+    #[error("could not read env file {0}: {1}")]
+    CouldNotReadEnvFile(std::path::PathBuf, #[source] std::io::Error),
     /// the specified program file was not found
     #[error("program file not found: {0}")]
     ProgramNotFound(std::path::PathBuf),

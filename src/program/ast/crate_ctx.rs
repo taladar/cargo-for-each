@@ -2,6 +2,7 @@
 
 use super::common::{
     Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
+    WithEnvFileBlock,
 };
 
 /// The type of a Rust crate, used as a filter in crate-context conditions.
@@ -34,6 +35,8 @@ pub enum CrateStatement {
     If(IfBlock<CrateCondition, Self>),
     /// Capture and store cargo metadata for the current workspace under a name.
     SnapshotMetadata(SnapshotMetadataNode),
+    /// Execute nested statements with environment variables loaded from a file.
+    WithEnvFile(WithEnvFileBlock<Self>),
 }
 
 /// A boolean condition available in the crate execution context.

@@ -14,6 +14,7 @@
 //! | `s{N}`           | Nth statement in current scope               |
 //! | `if{N}`          | Branch N chosen in an `if` block             |
 //! | `else`           | Else branch chosen in an `if` block          |
+//! | `env`            | Body of a `with_env_file` block              |
 //!
 //! ### Examples
 //!
@@ -22,6 +23,7 @@
 //! w1/s3/if0/s1/     workspace 1, stmt 3 (if), branch 0, stmt 1
 //! w0/c2/s0/         workspace 0, crate 2, statement 0
 //! c1/s0/            global-crate-loop crate 1, statement 0
+//! w0/s1/env/s0/     workspace 0, stmt 1 (with_env_file), nested stmt 0
 //! ```
 
 use std::fmt;
@@ -45,6 +47,8 @@ pub enum CursorSegment {
     IfBranch(usize),
     /// `else` — the else branch was chosen in an `if` block.
     ElseBranch,
+    /// `env` — the body of a `with_env_file` block.
+    WithEnvFile,
 }
 
 impl fmt::Display for CursorSegment {
@@ -55,6 +59,7 @@ impl fmt::Display for CursorSegment {
             Self::Statement(n) => write!(f, "s{n}"),
             Self::IfBranch(n) => write!(f, "if{n}"),
             Self::ElseBranch => write!(f, "else"),
+            Self::WithEnvFile => write!(f, "env"),
         }
     }
 }
@@ -85,6 +90,9 @@ impl FromStr for CursorSegment {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s == "else" {
             return Ok(Self::ElseBranch);
+        }
+        if s == "env" {
+            return Ok(Self::WithEnvFile);
         }
         if let Some(rest) = s.strip_prefix("w") {
             let n = rest
@@ -302,6 +310,33 @@ mod tests {
             "else".parse::<CursorSegment>(),
             Ok(CursorSegment::ElseBranch)
         );
+    }
+
+    #[test]
+    fn segment_display_with_env_file() {
+        assert_eq!(CursorSegment::WithEnvFile.to_string(), "env");
+    }
+
+    #[test]
+    fn segment_parse_with_env_file() {
+        assert_eq!(
+            "env".parse::<CursorSegment>(),
+            Ok(CursorSegment::WithEnvFile)
+        );
+    }
+
+    #[test]
+    fn cursor_roundtrip_with_env_file() {
+        let original = ProgramCursor::from_segments(vec![
+            CursorSegment::WorkspaceIteration(0),
+            CursorSegment::Statement(1),
+            CursorSegment::WithEnvFile,
+            CursorSegment::Statement(0),
+        ]);
+        let s = original.to_path_string();
+        assert_eq!(s, "w0/s1/env/s0/");
+        let parsed = ProgramCursor::from_path_string(&s).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(parsed, original);
     }
 
     #[test]

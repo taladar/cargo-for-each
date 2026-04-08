@@ -60,6 +60,74 @@ pub fn state_dir_for_task(name: &str, environment: &crate::Environment) -> Resul
         .join(name))
 }
 
+// ── Env file helpers ───────────────────────────────────────────────────────────
+
+/// Parses a `.env`-format string into a list of `(key, value)` pairs.
+///
+/// Supports:
+/// - `KEY=VALUE` lines (bare or with `export ` prefix)
+/// - Lines starting with `#` are treated as comments and ignored
+/// - Blank lines are ignored
+/// - Values optionally wrapped in single or double quotes (quotes are stripped)
+fn parse_env_file_content(content: &str) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_owned();
+        let value = value.trim();
+        let value = if let Some(inner) = value
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        {
+            inner.to_owned()
+        } else {
+            value.to_owned()
+        };
+        if !key.is_empty() {
+            vars.push((key, value));
+        }
+    }
+    vars
+}
+
+/// Reads and parses an env file at `path`, returning the key-value pairs.
+///
+/// # Errors
+///
+/// Returns [`Error::CouldNotReadEnvFile`] if the file cannot be read.
+fn load_env_file(path: &Path) -> Result<Vec<(String, String)>, Error> {
+    let content = fs_err::read_to_string(path)
+        .map_err(|e| Error::CouldNotReadEnvFile(path.to_path_buf(), e))?;
+    Ok(parse_env_file_content(&content))
+}
+
+/// Loads and combines env vars from a sequence of env file paths (relative to `manifest_dir`).
+///
+/// Files are applied in order; later files override earlier ones for the same key.
+///
+/// # Errors
+///
+/// Returns an error if any env file cannot be read.
+fn load_env_vars_from_files(
+    env_file_paths: &[String],
+    manifest_dir: &Path,
+) -> Result<Vec<(String, String)>, Error> {
+    let mut vars = Vec::new();
+    for path_str in env_file_paths {
+        let path = manifest_dir.join(path_str);
+        vars.extend(load_env_file(&path)?);
+    }
+    Ok(vars)
+}
+
 // ── CLI parameter structs ──────────────────────────────────────────────────────
 
 /// Parameters for creating a new task.
@@ -312,6 +380,10 @@ fn is_crate_stmt_completed(
                 }),
             }
         }
+        CrateStatement::WithEnvFile(block) => {
+            let p = cursor.clone().with(CursorSegment::WithEnvFile);
+            is_crate_stmts_completed(&block.statements, &p, state_base)
+        }
     }
 }
 
@@ -369,6 +441,10 @@ fn is_workspace_stmt_completed(
                     })
                 }),
             }
+        }
+        WorkspaceStatement::WithEnvFile(block) => {
+            let p = cursor.clone().with(CursorSegment::WithEnvFile);
+            is_workspace_stmts_completed(&block.statements, &p, member_crates, state_base)
         }
         WorkspaceStatement::ForCrateInWorkspace(block) => {
             member_crates.iter().enumerate().all(|(c_idx, _)| {
@@ -480,6 +556,9 @@ pub struct NextStatement<'a> {
     pub manifest_dir: &'a Path,
     /// What to do at this cursor position.
     pub action: StatementAction<'a>,
+    /// Env file paths (relative to `manifest_dir`) from enclosing `with_env_file` blocks,
+    /// ordered from outermost to innermost.
+    pub env_file_paths: Vec<String>,
 }
 
 /// Finds the first uncompleted crate statement in `stmts` starting at `prefix`.
@@ -490,6 +569,7 @@ fn find_next_in_crate_stmts<'a>(
     prefix: &ProgramCursor,
     manifest_dir: &'a Path,
     state_base: &Path,
+    env_file_paths: &[String],
 ) -> Option<NextStatement<'a>> {
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
@@ -502,6 +582,7 @@ fn find_next_in_crate_stmts<'a>(
                         cursor,
                         manifest_dir,
                         action: StatementAction::RunCommand(step),
+                        env_file_paths: env_file_paths.to_vec(),
                     });
                 }
             }
@@ -511,6 +592,7 @@ fn find_next_in_crate_stmts<'a>(
                         cursor,
                         manifest_dir,
                         action: StatementAction::ManualStep(step),
+                        env_file_paths: env_file_paths.to_vec(),
                     });
                 }
             }
@@ -520,6 +602,7 @@ fn find_next_in_crate_stmts<'a>(
                         cursor,
                         manifest_dir,
                         action: StatementAction::SnapshotMetadata(step),
+                        env_file_paths: env_file_paths.to_vec(),
                     });
                 }
             }
@@ -530,6 +613,7 @@ fn find_next_in_crate_stmts<'a>(
                             cursor,
                             manifest_dir,
                             action: StatementAction::EvaluateCrateIf(block),
+                            env_file_paths: env_file_paths.to_vec(),
                         });
                     }
                     Ok(chosen) => {
@@ -542,6 +626,7 @@ fn find_next_in_crate_stmts<'a>(
                                     &p,
                                     manifest_dir,
                                     state_base,
+                                    env_file_paths,
                                 )
                             }
                             s => s.parse::<usize>().ok().and_then(|n| {
@@ -552,6 +637,7 @@ fn find_next_in_crate_stmts<'a>(
                                         &p,
                                         manifest_dir,
                                         state_base,
+                                        env_file_paths,
                                     )
                                 })
                             }),
@@ -560,6 +646,21 @@ fn find_next_in_crate_stmts<'a>(
                             return nested;
                         }
                     }
+                }
+            }
+            CrateStatement::WithEnvFile(block) => {
+                let inner_prefix = cursor.clone().with(CursorSegment::WithEnvFile);
+                let mut inner_env_files = env_file_paths.to_vec();
+                inner_env_files.push(block.env_file.clone());
+                let nested = find_next_in_crate_stmts(
+                    &block.statements,
+                    &inner_prefix,
+                    manifest_dir,
+                    state_base,
+                    &inner_env_files,
+                );
+                if nested.is_some() {
+                    return nested;
                 }
             }
         }
@@ -576,6 +677,7 @@ fn find_next_in_workspace_stmts<'a>(
     manifest_dir: &'a Path,
     member_crates: &'a [ResolvedCrateExecution],
     state_base: &Path,
+    env_file_paths: &[String],
 ) -> Option<NextStatement<'a>> {
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
@@ -588,6 +690,7 @@ fn find_next_in_workspace_stmts<'a>(
                         cursor,
                         manifest_dir,
                         action: StatementAction::RunCommand(step),
+                        env_file_paths: env_file_paths.to_vec(),
                     });
                 }
             }
@@ -597,6 +700,7 @@ fn find_next_in_workspace_stmts<'a>(
                         cursor,
                         manifest_dir,
                         action: StatementAction::ManualStep(step),
+                        env_file_paths: env_file_paths.to_vec(),
                     });
                 }
             }
@@ -606,6 +710,7 @@ fn find_next_in_workspace_stmts<'a>(
                         cursor,
                         manifest_dir,
                         action: StatementAction::SnapshotMetadata(step),
+                        env_file_paths: env_file_paths.to_vec(),
                     });
                 }
             }
@@ -616,6 +721,7 @@ fn find_next_in_workspace_stmts<'a>(
                             cursor,
                             manifest_dir,
                             action: StatementAction::EvaluateWorkspaceIf(block),
+                            env_file_paths: env_file_paths.to_vec(),
                         });
                     }
                     Ok(chosen) => {
@@ -629,6 +735,7 @@ fn find_next_in_workspace_stmts<'a>(
                                     manifest_dir,
                                     member_crates,
                                     state_base,
+                                    env_file_paths,
                                 )
                             }
                             s => s.parse::<usize>().ok().and_then(|n| {
@@ -640,6 +747,7 @@ fn find_next_in_workspace_stmts<'a>(
                                         manifest_dir,
                                         member_crates,
                                         state_base,
+                                        env_file_paths,
                                     )
                                 })
                             }),
@@ -648,6 +756,22 @@ fn find_next_in_workspace_stmts<'a>(
                             return nested;
                         }
                     }
+                }
+            }
+            WorkspaceStatement::WithEnvFile(block) => {
+                let inner_prefix = cursor.clone().with(CursorSegment::WithEnvFile);
+                let mut inner_env_files = env_file_paths.to_vec();
+                inner_env_files.push(block.env_file.clone());
+                let nested = find_next_in_workspace_stmts(
+                    &block.statements,
+                    &inner_prefix,
+                    manifest_dir,
+                    member_crates,
+                    state_base,
+                    &inner_env_files,
+                );
+                if nested.is_some() {
+                    return nested;
                 }
             }
             WorkspaceStatement::ForCrateInWorkspace(block) => {
@@ -673,6 +797,7 @@ fn find_next_in_workspace_stmts<'a>(
                         &c_prefix,
                         &crate_exec.manifest_dir,
                         state_base,
+                        env_file_paths,
                     );
                     if nested.is_some() {
                         return nested;
@@ -714,6 +839,7 @@ pub fn find_next_statement<'a>(
             &ws_exec.manifest_dir,
             &ws_exec.member_crates,
             state_base,
+            &[],
         );
         if next.is_some() {
             return next;
@@ -733,8 +859,13 @@ pub fn find_next_statement<'a>(
             continue;
         }
         let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
-        let next =
-            find_next_in_crate_stmts(crate_stmts, &prefix, &crate_exec.manifest_dir, state_base);
+        let next = find_next_in_crate_stmts(
+            crate_stmts,
+            &prefix,
+            &crate_exec.manifest_dir,
+            state_base,
+            &[],
+        );
         if next.is_some() {
             return next;
         }
@@ -915,6 +1046,7 @@ async fn execute_run_step(
     manifest_dir: &Path,
     state_base: &Path,
     environment: &Environment,
+    extra_env: &[(String, String)],
 ) -> Result<(), Error> {
     let state_dir = state_base.join(cursor.to_path());
     fs_err::create_dir_all(&state_dir)
@@ -965,6 +1097,9 @@ async fn execute_run_step(
         .arg(wrapper_path.to_string_lossy().as_ref())
         .arg(&cast_path);
     cmd.env("CARGO_FOR_EACH_EXIT_STATUS_PATH", &exit_status_path);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     cmd.current_dir(manifest_dir);
 
     match crate::utils::execute_command(&mut cmd, environment, manifest_dir) {
@@ -1014,6 +1149,7 @@ async fn execute_manual_step(
     manifest_dir: &Path,
     state_base: &Path,
     environment: &Environment,
+    extra_env: &[(String, String)],
 ) -> Result<(), Error> {
     let state_dir = state_base.join(cursor.to_path());
     fs_err::create_dir_all(&state_dir)
@@ -1035,6 +1171,9 @@ async fn execute_manual_step(
         cmd.arg("--headless");
     }
     cmd.arg("-q").arg(&cast_path);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     cmd.current_dir(manifest_dir);
 
     let status = crate::utils::execute_command(&mut cmd, environment, manifest_dir)?.status;
@@ -1079,6 +1218,7 @@ fn evaluate_workspace_if_block(
     state_base: &Path,
     environment: &Environment,
     config: &Config,
+    extra_env: &[(String, String)],
 ) -> Result<(), Error> {
     let state_dir = state_base.join(cursor.to_path());
     fs_err::create_dir_all(&state_dir)
@@ -1086,8 +1226,13 @@ fn evaluate_workspace_if_block(
 
     let mut chosen: Option<usize> = None;
     for (i, branch) in block.branches.iter().enumerate() {
-        if evaluate_workspace_condition(&branch.condition, manifest_dir, environment, config)?
-            && chosen.is_none()
+        if evaluate_workspace_condition(
+            &branch.condition,
+            manifest_dir,
+            environment,
+            config,
+            extra_env,
+        )? && chosen.is_none()
         {
             chosen = Some(i);
         }
@@ -1121,6 +1266,7 @@ fn evaluate_crate_if_block(
     state_base: &Path,
     environment: &Environment,
     config: &Config,
+    extra_env: &[(String, String)],
 ) -> Result<(), Error> {
     let state_dir = state_base.join(cursor.to_path());
     fs_err::create_dir_all(&state_dir)
@@ -1128,8 +1274,13 @@ fn evaluate_crate_if_block(
 
     let mut chosen: Option<usize> = None;
     for (i, branch) in block.branches.iter().enumerate() {
-        if evaluate_crate_condition(&branch.condition, manifest_dir, environment, config)?
-            && chosen.is_none()
+        if evaluate_crate_condition(
+            &branch.condition,
+            manifest_dir,
+            environment,
+            config,
+            extra_env,
+        )? && chosen.is_none()
         {
             chosen = Some(i);
         }
@@ -1166,6 +1317,7 @@ async fn run_crate_stmts_to_completion(
     state_base: &Path,
     environment: &Environment,
     config: &Config,
+    extra_env: &[(String, String)],
 ) -> Result<(), Error> {
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
@@ -1174,13 +1326,21 @@ async fn run_crate_stmts_to_completion(
         match stmt {
             CrateStatement::Run(step) => {
                 if !is_run_completed(&state_dir) {
-                    execute_run_step(step, &cursor, manifest_dir, state_base, environment).await?;
+                    execute_run_step(step, &cursor, manifest_dir, state_base, environment, extra_env)
+                        .await?;
                 }
             }
             CrateStatement::ManualStep(step) => {
                 if !is_manual_completed(&state_dir) {
-                    execute_manual_step(step, &cursor, manifest_dir, state_base, environment)
-                        .await?;
+                    execute_manual_step(
+                        step,
+                        &cursor,
+                        manifest_dir,
+                        state_base,
+                        environment,
+                        extra_env,
+                    )
+                    .await?;
                 }
             }
             CrateStatement::SnapshotMetadata(step) => {
@@ -1198,6 +1358,7 @@ async fn run_crate_stmts_to_completion(
                         state_base,
                         environment,
                         config,
+                        extra_env,
                     )?;
                 }
                 let chosen = fs_err::read_to_string(&chosen_branch_path)
@@ -1213,6 +1374,7 @@ async fn run_crate_stmts_to_completion(
                             state_base,
                             environment,
                             config,
+                            extra_env,
                         ))
                         .await?;
                     }
@@ -1228,11 +1390,28 @@ async fn run_crate_stmts_to_completion(
                                 state_base,
                                 environment,
                                 config,
+                                extra_env,
                             ))
                             .await?;
                         }
                     }
                 }
+            }
+            CrateStatement::WithEnvFile(block) => {
+                let file_vars = load_env_file(&manifest_dir.join(&block.env_file))?;
+                let mut combined = extra_env.to_vec();
+                combined.extend(file_vars);
+                let inner_prefix = cursor.clone().with(CursorSegment::WithEnvFile);
+                Box::pin(run_crate_stmts_to_completion(
+                    &block.statements,
+                    &inner_prefix,
+                    manifest_dir,
+                    state_base,
+                    environment,
+                    config,
+                    &combined,
+                ))
+                .await?;
             }
         }
     }
@@ -1246,6 +1425,10 @@ async fn run_crate_stmts_to_completion(
 /// # Errors
 ///
 /// Returns an error if any statement fails.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all parameters are needed; the env-file threading adds one more than clippy's default limit"
+)]
 async fn run_workspace_stmts_to_completion(
     stmts: &[WorkspaceStatement],
     prefix: &ProgramCursor,
@@ -1254,6 +1437,7 @@ async fn run_workspace_stmts_to_completion(
     state_base: &Path,
     environment: &Environment,
     config: &Config,
+    extra_env: &[(String, String)],
 ) -> Result<(), Error> {
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
@@ -1262,13 +1446,21 @@ async fn run_workspace_stmts_to_completion(
         match stmt {
             WorkspaceStatement::Run(step) => {
                 if !is_run_completed(&state_dir) {
-                    execute_run_step(step, &cursor, manifest_dir, state_base, environment).await?;
+                    execute_run_step(step, &cursor, manifest_dir, state_base, environment, extra_env)
+                        .await?;
                 }
             }
             WorkspaceStatement::ManualStep(step) => {
                 if !is_manual_completed(&state_dir) {
-                    execute_manual_step(step, &cursor, manifest_dir, state_base, environment)
-                        .await?;
+                    execute_manual_step(
+                        step,
+                        &cursor,
+                        manifest_dir,
+                        state_base,
+                        environment,
+                        extra_env,
+                    )
+                    .await?;
                 }
             }
             WorkspaceStatement::SnapshotMetadata(step) => {
@@ -1286,6 +1478,7 @@ async fn run_workspace_stmts_to_completion(
                         state_base,
                         environment,
                         config,
+                        extra_env,
                     )?;
                 }
                 let chosen = fs_err::read_to_string(&chosen_branch_path)
@@ -1302,6 +1495,7 @@ async fn run_workspace_stmts_to_completion(
                             state_base,
                             environment,
                             config,
+                            extra_env,
                         ))
                         .await?;
                     }
@@ -1318,11 +1512,29 @@ async fn run_workspace_stmts_to_completion(
                                 state_base,
                                 environment,
                                 config,
+                                extra_env,
                             ))
                             .await?;
                         }
                     }
                 }
+            }
+            WorkspaceStatement::WithEnvFile(block) => {
+                let file_vars = load_env_file(&manifest_dir.join(&block.env_file))?;
+                let mut combined = extra_env.to_vec();
+                combined.extend(file_vars);
+                let inner_prefix = cursor.clone().with(CursorSegment::WithEnvFile);
+                Box::pin(run_workspace_stmts_to_completion(
+                    &block.statements,
+                    &inner_prefix,
+                    manifest_dir,
+                    member_crates,
+                    state_base,
+                    environment,
+                    config,
+                    &combined,
+                ))
+                .await?;
             }
             WorkspaceStatement::ForCrateInWorkspace(block) => {
                 // Member crates are already in intra-workspace dependency order.
@@ -1335,6 +1547,7 @@ async fn run_workspace_stmts_to_completion(
                         state_base,
                         environment,
                         config,
+                        extra_env,
                     )
                     .await?;
                 }
@@ -1393,26 +1606,38 @@ fn find_last_completed_crate_stmt(
 ) -> Option<ProgramCursor> {
     for (i, stmt) in stmts.iter().enumerate().rev() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
-        // Check inside IfBlocks for nested completed statements first.
-        if let CrateStatement::If(block) = stmt {
-            let state_dir = state_base.join(cursor.to_path());
-            if let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) {
-                let nested = match chosen.trim() {
-                    "else" => {
-                        let p = cursor.clone().with(CursorSegment::ElseBranch);
-                        find_last_completed_crate_stmt(&block.else_statements, &p, state_base)
+        // Check inside IfBlocks and WithEnvFile blocks for nested completed statements first.
+        match stmt {
+            CrateStatement::If(block) => {
+                let state_dir = state_base.join(cursor.to_path());
+                if let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) {
+                    let nested = match chosen.trim() {
+                        "else" => {
+                            let p = cursor.clone().with(CursorSegment::ElseBranch);
+                            find_last_completed_crate_stmt(&block.else_statements, &p, state_base)
+                        }
+                        s => s.parse::<usize>().ok().and_then(|n| {
+                            block.branches.get(n).and_then(|branch| {
+                                let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                                find_last_completed_crate_stmt(&branch.statements, &p, state_base)
+                            })
+                        }),
+                    };
+                    if nested.is_some() {
+                        return nested;
                     }
-                    s => s.parse::<usize>().ok().and_then(|n| {
-                        block.branches.get(n).and_then(|branch| {
-                            let p = cursor.clone().with(CursorSegment::IfBranch(n));
-                            find_last_completed_crate_stmt(&branch.statements, &p, state_base)
-                        })
-                    }),
-                };
+                }
+            }
+            CrateStatement::WithEnvFile(block) => {
+                let p = cursor.clone().with(CursorSegment::WithEnvFile);
+                let nested = find_last_completed_crate_stmt(&block.statements, &p, state_base);
                 if nested.is_some() {
                     return nested;
                 }
             }
+            CrateStatement::Run(_)
+            | CrateStatement::ManualStep(_)
+            | CrateStatement::SnapshotMetadata(_) => {}
         }
         if is_crate_stmt_completed(stmt, &cursor, state_base) {
             return Some(cursor);
@@ -1459,6 +1684,14 @@ fn find_last_completed_workspace_stmt(
                     if nested.is_some() {
                         return nested;
                     }
+                }
+            }
+            WorkspaceStatement::WithEnvFile(block) => {
+                let p = cursor.clone().with(CursorSegment::WithEnvFile);
+                let nested =
+                    find_last_completed_workspace_stmt(&block.statements, &p, member_crates, state_base);
+                if nested.is_some() {
+                    return nested;
                 }
             }
             WorkspaceStatement::ForCrateInWorkspace(block) => {
@@ -1556,6 +1789,7 @@ pub async fn run_single_step_command(
             next.cursor,
             next.manifest_dir.display()
         );
+        let extra_env = load_env_vars_from_files(&next.env_file_paths, next.manifest_dir)?;
         match next.action {
             StatementAction::RunCommand(step) => {
                 execute_run_step(
@@ -1564,6 +1798,7 @@ pub async fn run_single_step_command(
                     next.manifest_dir,
                     &state_base,
                     &environment,
+                    &extra_env,
                 )
                 .await?;
             }
@@ -1574,6 +1809,7 @@ pub async fn run_single_step_command(
                     next.manifest_dir,
                     &state_base,
                     &environment,
+                    &extra_env,
                 )
                 .await?;
             }
@@ -1585,6 +1821,7 @@ pub async fn run_single_step_command(
                     &state_base,
                     &environment,
                     &config,
+                    &extra_env,
                 )?;
             }
             StatementAction::EvaluateCrateIf(block) => {
@@ -1595,6 +1832,7 @@ pub async fn run_single_step_command(
                     &state_base,
                     &environment,
                     &config,
+                    &extra_env,
                 )?;
             }
             StatementAction::SnapshotMetadata(step) => {
@@ -1651,6 +1889,7 @@ pub async fn run_single_target_command(
             &state_base,
             &environment,
             &config,
+            &[],
         )
         .await?;
         return Ok(());
@@ -1683,6 +1922,7 @@ pub async fn run_single_target_command(
             &state_base,
             &environment,
             &config,
+            &[],
         )
         .await?;
         return Ok(());
@@ -1775,6 +2015,7 @@ pub async fn run_all_targets_command(
                             &state_base,
                             &environment,
                             &config,
+                            &[],
                         )
                         .await;
                         (ws_idx, result)
@@ -1865,6 +2106,7 @@ pub async fn run_all_targets_command(
                             &state_base,
                             &environment,
                             &config,
+                            &[],
                         )
                         .await;
                         (c_idx, result)

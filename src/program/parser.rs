@@ -7,6 +7,7 @@ use chumsky::prelude::*;
 
 use super::ast::common::{
     Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
+    WithEnvFileBlock,
 };
 use super::ast::crate_ctx::{
     CrateCondition, CrateFilter, CrateSelectCondition, CrateStatement, CrateTypeFilter,
@@ -448,11 +449,18 @@ fn crate_statement_parser<'src>()
         let snapshot_metadata = snapshot_metadata_parser().map(CrateStatement::SnapshotMetadata);
 
         let crate_cond = crate_condition_parser();
-        let body = stmt.repeated().collect::<Vec<_>>();
+        let body = stmt.clone().repeated().collect::<Vec<_>>();
 
-        let if_stmt = crate_if_parser(crate_cond, body).map(CrateStatement::If);
+        let if_stmt = crate_if_parser(crate_cond, body.clone()).map(CrateStatement::If);
 
-        choice((run, manual, if_stmt, snapshot_metadata))
+        let with_env_file = kw("with_env_file")
+            .ignore_then(string_literal())
+            .then(stmt.repeated().collect::<Vec<_>>().delimited_by(sym("{"), sym("}")))
+            .map(|(env_file, statements)| {
+                CrateStatement::WithEnvFile(WithEnvFileBlock { env_file, statements })
+            });
+
+        choice((run, manual, if_stmt, with_env_file, snapshot_metadata))
     })
 }
 
@@ -506,9 +514,9 @@ fn workspace_statement_parser<'src>()
             snapshot_metadata_parser().map(WorkspaceStatement::SnapshotMetadata);
 
         let ws_cond = workspace_condition_parser();
-        let ws_body = stmt.repeated().collect::<Vec<_>>();
+        let ws_body = stmt.clone().repeated().collect::<Vec<_>>();
 
-        let if_stmt = workspace_if_parser(ws_cond, ws_body).map(WorkspaceStatement::If);
+        let if_stmt = workspace_if_parser(ws_cond, ws_body.clone()).map(WorkspaceStatement::If);
 
         let for_crate_in_ws = kw("for")
             .ignore_then(kw("crate"))
@@ -524,7 +532,14 @@ fn workspace_statement_parser<'src>()
                 WorkspaceStatement::ForCrateInWorkspace(ForCrateInWorkspaceBlock { statements })
             });
 
-        choice((run, manual, if_stmt, for_crate_in_ws, snapshot_metadata))
+        let with_env_file = kw("with_env_file")
+            .ignore_then(string_literal())
+            .then(stmt.repeated().collect::<Vec<_>>().delimited_by(sym("{"), sym("}")))
+            .map(|(env_file, statements)| {
+                WorkspaceStatement::WithEnvFile(WithEnvFileBlock { env_file, statements })
+            });
+
+        choice((run, manual, if_stmt, for_crate_in_ws, with_env_file, snapshot_metadata))
     })
 }
 
@@ -988,5 +1003,73 @@ for crate {
 "#;
         let prog = parse_ok(src);
         assert_eq!(prog.statements.len(), 4);
+    }
+
+    #[test]
+    fn with_env_file_in_crate_context() {
+        let prog = parse_ok(
+            r#"for crate { with_env_file ".env" { run "cargo" "build"; } }"#,
+        );
+        let GlobalStatement::ForCrate(block) = &prog.statements[0] else {
+            panic!("expected ForCrate");
+        };
+        let CrateStatement::WithEnvFile(env_block) = &block.statements[0] else {
+            panic!("expected WithEnvFile");
+        };
+        assert_eq!(env_block.env_file, ".env");
+        assert_eq!(env_block.statements.len(), 1);
+        let CrateStatement::Run(run) = &env_block.statements[0] else {
+            panic!("expected Run");
+        };
+        assert_eq!(run.command, "cargo");
+        assert_eq!(run.args, vec!["build"]);
+    }
+
+    #[test]
+    fn with_env_file_in_workspace_context() {
+        let prog = parse_ok(
+            r#"for workspace { with_env_file "secrets.env" { run "deploy" "prod"; } }"#,
+        );
+        let GlobalStatement::ForWorkspace(block) = &prog.statements[0] else {
+            panic!("expected ForWorkspace");
+        };
+        let WorkspaceStatement::WithEnvFile(env_block) = &block.statements[0] else {
+            panic!("expected WithEnvFile");
+        };
+        assert_eq!(env_block.env_file, "secrets.env");
+        assert_eq!(env_block.statements.len(), 1);
+    }
+
+    #[test]
+    fn nested_with_env_file_blocks() {
+        let prog = parse_ok(
+            r#"for crate { with_env_file "outer.env" { with_env_file "inner.env" { run "test" "run"; } } }"#,
+        );
+        let GlobalStatement::ForCrate(block) = &prog.statements[0] else {
+            panic!("expected ForCrate");
+        };
+        let CrateStatement::WithEnvFile(outer) = &block.statements[0] else {
+            panic!("expected outer WithEnvFile");
+        };
+        assert_eq!(outer.env_file, "outer.env");
+        let CrateStatement::WithEnvFile(inner) = &outer.statements[0] else {
+            panic!("expected inner WithEnvFile");
+        };
+        assert_eq!(inner.env_file, "inner.env");
+    }
+
+    #[test]
+    fn with_env_file_with_if_inside() {
+        let prog = parse_ok(
+            r#"for crate { with_env_file ".env" { if file_exists "check" { run "cmd"; } } }"#,
+        );
+        let GlobalStatement::ForCrate(block) = &prog.statements[0] else {
+            panic!("expected ForCrate");
+        };
+        let CrateStatement::WithEnvFile(env_block) = &block.statements[0] else {
+            panic!("expected WithEnvFile");
+        };
+        assert_eq!(env_block.statements.len(), 1);
+        assert!(matches!(env_block.statements[0], CrateStatement::If(_)));
     }
 }

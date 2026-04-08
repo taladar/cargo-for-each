@@ -2,6 +2,7 @@
 
 use super::common::{
     Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
+    WithEnvFileBlock,
 };
 use super::crate_ctx::CrateStatement;
 
@@ -34,6 +35,8 @@ pub enum WorkspaceStatement {
     ForCrateInWorkspace(ForCrateInWorkspaceBlock),
     /// Capture and store cargo metadata for the current workspace under a name.
     SnapshotMetadata(SnapshotMetadataNode),
+    /// Execute nested statements with environment variables loaded from a file.
+    WithEnvFile(WithEnvFileBlock<Self>),
 }
 
 /// A boolean condition available in the workspace execution context.
