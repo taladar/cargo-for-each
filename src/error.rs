@@ -136,6 +136,13 @@ pub enum Error {
     /// an IO error occurred
     #[error("I/O error: {0}")]
     IoError(#[source] std::io::Error),
+    /// a git error occurred
+    #[error("git error: {0}")]
+    GitError(
+        #[source]
+        #[from]
+        git2::Error,
+    ),
     /// the user did not confirm the manual step
     #[error("manual step not confirmed")]
     ManualStepNotConfirmed,

@@ -7,6 +7,8 @@
 use std::io::Write as _;
 use std::path::Path;
 
+use git2::Repository;
+
 use crate::error::Error;
 use crate::program::ast::common::CommonCondition;
 use crate::program::ast::crate_ctx::{CrateCondition, CrateTypeFilter};
@@ -100,6 +102,20 @@ pub fn evaluate_common_condition(
                 }
             }
             Ok(false)
+        }
+        CommonCondition::GitConfigEquals { key, value } => {
+            let repo = Repository::discover(manifest_dir);
+            match repo {
+                Ok(repo) => {
+                    let config = repo.config().map_err(Error::GitError)?;
+                    let git_value = config.get_string(key);
+                    match git_value {
+                        Ok(git_value) => Ok(git_value == *value),
+                        Err(_) => Ok(false), // Key not found or other error, treat as not equal
+                    }
+                }
+                Err(_) => Ok(false), // Not a git repository, treat as not equal
+            }
         }
     }
 }
@@ -346,6 +362,96 @@ mod tests {
             &config,
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
+    }
+
+    #[test]
+    fn common_git_config_equals_true() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = temp.path();
+        let repo = git2::Repository::init(dir).unwrap_or_else(|e| panic!("{e}"));
+        {
+            // use a block to ensure `config` is dropped and written to disk
+            let mut config = repo.config().unwrap_or_else(|e| panic!("{e}"));
+            config
+                .set_str("user.name", "Test User")
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let env = mock_env(&temp);
+        let config = empty_config();
+        let result = evaluate_common_condition(
+            &CommonCondition::GitConfigEquals {
+                key: "user.name".to_owned(),
+                value: "Test User".to_owned(),
+            },
+            dir,
+            &env,
+            &config,
+        );
+        assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
+    }
+
+    #[test]
+    fn common_git_config_equals_false_mismatch() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = temp.path();
+        let repo = git2::Repository::init(dir).unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut config = repo.config().unwrap_or_else(|e| panic!("{e}"));
+            config
+                .set_str("user.name", "Test User")
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let env = mock_env(&temp);
+        let config = empty_config();
+        let result = evaluate_common_condition(
+            &CommonCondition::GitConfigEquals {
+                key: "user.name".to_owned(),
+                value: "Another User".to_owned(),
+            },
+            dir,
+            &env,
+            &config,
+        );
+        assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), false);
+    }
+
+    #[test]
+    fn common_git_config_equals_false_no_repo() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = temp.path();
+        // No git repo initialized
+        let env = mock_env(&temp);
+        let config = empty_config();
+        let result = evaluate_common_condition(
+            &CommonCondition::GitConfigEquals {
+                key: "user.name".to_owned(),
+                value: "Test User".to_owned(),
+            },
+            dir,
+            &env,
+            &config,
+        );
+        assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), false);
+    }
+
+    #[test]
+    fn common_git_config_equals_false_key_not_found() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = temp.path();
+        let _repo = git2::Repository::init(dir).unwrap_or_else(|e| panic!("{e}"));
+        // Don't set user.name
+        let env = mock_env(&temp);
+        let config = empty_config();
+        let result = evaluate_common_condition(
+            &CommonCondition::GitConfigEquals {
+                key: "user.name".to_owned(),
+                value: "Test User".to_owned(),
+            },
+            dir,
+            &env,
+            &config,
+        );
+        assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), false);
     }
 
     // ── WorkspaceCondition ───────────────────────────────────────────────────

@@ -52,6 +52,7 @@ clap_mangen = "0.3.0"
 dirs = "6.0.0"
 fs-err = "3.3.0"
 futures = "0.3.32"
+git2 = "0.20.4"
 humantime = "2.3.0"
 log-panics = { version = "2.1.0", features = ["with-backtrace"] }
 serde = { version = "1.0.228", features = ["derive"] }

@@ -80,4 +80,11 @@ pub enum CommonCondition {
     And(Vec<Self>),
     /// True if at least one inner condition evaluates to true (short-circuits on first true).
     Or(Vec<Self>),
+    /// True if the specified Git configuration key equals the specified value in the target's repository.
+    GitConfigEquals {
+        /// The Git configuration key to check (e.g. `user.name`, `init.defaultbranch`).
+        key: String,
+        /// The value to compare against.
+        value: String,
+    },
 }

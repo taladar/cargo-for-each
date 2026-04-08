@@ -166,14 +166,22 @@ fn workspace_condition_parser<'src>()
                 });
 
             let file_exists = kw("file_exists")
-                .ignore_then(str_lit)
+                .ignore_then(str_lit.clone())
                 .map(|f| WorkspaceCondition::Common(CommonCondition::FileExists(f)));
 
             let wdc = kw("working_directory_clean").to(WorkspaceCondition::Common(
                 CommonCondition::WorkingDirectoryClean,
             ));
 
-            choice((ask_user, run_cond, file_exists, wdc))
+            let git_config_equals = kw("git_config")
+                .ignore_then(str_lit.clone())
+                .then_ignore(sym("=="))
+                .then(str_lit.clone())
+                .map(|(key, value)| {
+                    WorkspaceCondition::Common(CommonCondition::GitConfigEquals { key, value })
+                });
+
+            choice((ask_user, run_cond, file_exists, wdc, git_config_equals))
         };
 
         // Workspace-specific leaf conditions ──────────────────────────────────
@@ -239,12 +247,20 @@ fn crate_condition_parser<'src>()
             });
 
         let file_exists = kw("file_exists")
-            .ignore_then(str_lit)
+            .ignore_then(str_lit.clone())
             .map(|f| CrateCondition::Common(CommonCondition::FileExists(f)));
 
         let wdc = kw("working_directory_clean").to(CrateCondition::Common(
             CommonCondition::WorkingDirectoryClean,
         ));
+
+        let git_config_equals = kw("git_config")
+            .ignore_then(str_lit.clone())
+            .then_ignore(sym("=="))
+            .then(str_lit.clone())
+            .map(|(key, value)| {
+                CrateCondition::Common(CommonCondition::GitConfigEquals { key, value })
+            });
 
         // Crate-specific leaves ───────────────────────────────────────────────
         let crate_type = kw("type")
@@ -265,6 +281,7 @@ fn crate_condition_parser<'src>()
             run_cond,
             file_exists,
             wdc,
+            git_config_equals,
             crate_type,
             standalone,
             paren,
