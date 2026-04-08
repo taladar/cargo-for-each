@@ -6,7 +6,7 @@ pub mod snapshot;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use cargo_metadata::PackageId;
+use cargo_metadata::{DependencyKind, PackageId};
 
 use crate::error::Error;
 use crate::program::ast::crate_ctx::{CrateFilter, CrateSelectCondition, CrateTypeFilter};
@@ -268,6 +268,10 @@ fn resolve_workspace_member_crates(
 
         let mut dependencies: Vec<PathBuf> = Vec::new();
         for dep in &package.dependencies {
+            // Skip dev-dependencies: they do not affect publish/execution order.
+            if dep.kind == DependencyKind::Development {
+                continue;
+            }
             if let Some(dep_id) = package_name_to_id.get(&dep.name)
                 && let Some(dep_pkg) = all_packages.get(dep_id)
             {
@@ -471,6 +475,10 @@ fn crate_executions_from_dirs(
 
         let mut dependencies: Vec<PathBuf> = Vec::new();
         for dep in &package.dependencies {
+            // Skip dev-dependencies: they do not affect publish/execution order.
+            if dep.kind == DependencyKind::Development {
+                continue;
+            }
             let Some(dep_id) = package_name_to_id.get(&dep.name) else {
                 continue;
             };
