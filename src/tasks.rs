@@ -1040,6 +1040,7 @@ async fn execute_snapshot_metadata_step(
 ///
 /// Returns an error if the command is not found, if asciinema fails to launch,
 /// or if the exit-status file cannot be written.
+#[expect(clippy::print_stdout, reason = "printing the command is part of the UI")]
 async fn execute_run_step(
     step: &RunStep,
     cursor: &ProgramCursor,
@@ -1071,6 +1072,8 @@ async fn execute_run_step(
             .collect::<Vec<_>>()
             .join(" ")
     );
+
+    println!("Running: {command_str}");
 
     let wrapper_path = state_dir.join("run_wrapper.sh");
     let exit_status_path = state_dir.join("exit_status");
@@ -1326,8 +1329,15 @@ async fn run_crate_stmts_to_completion(
         match stmt {
             CrateStatement::Run(step) => {
                 if !is_run_completed(&state_dir) {
-                    execute_run_step(step, &cursor, manifest_dir, state_base, environment, extra_env)
-                        .await?;
+                    execute_run_step(
+                        step,
+                        &cursor,
+                        manifest_dir,
+                        state_base,
+                        environment,
+                        extra_env,
+                    )
+                    .await?;
                 }
             }
             CrateStatement::ManualStep(step) => {
@@ -1446,8 +1456,15 @@ async fn run_workspace_stmts_to_completion(
         match stmt {
             WorkspaceStatement::Run(step) => {
                 if !is_run_completed(&state_dir) {
-                    execute_run_step(step, &cursor, manifest_dir, state_base, environment, extra_env)
-                        .await?;
+                    execute_run_step(
+                        step,
+                        &cursor,
+                        manifest_dir,
+                        state_base,
+                        environment,
+                        extra_env,
+                    )
+                    .await?;
                 }
             }
             WorkspaceStatement::ManualStep(step) => {
@@ -1688,8 +1705,12 @@ fn find_last_completed_workspace_stmt(
             }
             WorkspaceStatement::WithEnvFile(block) => {
                 let p = cursor.clone().with(CursorSegment::WithEnvFile);
-                let nested =
-                    find_last_completed_workspace_stmt(&block.statements, &p, member_crates, state_base);
+                let nested = find_last_completed_workspace_stmt(
+                    &block.statements,
+                    &p,
+                    member_crates,
+                    state_base,
+                );
                 if nested.is_some() {
                     return nested;
                 }
