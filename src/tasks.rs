@@ -322,6 +322,23 @@ fn is_run_completed(state_dir: &Path) -> bool {
         == Some("0")
 }
 
+/// Returns `true` if the `run` step at `state_dir` has a recorded non-zero exit status.
+///
+/// Distinct from `is_run_completed`: a step that has not been started at all returns `false`.
+fn is_run_failed(state_dir: &Path) -> bool {
+    if !state_dir.exists() {
+        return false;
+    }
+    match fs_err::read_to_string(state_dir.join("exit_status"))
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("0") => false,
+        Some(_) => true,
+    }
+}
+
 /// Returns `true` if the `manual_step` at `state_dir` was confirmed by the user.
 fn is_manual_completed(state_dir: &Path) -> bool {
     if !state_dir.exists() {
@@ -1040,7 +1057,10 @@ async fn execute_snapshot_metadata_step(
 ///
 /// Returns an error if the command is not found, if asciinema fails to launch,
 /// or if the exit-status file cannot be written.
-#[expect(clippy::print_stdout, reason = "printing the command is part of the UI")]
+#[expect(
+    clippy::print_stdout,
+    reason = "printing the command is part of the UI"
+)]
 async fn execute_run_step(
     step: &RunStep,
     cursor: &ProgramCursor,
@@ -2347,6 +2367,268 @@ pub async fn task_rewind_command(
 
 // ── Describe and list commands ─────────────────────────────────────────────────
 
+/// Builds the label string for a crate statement (raw AST, no interpolation).
+fn crate_stmt_label(stmt: &CrateStatement) -> String {
+    match stmt {
+        CrateStatement::Run(step) => {
+            let mut parts = vec![format!("\"{}\"", step.command)];
+            parts.extend(step.args.iter().map(|a| format!("\"{a}\"")));
+            format!("run {}", parts.join(" "))
+        }
+        CrateStatement::ManualStep(node) => format!("manual_step \"{}\"", node.title),
+        CrateStatement::SnapshotMetadata(node) => {
+            format!("snapshot_metadata \"{}\"", node.name)
+        }
+        CrateStatement::If(_) => String::from("if ..."),
+        CrateStatement::WithEnvFile(block) => {
+            format!("with_env_file \"{}\"", block.env_file)
+        }
+    }
+}
+
+/// Builds the label string for a workspace statement (raw AST, no interpolation).
+fn workspace_stmt_label(stmt: &WorkspaceStatement) -> String {
+    match stmt {
+        WorkspaceStatement::Run(step) => {
+            let mut parts = vec![format!("\"{}\"", step.command)];
+            parts.extend(step.args.iter().map(|a| format!("\"{a}\"")));
+            format!("run {}", parts.join(" "))
+        }
+        WorkspaceStatement::ManualStep(node) => format!("manual_step \"{}\"", node.title),
+        WorkspaceStatement::SnapshotMetadata(node) => {
+            format!("snapshot_metadata \"{}\"", node.name)
+        }
+        WorkspaceStatement::If(_) => String::from("if ..."),
+        WorkspaceStatement::ForCrateInWorkspace(_) => String::from("for crate in workspace"),
+        WorkspaceStatement::WithEnvFile(block) => {
+            format!("with_env_file \"{}\"", block.env_file)
+        }
+    }
+}
+
+/// Recursively prints crate statements with their cursor, completion icon, and label.
+#[expect(clippy::print_stdout, reason = "part of the describe UI")]
+fn print_crate_stmts_describe(
+    stmts: &[CrateStatement],
+    prefix: &ProgramCursor,
+    state_base: &Path,
+    indent: &str,
+) {
+    for (i, stmt) in stmts.iter().enumerate() {
+        let cursor = prefix.clone().with(CursorSegment::Statement(i));
+        let state_dir = state_base.join(cursor.to_path());
+        let cursor_str = cursor.to_path_string();
+
+        match stmt {
+            CrateStatement::If(block) => {
+                let chosen = fs_err::read_to_string(state_dir.join("chosen_branch"))
+                    .ok()
+                    .unwrap_or_default();
+                let chosen = chosen.trim();
+                let (icon, label) = if chosen.is_empty() {
+                    ("\u{2B1C}", "if [not yet evaluated]")
+                } else if chosen == "none" {
+                    ("\u{2705}", "if [no branch matched]")
+                } else if chosen == "else" {
+                    ("\u{2705}", "if [else branch taken]")
+                } else {
+                    ("\u{2705}", "if [branch taken]")
+                };
+                println!("{indent}{cursor_str:<20}  {icon}  {label}");
+                if chosen == "else" {
+                    let nested_indent = format!("{indent}  ");
+                    print_crate_stmts_describe(
+                        &block.else_statements,
+                        &cursor.with(CursorSegment::ElseBranch),
+                        state_base,
+                        &nested_indent,
+                    );
+                } else if let Ok(n) = chosen.parse::<usize>()
+                    && let Some(branch) = block.branches.get(n)
+                {
+                    let nested_indent = format!("{indent}  ");
+                    print_crate_stmts_describe(
+                        &branch.statements,
+                        &cursor.with(CursorSegment::IfBranch(n)),
+                        state_base,
+                        &nested_indent,
+                    );
+                }
+            }
+            CrateStatement::WithEnvFile(block) => {
+                let env_prefix = cursor.clone().with(CursorSegment::WithEnvFile);
+                let icon = if is_crate_stmts_completed(&block.statements, &env_prefix, state_base) {
+                    "\u{2705}"
+                } else {
+                    "\u{2B1C}"
+                };
+                let label = format!("with_env_file \"{}\"", block.env_file);
+                println!("{indent}{cursor_str:<20}  {icon}  {label}");
+                let nested_indent = format!("{indent}  ");
+                print_crate_stmts_describe(
+                    &block.statements,
+                    &env_prefix,
+                    state_base,
+                    &nested_indent,
+                );
+            }
+            CrateStatement::Run(_) => {
+                let state_dir = state_base.join(cursor.to_path());
+                let icon = if is_run_completed(&state_dir) {
+                    "\u{2705}"
+                } else if is_run_failed(&state_dir) {
+                    "\u{274C}"
+                } else {
+                    "\u{2B1C}"
+                };
+                let label = crate_stmt_label(stmt);
+                println!("{indent}{cursor_str:<20}  {icon}  {label}");
+            }
+            _ => {
+                let icon = if is_crate_stmt_completed(stmt, &cursor, state_base) {
+                    "\u{2705}"
+                } else {
+                    "\u{2B1C}"
+                };
+                let label = crate_stmt_label(stmt);
+                println!("{indent}{cursor_str:<20}  {icon}  {label}");
+            }
+        }
+    }
+}
+
+/// Recursively prints workspace statements with their cursor, completion icon, and label.
+#[expect(clippy::print_stdout, reason = "part of the describe UI")]
+fn print_workspace_stmts_describe(
+    stmts: &[WorkspaceStatement],
+    prefix: &ProgramCursor,
+    member_crates: &[ResolvedCrateExecution],
+    state_base: &Path,
+    indent: &str,
+) {
+    for (i, stmt) in stmts.iter().enumerate() {
+        let cursor = prefix.clone().with(CursorSegment::Statement(i));
+        let state_dir = state_base.join(cursor.to_path());
+        let cursor_str = cursor.to_path_string();
+
+        match stmt {
+            WorkspaceStatement::If(block) => {
+                let chosen = fs_err::read_to_string(state_dir.join("chosen_branch"))
+                    .ok()
+                    .unwrap_or_default();
+                let chosen = chosen.trim();
+                let (icon, label) = if chosen.is_empty() {
+                    ("\u{2B1C}", "if [not yet evaluated]")
+                } else if chosen == "none" {
+                    ("\u{2705}", "if [no branch matched]")
+                } else if chosen == "else" {
+                    ("\u{2705}", "if [else branch taken]")
+                } else {
+                    ("\u{2705}", "if [branch taken]")
+                };
+                println!("{indent}{cursor_str:<20}  {icon}  {label}");
+                if chosen == "else" {
+                    let nested_indent = format!("{indent}  ");
+                    print_workspace_stmts_describe(
+                        &block.else_statements,
+                        &cursor.with(CursorSegment::ElseBranch),
+                        member_crates,
+                        state_base,
+                        &nested_indent,
+                    );
+                } else if let Ok(n) = chosen.parse::<usize>()
+                    && let Some(branch) = block.branches.get(n)
+                {
+                    let nested_indent = format!("{indent}  ");
+                    print_workspace_stmts_describe(
+                        &branch.statements,
+                        &cursor.with(CursorSegment::IfBranch(n)),
+                        member_crates,
+                        state_base,
+                        &nested_indent,
+                    );
+                }
+            }
+            WorkspaceStatement::ForCrateInWorkspace(block) => {
+                let icon = if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base)
+                {
+                    "\u{2705}"
+                } else {
+                    "\u{2B1C}"
+                };
+                println!("{indent}{cursor_str:<20}  {icon}  for crate in workspace");
+                let crate_indent = format!("{indent}  ");
+                let nested_indent = format!("{indent}    ");
+                for (c_idx, crate_exec) in member_crates.iter().enumerate() {
+                    let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
+                    let c_prefix_str = c_prefix.to_path_string();
+                    let crate_icon =
+                        if is_crate_stmts_completed(&block.statements, &c_prefix, state_base) {
+                            "\u{2705}"
+                        } else {
+                            "\u{2B1C}"
+                        };
+                    println!(
+                        "{crate_indent}{c_prefix_str:<20}  {crate_icon}  crate {}",
+                        crate_exec.manifest_dir.display()
+                    );
+                    print_crate_stmts_describe(
+                        &block.statements,
+                        &c_prefix,
+                        state_base,
+                        &nested_indent,
+                    );
+                }
+            }
+            WorkspaceStatement::WithEnvFile(block) => {
+                let env_prefix = cursor.clone().with(CursorSegment::WithEnvFile);
+                let icon = if is_workspace_stmts_completed(
+                    &block.statements,
+                    &env_prefix,
+                    member_crates,
+                    state_base,
+                ) {
+                    "\u{2705}"
+                } else {
+                    "\u{2B1C}"
+                };
+                let label = format!("with_env_file \"{}\"", block.env_file);
+                println!("{indent}{cursor_str:<20}  {icon}  {label}");
+                let nested_indent = format!("{indent}  ");
+                print_workspace_stmts_describe(
+                    &block.statements,
+                    &env_prefix,
+                    member_crates,
+                    state_base,
+                    &nested_indent,
+                );
+            }
+            WorkspaceStatement::Run(_) => {
+                let state_dir = state_base.join(cursor.to_path());
+                let icon = if is_run_completed(&state_dir) {
+                    "\u{2705}"
+                } else if is_run_failed(&state_dir) {
+                    "\u{274C}"
+                } else {
+                    "\u{2B1C}"
+                };
+                let label = workspace_stmt_label(stmt);
+                println!("{indent}{cursor_str:<20}  {icon}  {label}");
+            }
+            _ => {
+                let icon = if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base)
+                {
+                    "\u{2705}"
+                } else {
+                    "\u{2B1C}"
+                };
+                let label = workspace_stmt_label(stmt);
+                println!("{indent}{cursor_str:<20}  {icon}  {label}");
+            }
+        }
+    }
+}
+
 /// Displays the current execution status of every target in a task.
 ///
 /// # Errors
@@ -2370,6 +2652,13 @@ pub async fn task_describe_command(
             let done = is_workspace_completed(ws_idx, ws_exec, ws_stmts, &state_base);
             let icon = if done { "\u{2705}" } else { "\u{2B1C}" };
             println!("  {} {}", icon, ws_exec.manifest_dir.display());
+            print_workspace_stmts_describe(
+                ws_stmts,
+                &ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx)),
+                &ws_exec.member_crates,
+                &state_base,
+                "    ",
+            );
         }
     }
 
@@ -2380,6 +2669,12 @@ pub async fn task_describe_command(
             let done = is_standalone_crate_completed(c_idx, crate_stmts, &state_base);
             let icon = if done { "\u{2705}" } else { "\u{2B1C}" };
             println!("  {} {}", icon, crate_exec.manifest_dir.display());
+            print_crate_stmts_describe(
+                crate_stmts,
+                &ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx)),
+                &state_base,
+                "    ",
+            );
         }
     }
 
