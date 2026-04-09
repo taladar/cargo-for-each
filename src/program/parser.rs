@@ -270,6 +270,14 @@ fn crate_condition_parser<'src>()
                 kw("bin").to(CrateTypeFilter::Bin),
                 kw("lib").to(CrateTypeFilter::Lib),
                 kw("proc_macro").to(CrateTypeFilter::ProcMacro),
+                kw("cdylib").to(CrateTypeFilter::CDyLib),
+                kw("dylib").to(CrateTypeFilter::DyLib),
+                kw("rlib").to(CrateTypeFilter::RLib),
+                kw("staticlib").to(CrateTypeFilter::StaticLib),
+                kw("bench").to(CrateTypeFilter::Bench),
+                kw("test").to(CrateTypeFilter::Test),
+                kw("example").to(CrateTypeFilter::Example),
+                kw("custom_build").to(CrateTypeFilter::CustomBuild),
             )))
             .map(CrateCondition::CrateType);
 
@@ -369,6 +377,14 @@ fn crate_select_condition_parser<'src>()
                 kw("bin").to(CrateTypeFilter::Bin),
                 kw("lib").to(CrateTypeFilter::Lib),
                 kw("proc_macro").to(CrateTypeFilter::ProcMacro),
+                kw("cdylib").to(CrateTypeFilter::CDyLib),
+                kw("dylib").to(CrateTypeFilter::DyLib),
+                kw("rlib").to(CrateTypeFilter::RLib),
+                kw("staticlib").to(CrateTypeFilter::StaticLib),
+                kw("bench").to(CrateTypeFilter::Bench),
+                kw("test").to(CrateTypeFilter::Test),
+                kw("example").to(CrateTypeFilter::Example),
+                kw("custom_build").to(CrateTypeFilter::CustomBuild),
             )))
             .map(CrateSelectCondition::CrateType);
         let paren = cond.clone().delimited_by(sym("("), sym(")"));

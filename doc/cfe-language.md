@@ -542,6 +542,14 @@ Available in crate `if` blocks (in addition to all common conditions).
 | `type == bin` | The crate produces an executable binary. |
 | `type == lib` | The crate is a library crate. |
 | `type == proc_macro` | The crate is a procedural macro crate. |
+| `type == cdylib` | The crate is a C-compatible dynamic library (e.g. for FFI or WebAssembly). |
+| `type == dylib` | The crate is a Rust dynamic library. |
+| `type == rlib` | The crate is a Rust static library (rlib). |
+| `type == staticlib` | The crate is a C-compatible static library. |
+| `type == bench` | The crate has a benchmark target. |
+| `type == test` | The crate has an integration test target. |
+| `type == example` | The crate has an example target. |
+| `type == custom_build` | The crate has a custom build script (`build.rs`). |
 | `standalone` | The crate lives in a standalone (single-crate) workspace. |
 
 #### Examples
@@ -581,6 +589,14 @@ These are evaluated statically at task-creation time; dynamic conditions
 | `type == bin` | The crate is a binary crate. |
 | `type == lib` | The crate is a library crate. |
 | `type == proc_macro` | The crate is a procedural macro crate. |
+| `type == cdylib` | The crate is a C-compatible dynamic library (e.g. for FFI or WebAssembly). |
+| `type == dylib` | The crate is a Rust dynamic library. |
+| `type == rlib` | The crate is a Rust static library (rlib). |
+| `type == staticlib` | The crate is a C-compatible static library. |
+| `type == bench` | The crate has a benchmark target. |
+| `type == test` | The crate has an integration test target. |
+| `type == example` | The crate has an example target. |
+| `type == custom_build` | The crate has a custom build script (`build.rs`). |
 
 ### 6.5 Boolean operators
 

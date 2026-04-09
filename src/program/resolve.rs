@@ -135,6 +135,14 @@ fn evaluate_crate_select_condition(
             CrateTypeFilter::Bin => krate.types.contains(&CrateType::Bin),
             CrateTypeFilter::Lib => krate.types.contains(&CrateType::Lib),
             CrateTypeFilter::ProcMacro => krate.types.contains(&CrateType::ProcMacro),
+            CrateTypeFilter::CDyLib => krate.types.contains(&CrateType::CDyLib),
+            CrateTypeFilter::DyLib => krate.types.contains(&CrateType::DyLib),
+            CrateTypeFilter::RLib => krate.types.contains(&CrateType::RLib),
+            CrateTypeFilter::StaticLib => krate.types.contains(&CrateType::StaticLib),
+            CrateTypeFilter::Bench => krate.types.contains(&CrateType::Bench),
+            CrateTypeFilter::Test => krate.types.contains(&CrateType::Test),
+            CrateTypeFilter::Example => krate.types.contains(&CrateType::Example),
+            CrateTypeFilter::CustomBuild => krate.types.contains(&CrateType::CustomBuild),
         },
         CrateSelectCondition::Not(inner) => {
             !evaluate_crate_select_condition(inner, krate, workspace_standalone_map)

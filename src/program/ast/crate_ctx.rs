@@ -14,6 +14,22 @@ pub enum CrateTypeFilter {
     Lib,
     /// A procedural macro crate.
     ProcMacro,
+    /// A C-compatible dynamic library (e.g. for FFI or WebAssembly).
+    CDyLib,
+    /// A Rust dynamic library.
+    DyLib,
+    /// A Rust static library (rlib).
+    RLib,
+    /// A C-compatible static library.
+    StaticLib,
+    /// A benchmark target.
+    Bench,
+    /// An integration test target.
+    Test,
+    /// An example target.
+    Example,
+    /// A custom build script (`build.rs`).
+    CustomBuild,
 }
 
 /// A block that iterates over all selected crates (standalone or within a workspace)

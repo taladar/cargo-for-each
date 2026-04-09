@@ -204,6 +204,14 @@ pub fn evaluate_crate_condition(
                 CrateTypeFilter::Bin => CrateType::Bin,
                 CrateTypeFilter::Lib => CrateType::Lib,
                 CrateTypeFilter::ProcMacro => CrateType::ProcMacro,
+                CrateTypeFilter::CDyLib => CrateType::CDyLib,
+                CrateTypeFilter::DyLib => CrateType::DyLib,
+                CrateTypeFilter::RLib => CrateType::RLib,
+                CrateTypeFilter::StaticLib => CrateType::StaticLib,
+                CrateTypeFilter::Bench => CrateType::Bench,
+                CrateTypeFilter::Test => CrateType::Test,
+                CrateTypeFilter::Example => CrateType::Example,
+                CrateTypeFilter::CustomBuild => CrateType::CustomBuild,
             };
             Ok(config
                 .crates

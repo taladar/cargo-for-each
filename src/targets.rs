@@ -523,6 +523,22 @@ pub enum CrateType {
     Lib,
     /// a proc-macro crate
     ProcMacro,
+    /// a C-compatible dynamic library (e.g. for FFI or WebAssembly)
+    CDyLib,
+    /// a Rust dynamic library
+    DyLib,
+    /// a Rust static library (rlib)
+    RLib,
+    /// a C-compatible static library
+    StaticLib,
+    /// a benchmark target
+    Bench,
+    /// an integration test target
+    Test,
+    /// an example target
+    Example,
+    /// a custom build script (build.rs)
+    CustomBuild,
 }
 
 impl CrateType {
@@ -538,6 +554,30 @@ impl CrateType {
         }
         if package.has_target(&cargo_metadata::TargetKind::ProcMacro) {
             crate_types.insert(Self::ProcMacro);
+        }
+        if package.has_target(&cargo_metadata::TargetKind::CDyLib) {
+            crate_types.insert(Self::CDyLib);
+        }
+        if package.has_target(&cargo_metadata::TargetKind::DyLib) {
+            crate_types.insert(Self::DyLib);
+        }
+        if package.has_target(&cargo_metadata::TargetKind::RLib) {
+            crate_types.insert(Self::RLib);
+        }
+        if package.has_target(&cargo_metadata::TargetKind::StaticLib) {
+            crate_types.insert(Self::StaticLib);
+        }
+        if package.has_target(&cargo_metadata::TargetKind::Bench) {
+            crate_types.insert(Self::Bench);
+        }
+        if package.has_target(&cargo_metadata::TargetKind::Test) {
+            crate_types.insert(Self::Test);
+        }
+        if package.has_target(&cargo_metadata::TargetKind::Example) {
+            crate_types.insert(Self::Example);
+        }
+        if package.has_target(&cargo_metadata::TargetKind::CustomBuild) {
+            crate_types.insert(Self::CustomBuild);
         }
         crate_types
     }

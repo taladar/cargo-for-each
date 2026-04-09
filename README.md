@@ -87,7 +87,7 @@ List all registered crates.
 
 | Flag | Description |
 |------|-------------|
-| `--type <TYPE>` | Only list crates of the given type (`bin`, `lib`, `proc-macro`, etc.). |
+| `--type <TYPE>` | Only list crates of the given type (`bin`, `lib`, `proc-macro`, `cdylib`, `dylib`, `rlib`, `staticlib`, `bench`, `test`, `example`, `custom-build`). |
 | `--standalone <BOOL>` | Filter by whether the crate belongs to a standalone workspace. |
 
 #### `target add`
