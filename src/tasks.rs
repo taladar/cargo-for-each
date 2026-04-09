@@ -141,6 +141,20 @@ pub struct CreateTaskParameters {
     /// Path to the `.cfe` program file that defines the task steps.
     #[clap(long)]
     pub program: PathBuf,
+    /// Explicit workspace directory paths to run the task against.
+    ///
+    /// When provided, these paths override the `select workspaces` statement(s)
+    /// in the program.  Dependency ordering among the given workspaces is still
+    /// computed automatically.  May be specified multiple times.
+    #[clap(long = "workspace", value_name = "PATH")]
+    pub workspaces: Vec<PathBuf>,
+    /// Explicit crate directory paths to run the task against.
+    ///
+    /// When provided, these paths override the `select crates` statement(s)
+    /// in the program.  Dependency ordering among the given crates is still
+    /// computed automatically.  May be specified multiple times.
+    #[clap(long = "crate", value_name = "PATH")]
+    pub crates: Vec<PathBuf>,
 }
 
 /// Parameters for running the next single uncompleted statement of a task.
@@ -1887,8 +1901,37 @@ pub async fn task_create_command(
             Error::ProgramParseErrors(msgs)
         })?;
 
-    let config = Config::load(&environment)?;
-    let resolved = crate::program::resolve::resolve_program(&program, &config)?;
+    use crate::program::resolve::{
+        ResolvedProgram, resolve_explicit_crate_targets, resolve_explicit_workspace_targets,
+    };
+    let resolved = if params.workspaces.is_empty() && params.crates.is_empty() {
+        let config = Config::load(&environment)?;
+        crate::program::resolve::resolve_program(&program, &config)?
+    } else if params.workspaces.is_empty() || params.crates.is_empty() {
+        // One side uses explicit paths; the other still needs the program selection.
+        let config = Config::load(&environment)?;
+        let from_program = crate::program::resolve::resolve_program(&program, &config)?;
+        let workspace_executions = if params.workspaces.is_empty() {
+            from_program.workspace_executions
+        } else {
+            resolve_explicit_workspace_targets(&params.workspaces)?
+        };
+        let crate_executions = if params.crates.is_empty() {
+            from_program.crate_executions
+        } else {
+            resolve_explicit_crate_targets(&params.crates)?
+        };
+        ResolvedProgram {
+            workspace_executions,
+            crate_executions,
+        }
+    } else {
+        // Both sides are explicit — no config or program selection needed.
+        ResolvedProgram {
+            workspace_executions: resolve_explicit_workspace_targets(&params.workspaces)?,
+            crate_executions: resolve_explicit_crate_targets(&params.crates)?,
+        }
+    };
 
     let task_dir = named_dir_path(&params.name, &environment)?;
     if task_dir.exists() {

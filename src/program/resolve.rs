@@ -171,6 +171,21 @@ fn resolve_workspaces(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    resolve_workspaces_from_canonical_dirs(canonical_selected)
+}
+
+/// Resolves workspace executions from an explicit list of canonical workspace
+/// directory paths, loading `cargo metadata` directly.
+///
+/// This is the shared implementation used by both the filter-based and
+/// explicit-path-based workspace resolution paths.
+fn resolve_workspaces_from_canonical_dirs(
+    canonical_selected: Vec<PathBuf>,
+) -> Result<Vec<ResolvedWorkspaceExecution>, Error> {
+    if canonical_selected.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let selected_set: HashSet<&PathBuf> = canonical_selected.iter().collect();
 
     // For each selected workspace, load cargo metadata to get member crates.
@@ -235,6 +250,106 @@ fn resolve_workspaces(
     }
 
     Ok(executions)
+}
+
+/// Resolves workspace executions from an explicit list of workspace directory
+/// paths provided by the user, bypassing the program's `select workspaces`
+/// filter.
+///
+/// Dependency ordering among the provided workspaces is still computed and
+/// applied.
+///
+/// # Errors
+///
+/// Returns an error if any path cannot be canonicalized or if `cargo metadata`
+/// fails for any workspace.
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "the 'resolve_' prefix is part of the function's identity within this module"
+)]
+pub fn resolve_explicit_workspace_targets(
+    workspace_dirs: &[PathBuf],
+) -> Result<Vec<ResolvedWorkspaceExecution>, Error> {
+    let canonical: Vec<PathBuf> = workspace_dirs
+        .iter()
+        .map(|d| {
+            fs_err::canonicalize(d)
+                .map_err(|e| Error::CouldNotDetermineCanonicalManifestPath(d.clone(), e))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    resolve_workspaces_from_canonical_dirs(canonical)
+}
+
+/// Resolves crate executions from an explicit list of crate directory paths
+/// provided by the user, bypassing the program's `select crates` filter.
+///
+/// For each provided path `cargo metadata` is run to discover its workspace
+/// root; metadata from each unique workspace root is loaded once. Dependency
+/// ordering among the provided crates is still computed and applied.
+///
+/// # Errors
+///
+/// Returns an error if any path cannot be canonicalized or if `cargo metadata`
+/// fails.
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "the 'resolve_' prefix is part of the function's identity within this module"
+)]
+pub fn resolve_explicit_crate_targets(
+    crate_dirs: &[PathBuf],
+) -> Result<Vec<ResolvedCrateExecution>, Error> {
+    if crate_dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let canonical_dirs: Vec<PathBuf> = crate_dirs
+        .iter()
+        .map(|d| {
+            fs_err::canonicalize(d)
+                .map_err(|e| Error::CouldNotDetermineCanonicalManifestPath(d.clone(), e))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let target_set: HashSet<&PathBuf> = canonical_dirs.iter().collect();
+
+    // Run `cargo metadata` in each crate dir to discover its workspace root,
+    // then load all packages from each unique workspace root exactly once.
+    let mut all_packages: HashMap<PackageId, cargo_metadata::Package> = HashMap::new();
+    let mut package_name_to_id: HashMap<String, PackageId> = HashMap::new();
+    let mut seen_workspace_roots: HashSet<PathBuf> = HashSet::new();
+
+    for canonical_dir in &canonical_dirs {
+        let metadata = cargo_metadata::MetadataCommand::new()
+            .manifest_path(canonical_dir.join("Cargo.toml"))
+            .no_deps()
+            .exec()
+            .map_err(|e| Error::CargoMetadataError(canonical_dir.clone(), e))?;
+
+        let ws_root = metadata.workspace_root.into_std_path_buf();
+        let canonical_ws_root = fs_err::canonicalize(&ws_root)
+            .map_err(|e| Error::CouldNotDetermineCanonicalManifestPath(ws_root.clone(), e))?;
+
+        if seen_workspace_roots.insert(canonical_ws_root.clone()) {
+            let ws_metadata = cargo_metadata::MetadataCommand::new()
+                .manifest_path(canonical_ws_root.join("Cargo.toml"))
+                .no_deps()
+                .exec()
+                .map_err(|e| Error::CargoMetadataError(canonical_ws_root.clone(), e))?;
+
+            for package in ws_metadata.packages {
+                package_name_to_id.insert(package.name.to_string(), package.id.clone());
+                all_packages.insert(package.id.clone(), package);
+            }
+        }
+    }
+
+    crate_executions_from_dirs(
+        &canonical_dirs,
+        &target_set,
+        &all_packages,
+        &package_name_to_id,
+    )
 }
 
 /// Info about a single workspace member package.

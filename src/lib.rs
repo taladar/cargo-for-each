@@ -426,6 +426,8 @@ mod tests {
                 sub_command: TaskSubCommand::Create(CreateTaskParameters {
                     name: "test-task".to_string(),
                     program: cfe_path,
+                    workspaces: vec![],
+                    crates: vec![],
                 }),
             }),
         };
@@ -612,6 +614,8 @@ mod tests {
                 sub_command: TaskSubCommand::Create(CreateTaskParameters {
                     name: "test-task".to_string(),
                     program: cfe_path,
+                    workspaces: vec![],
+                    crates: vec![],
                 }),
             }),
         };
@@ -696,6 +700,8 @@ mod tests {
                 sub_command: TaskSubCommand::Create(CreateTaskParameters {
                     name: "failing-task".to_string(),
                     program: cfe_path,
+                    workspaces: vec![],
+                    crates: vec![],
                 }),
             }),
         };
