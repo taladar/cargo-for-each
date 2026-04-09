@@ -1440,6 +1440,10 @@ fn evaluate_crate_if_block(
 ///
 /// Returns an error if any statement fails.
 #[expect(clippy::print_stdout, reason = "barrier message is part of the UI")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all parameters are needed; the task_name threading adds one more than clippy's default limit"
+)]
 async fn run_crate_stmts_to_completion(
     stmts: &[CrateStatement],
     prefix: &ProgramCursor,
@@ -1448,6 +1452,7 @@ async fn run_crate_stmts_to_completion(
     environment: &Environment,
     config: &Config,
     extra_env: &[(String, String)],
+    task_name: &str,
 ) -> Result<(), Error> {
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
@@ -1512,6 +1517,7 @@ async fn run_crate_stmts_to_completion(
                             environment,
                             config,
                             extra_env,
+                            task_name,
                         ))
                         .await?;
                     }
@@ -1528,6 +1534,7 @@ async fn run_crate_stmts_to_completion(
                                 environment,
                                 config,
                                 extra_env,
+                                task_name,
                             ))
                             .await?;
                         }
@@ -1547,6 +1554,7 @@ async fn run_crate_stmts_to_completion(
                     environment,
                     config,
                     &combined,
+                    task_name,
                 ))
                 .await?;
             }
@@ -1560,9 +1568,10 @@ async fn run_crate_stmts_to_completion(
                             .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
                     }
                     println!(
-                        "Wait barrier reached at {}: \"{}\". Release with `task continue --name <task-name> --cursor {}`.",
+                        "Wait barrier reached at {}: \"{}\". Release with `cargo-for-each task continue --name {} --cursor {}`.",
                         cursor,
                         node.description,
+                        task_name,
                         cursor.to_path_string()
                     );
                     return Ok(());
@@ -1594,6 +1603,7 @@ async fn run_workspace_stmts_to_completion(
     environment: &Environment,
     config: &Config,
     extra_env: &[(String, String)],
+    task_name: &str,
 ) -> Result<(), Error> {
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
@@ -1659,6 +1669,7 @@ async fn run_workspace_stmts_to_completion(
                             environment,
                             config,
                             extra_env,
+                            task_name,
                         ))
                         .await?;
                     }
@@ -1676,6 +1687,7 @@ async fn run_workspace_stmts_to_completion(
                                 environment,
                                 config,
                                 extra_env,
+                                task_name,
                             ))
                             .await?;
                         }
@@ -1696,6 +1708,7 @@ async fn run_workspace_stmts_to_completion(
                     environment,
                     config,
                     &combined,
+                    task_name,
                 ))
                 .await?;
             }
@@ -1711,6 +1724,7 @@ async fn run_workspace_stmts_to_completion(
                         environment,
                         config,
                         extra_env,
+                        task_name,
                     )
                     .await?;
                 }
@@ -1725,9 +1739,10 @@ async fn run_workspace_stmts_to_completion(
                             .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
                     }
                     println!(
-                        "Wait barrier reached at {}: \"{}\". Release with `task continue --name <task-name> --cursor {}`.",
+                        "Wait barrier reached at {}: \"{}\". Release with `cargo-for-each task continue --name {} --cursor {}`.",
                         cursor,
                         node.description,
+                        task_name,
                         cursor.to_path_string()
                     );
                     return Ok(());
@@ -2118,6 +2133,7 @@ pub async fn run_single_target_command(
             &environment,
             &config,
             &[],
+            &params.name,
         )
         .await?;
         return Ok(());
@@ -2151,6 +2167,7 @@ pub async fn run_single_target_command(
             &environment,
             &config,
             &[],
+            &params.name,
         )
         .await?;
         return Ok(());
@@ -2232,6 +2249,7 @@ pub async fn run_all_targets_command(
                     let config = Arc::clone(&config);
                     let state_base = Arc::clone(&state_base);
                     let environment = environment.clone();
+                    let task_name = params.name.clone();
                     async move {
                         let prefix =
                             ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
@@ -2244,6 +2262,7 @@ pub async fn run_all_targets_command(
                             &environment,
                             &config,
                             &[],
+                            &task_name,
                         )
                         .await;
                         (ws_idx, result)
@@ -2324,6 +2343,7 @@ pub async fn run_all_targets_command(
                     let config = Arc::clone(&config);
                     let state_base = Arc::clone(&state_base);
                     let environment = environment.clone();
+                    let task_name = params.name.clone();
                     async move {
                         let prefix =
                             ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
@@ -2335,6 +2355,7 @@ pub async fn run_all_targets_command(
                             &environment,
                             &config,
                             &[],
+                            &task_name,
                         )
                         .await;
                         (c_idx, result)
