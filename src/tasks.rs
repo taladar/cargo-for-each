@@ -21,7 +21,10 @@ use crate::program::ast::common::{
 use crate::program::ast::crate_ctx::{CrateIfBlock, CrateStatement};
 use crate::program::ast::workspace_ctx::{WorkspaceIfBlock, WorkspaceStatement};
 use crate::program::cursor::{CursorSegment, ProgramCursor};
-use crate::program::evaluate::{evaluate_crate_condition, evaluate_workspace_condition};
+use crate::program::evaluate::{
+    crate_condition_runtime_detail, evaluate_crate_condition, evaluate_workspace_condition,
+    workspace_condition_runtime_detail,
+};
 use crate::program::resolve::{
     ResolvedCrateExecution, ResolvedProgram, ResolvedWorkspaceExecution,
 };
@@ -1088,12 +1091,17 @@ fn resolve_interpolation(
 ///
 /// Returns an error if `cargo metadata` fails, if the JSON cannot be serialized,
 /// or if any filesystem operation fails.
+#[expect(
+    clippy::print_stdout,
+    reason = "snapshot step announcement is part of the UI"
+)]
 async fn execute_snapshot_metadata_step(
     step: &SnapshotMetadataNode,
     cursor: &ProgramCursor,
     manifest_dir: &Path,
     state_base: &Path,
 ) -> Result<(), Error> {
+    println!("Snapshot metadata: {:?}", step.name);
     let state_dir = state_base.join(cursor.to_path());
     fs_err::create_dir_all(&state_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
@@ -1310,6 +1318,7 @@ async fn execute_manual_step(
 /// # Errors
 ///
 /// Returns an error if condition evaluation fails or the state file cannot be written.
+#[expect(clippy::print_stdout, reason = "if-block evaluation is part of the UI")]
 fn evaluate_workspace_if_block(
     block: &WorkspaceIfBlock,
     cursor: &ProgramCursor,
@@ -1323,16 +1332,21 @@ fn evaluate_workspace_if_block(
     fs_err::create_dir_all(&state_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
 
+    println!("Evaluating if at {cursor}:");
     let mut chosen: Option<usize> = None;
     for (i, branch) in block.branches.iter().enumerate() {
-        if evaluate_workspace_condition(
+        let result = evaluate_workspace_condition(
             &branch.condition,
             manifest_dir,
             environment,
             config,
             extra_env,
-        )? && chosen.is_none()
-        {
+        )?;
+        let detail = workspace_condition_runtime_detail(&branch.condition, manifest_dir)
+            .map(|d| format!(" [{d}]"))
+            .unwrap_or_default();
+        println!("  branch {i}: {}{detail} → {result}", branch.condition);
+        if result && chosen.is_none() {
             chosen = Some(i);
         }
     }
@@ -1347,6 +1361,11 @@ fn evaluate_workspace_if_block(
         },
         |n| n.to_string(),
     );
+    match chosen_str.as_str() {
+        "none" => println!("  → no branch taken"),
+        "else" => println!("  → else branch taken"),
+        n => println!("  → branch {n} taken"),
+    }
     let chosen_branch_path = state_dir.join("chosen_branch");
     fs_err::write(&chosen_branch_path, &chosen_str)
         .map_err(|e| Error::CouldNotWriteStateFile(chosen_branch_path, e))?;
@@ -1358,6 +1377,7 @@ fn evaluate_workspace_if_block(
 /// # Errors
 ///
 /// Returns an error if condition evaluation fails or the state file cannot be written.
+#[expect(clippy::print_stdout, reason = "if-block evaluation is part of the UI")]
 fn evaluate_crate_if_block(
     block: &CrateIfBlock,
     cursor: &ProgramCursor,
@@ -1371,16 +1391,21 @@ fn evaluate_crate_if_block(
     fs_err::create_dir_all(&state_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
 
+    println!("Evaluating if at {cursor}:");
     let mut chosen: Option<usize> = None;
     for (i, branch) in block.branches.iter().enumerate() {
-        if evaluate_crate_condition(
+        let result = evaluate_crate_condition(
             &branch.condition,
             manifest_dir,
             environment,
             config,
             extra_env,
-        )? && chosen.is_none()
-        {
+        )?;
+        let detail = crate_condition_runtime_detail(&branch.condition, manifest_dir)
+            .map(|d| format!(" [{d}]"))
+            .unwrap_or_default();
+        println!("  branch {i}: {}{detail} → {result}", branch.condition);
+        if result && chosen.is_none() {
             chosen = Some(i);
         }
     }
@@ -1395,6 +1420,11 @@ fn evaluate_crate_if_block(
         },
         |n| n.to_string(),
     );
+    match chosen_str.as_str() {
+        "none" => println!("  → no branch taken"),
+        "else" => println!("  → else branch taken"),
+        n => println!("  → branch {n} taken"),
+    }
     let chosen_branch_path = state_dir.join("chosen_branch");
     fs_err::write(&chosen_branch_path, &chosen_str)
         .map_err(|e| Error::CouldNotWriteStateFile(chosen_branch_path, e))?;

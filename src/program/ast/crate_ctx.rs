@@ -32,6 +32,24 @@ pub enum CrateTypeFilter {
     CustomBuild,
 }
 
+impl std::fmt::Display for CrateTypeFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bin => write!(f, "bin"),
+            Self::Lib => write!(f, "lib"),
+            Self::ProcMacro => write!(f, "proc_macro"),
+            Self::CDyLib => write!(f, "cdylib"),
+            Self::DyLib => write!(f, "dylib"),
+            Self::RLib => write!(f, "rlib"),
+            Self::StaticLib => write!(f, "staticlib"),
+            Self::Bench => write!(f, "bench"),
+            Self::Test => write!(f, "test"),
+            Self::Example => write!(f, "example"),
+            Self::CustomBuild => write!(f, "custom_build"),
+        }
+    }
+}
+
 /// A block that iterates over all selected crates (standalone or within a workspace)
 /// in dependency order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +127,37 @@ impl From<CrateSelectCondition> for CrateCondition {
             }
             CrateSelectCondition::Or(conditions) => {
                 Self::Or(conditions.into_iter().map(Self::from).collect())
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for CrateCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Common(inner) => write!(f, "{inner}"),
+            Self::CrateType(filter) => write!(f, "type == {filter}"),
+            Self::Standalone => write!(f, "standalone"),
+            Self::Not(inner) => write!(f, "!{inner}"),
+            Self::And(conditions) => {
+                write!(f, "(")?;
+                for (i, c) in conditions.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " && ")?;
+                    }
+                    write!(f, "{c}")?;
+                }
+                write!(f, ")")
+            }
+            Self::Or(conditions) => {
+                write!(f, "(")?;
+                for (i, c) in conditions.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " || ")?;
+                    }
+                    write!(f, "{c}")?;
+                }
+                write!(f, ")")
             }
         }
     }

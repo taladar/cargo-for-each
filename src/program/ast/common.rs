@@ -71,6 +71,47 @@ pub struct WithEnvFileBlock<S> {
     pub statements: Vec<S>,
 }
 
+impl std::fmt::Display for CommonCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AskUser(q) => write!(f, "ask_user({q:?})"),
+            Self::RunCommand { command, args } => {
+                write!(f, "run {command:?}")?;
+                for a in args {
+                    write!(f, " {a:?}")?;
+                }
+                Ok(())
+            }
+            Self::FileExists(path) => write!(f, "file_exists({path:?})"),
+            Self::WorkingDirectoryClean => write!(f, "working_directory_clean"),
+            Self::GitConfigEquals { key, value } => {
+                write!(f, "git_config.{key} == {value:?}")
+            }
+            Self::Not(inner) => write!(f, "!{inner}"),
+            Self::And(conditions) => {
+                write!(f, "(")?;
+                for (i, c) in conditions.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " && ")?;
+                    }
+                    write!(f, "{c}")?;
+                }
+                write!(f, ")")
+            }
+            Self::Or(conditions) => {
+                write!(f, "(")?;
+                for (i, c) in conditions.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " || ")?;
+                    }
+                    write!(f, "{c}")?;
+                }
+                write!(f, ")")
+            }
+        }
+    }
+}
+
 /// A boolean condition available in all execution contexts.
 ///
 /// This represents the subset of conditions that do not depend on workspace- or

@@ -60,6 +60,37 @@ pub enum WorkspaceCondition {
     Or(Vec<Self>),
 }
 
+impl std::fmt::Display for WorkspaceCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Common(inner) => write!(f, "{inner}"),
+            Self::Standalone => write!(f, "standalone"),
+            Self::HasMembers => write!(f, "has_members"),
+            Self::Not(inner) => write!(f, "!{inner}"),
+            Self::And(conditions) => {
+                write!(f, "(")?;
+                for (i, c) in conditions.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " && ")?;
+                    }
+                    write!(f, "{c}")?;
+                }
+                write!(f, ")")
+            }
+            Self::Or(conditions) => {
+                write!(f, "(")?;
+                for (i, c) in conditions.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " || ")?;
+                    }
+                    write!(f, "{c}")?;
+                }
+                write!(f, ")")
+            }
+        }
+    }
+}
+
 /// A condition allowed inside `select workspaces where ...` filters.
 ///
 /// This is a restricted subset of [`WorkspaceCondition`] that can be evaluated

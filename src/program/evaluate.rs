@@ -15,6 +15,95 @@ use crate::program::ast::crate_ctx::{CrateCondition, CrateTypeFilter};
 use crate::program::ast::workspace_ctx::WorkspaceCondition;
 use crate::targets::CrateType;
 
+/// Looks up the actual value of `key` in the git config reachable from `manifest_dir`.
+///
+/// Returns `None` if the directory is not in a git repository or the key is absent.
+fn lookup_git_config_value(key: &str, manifest_dir: &std::path::Path) -> Option<String> {
+    let repo = Repository::discover(manifest_dir).ok()?;
+    let config = repo.config().ok()?;
+    config.get_string(key).ok()
+}
+
+/// Returns a human-readable string describing any runtime values embedded in a
+/// [`CommonCondition`] that would not be obvious from the condition text alone.
+///
+/// Currently this surfaces the actual git config value for [`CommonCondition::GitConfigEquals`].
+/// Returns `None` if there is nothing interesting to add.
+#[must_use]
+pub fn common_condition_runtime_detail(
+    cond: &CommonCondition,
+    manifest_dir: &std::path::Path,
+) -> Option<String> {
+    match cond {
+        CommonCondition::GitConfigEquals { key, value: _ } => {
+            let actual = lookup_git_config_value(key, manifest_dir)
+                .map_or_else(|| "(not set)".to_owned(), |v| format!("{v:?}"));
+            Some(format!("actual git_config.{key} = {actual}"))
+        }
+        CommonCondition::Not(inner) => common_condition_runtime_detail(inner, manifest_dir),
+        CommonCondition::And(conditions) | CommonCondition::Or(conditions) => {
+            let details: Vec<_> = conditions
+                .iter()
+                .filter_map(|c| common_condition_runtime_detail(c, manifest_dir))
+                .collect();
+            if details.is_empty() {
+                None
+            } else {
+                Some(details.join(", "))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Returns runtime detail strings for a [`WorkspaceCondition`].
+#[must_use]
+pub fn workspace_condition_runtime_detail(
+    cond: &WorkspaceCondition,
+    manifest_dir: &std::path::Path,
+) -> Option<String> {
+    match cond {
+        WorkspaceCondition::Common(inner) => common_condition_runtime_detail(inner, manifest_dir),
+        WorkspaceCondition::Not(inner) => workspace_condition_runtime_detail(inner, manifest_dir),
+        WorkspaceCondition::And(conditions) | WorkspaceCondition::Or(conditions) => {
+            let details: Vec<_> = conditions
+                .iter()
+                .filter_map(|c| workspace_condition_runtime_detail(c, manifest_dir))
+                .collect();
+            if details.is_empty() {
+                None
+            } else {
+                Some(details.join(", "))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Returns runtime detail strings for a [`CrateCondition`].
+#[must_use]
+pub fn crate_condition_runtime_detail(
+    cond: &CrateCondition,
+    manifest_dir: &std::path::Path,
+) -> Option<String> {
+    match cond {
+        CrateCondition::Common(inner) => common_condition_runtime_detail(inner, manifest_dir),
+        CrateCondition::Not(inner) => crate_condition_runtime_detail(inner, manifest_dir),
+        CrateCondition::And(conditions) | CrateCondition::Or(conditions) => {
+            let details: Vec<_> = conditions
+                .iter()
+                .filter_map(|c| crate_condition_runtime_detail(c, manifest_dir))
+                .collect();
+            if details.is_empty() {
+                None
+            } else {
+                Some(details.join(", "))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Evaluates a [`CommonCondition`] for the given target directory.
 ///
 /// Common conditions are available in all execution contexts.
