@@ -51,6 +51,13 @@ pub struct SnapshotMetadataNode {
     pub name: String,
 }
 
+/// A barrier that pauses execution of this target until the user releases it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitForContinueNode {
+    /// Human-readable description shown when the barrier is reached.
+    pub description: String,
+}
+
 /// A block that applies environment variables from a file to all nested statements.
 ///
 /// The env file is read at execution time, relative to the target's manifest directory.

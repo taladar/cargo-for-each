@@ -202,4 +202,7 @@ pub enum Error {
     /// error parsing resolved program snapshot file
     #[error("error parsing resolved program snapshot file {0}: {1}")]
     CouldNotParseResolvedProgram(std::path::PathBuf, #[source] toml::de::Error),
+    /// a cursor string given to `task continue` could not be parsed
+    #[error("invalid cursor string {0:?}: {1}")]
+    InvalidCursorString(String, String),
 }

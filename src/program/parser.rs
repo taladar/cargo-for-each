@@ -7,7 +7,7 @@ use chumsky::prelude::*;
 
 use super::ast::common::{
     Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
-    WithEnvFileBlock,
+    WaitForContinueNode, WithEnvFileBlock,
 };
 use super::ast::crate_ctx::{
     CrateCondition, CrateFilter, CrateSelectCondition, CrateStatement, CrateTypeFilter,
@@ -438,6 +438,15 @@ fn manual_step_parser<'src>()
         })
 }
 
+/// Parses a [`WaitForContinueNode`] from `wait_for_continue "description";`.
+fn wait_for_continue_parser<'src>()
+-> impl Parser<'src, &'src str, WaitForContinueNode, extra::Err<Rich<'src, char>>> + Clone {
+    kw("wait_for_continue")
+        .ignore_then(string_literal())
+        .then_ignore(sym(";"))
+        .map(|description| WaitForContinueNode { description })
+}
+
 // ─── CrateStatement parser ────────────────────────────────────────────────────
 
 /// Parses a [`CrateStatement`].
@@ -447,6 +456,7 @@ fn crate_statement_parser<'src>()
         let run = run_step_parser().map(CrateStatement::Run);
         let manual = manual_step_parser().map(CrateStatement::ManualStep);
         let snapshot_metadata = snapshot_metadata_parser().map(CrateStatement::SnapshotMetadata);
+        let wait_for_continue = wait_for_continue_parser().map(CrateStatement::WaitForContinue);
 
         let crate_cond = crate_condition_parser();
         let body = stmt.clone().repeated().collect::<Vec<_>>();
@@ -467,7 +477,14 @@ fn crate_statement_parser<'src>()
                 })
             });
 
-        choice((run, manual, if_stmt, with_env_file, snapshot_metadata))
+        choice((
+            run,
+            manual,
+            if_stmt,
+            with_env_file,
+            snapshot_metadata,
+            wait_for_continue,
+        ))
     })
 }
 
@@ -519,6 +536,7 @@ fn workspace_statement_parser<'src>()
         let manual = manual_step_parser().map(WorkspaceStatement::ManualStep);
         let snapshot_metadata =
             snapshot_metadata_parser().map(WorkspaceStatement::SnapshotMetadata);
+        let wait_for_continue = wait_for_continue_parser().map(WorkspaceStatement::WaitForContinue);
 
         let ws_cond = workspace_condition_parser();
         let ws_body = stmt.clone().repeated().collect::<Vec<_>>();
@@ -560,6 +578,7 @@ fn workspace_statement_parser<'src>()
             for_crate_in_ws,
             with_env_file,
             snapshot_metadata,
+            wait_for_continue,
         ))
     })
 }

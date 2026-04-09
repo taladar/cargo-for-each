@@ -2,7 +2,7 @@
 
 use super::common::{
     Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
-    WithEnvFileBlock,
+    WaitForContinueNode, WithEnvFileBlock,
 };
 use super::crate_ctx::CrateStatement;
 
@@ -37,6 +37,8 @@ pub enum WorkspaceStatement {
     SnapshotMetadata(SnapshotMetadataNode),
     /// Execute nested statements with environment variables loaded from a file.
     WithEnvFile(WithEnvFileBlock<Self>),
+    /// Pause execution until the user releases this barrier.
+    WaitForContinue(WaitForContinueNode),
 }
 
 /// A boolean condition available in the workspace execution context.

@@ -15,7 +15,9 @@ use futures::stream::{self, StreamExt as _};
 use tracing::instrument;
 
 use crate::error::Error;
-use crate::program::ast::common::{ManualStepNode, RunStep, SnapshotMetadataNode};
+use crate::program::ast::common::{
+    ManualStepNode, RunStep, SnapshotMetadataNode, WaitForContinueNode,
+};
 use crate::program::ast::crate_ctx::{CrateIfBlock, CrateStatement};
 use crate::program::ast::workspace_ctx::{WorkspaceIfBlock, WorkspaceStatement};
 use crate::program::cursor::{CursorSegment, ProgramCursor};
@@ -233,6 +235,17 @@ pub struct TaskRewindParameters {
     pub sub_command: TaskRewindSubCommand,
 }
 
+/// Parameters for releasing a wait barrier in a task.
+#[derive(Parser, Debug, Clone)]
+pub struct ContinueBarrierParameters {
+    /// The name of the task.
+    #[clap(long)]
+    pub name: String,
+    /// Cursor path of the wait barrier to release (e.g. `w0/s2/`).
+    #[clap(long)]
+    pub cursor: String,
+}
+
 /// The `task` subcommand.
 #[derive(Parser, Debug, Clone)]
 pub enum TaskSubCommand {
@@ -248,6 +261,8 @@ pub enum TaskSubCommand {
     Run(TaskRunParameters),
     /// Rewind a task.
     Rewind(TaskRewindParameters),
+    /// Release a wait barrier so execution can continue past it.
+    Continue(ContinueBarrierParameters),
 }
 
 /// Parameters for removing a task.
@@ -356,6 +371,17 @@ fn is_snapshot_metadata_completed(state_dir: &Path) -> bool {
     state_dir.exists() && state_dir.join("snapshot_metadata_completed").exists()
 }
 
+/// Returns `true` if the `wait_for_continue` barrier at `state_dir` is in the waiting state
+/// (state_dir exists but no `barrier_released` file).
+fn is_wait_barrier_waiting(state_dir: &Path) -> bool {
+    state_dir.exists() && !state_dir.join("barrier_released").exists()
+}
+
+/// Returns `true` if the `wait_for_continue` barrier at `state_dir` has been released.
+fn is_wait_barrier_released(state_dir: &Path) -> bool {
+    state_dir.join("barrier_released").exists()
+}
+
 /// Returns `true` if all crate statements in `stmts` under `prefix` are completed.
 fn is_crate_stmts_completed(
     stmts: &[CrateStatement],
@@ -401,6 +427,7 @@ fn is_crate_stmt_completed(
             let p = cursor.clone().with(CursorSegment::WithEnvFile);
             is_crate_stmts_completed(&block.statements, &p, state_base)
         }
+        CrateStatement::WaitForContinue(_) => is_wait_barrier_released(&state_dir),
     }
 }
 
@@ -469,6 +496,7 @@ fn is_workspace_stmt_completed(
                 is_crate_stmts_completed(&block.statements, &c_prefix, state_base)
             })
         }
+        WorkspaceStatement::WaitForContinue(_) => is_wait_barrier_released(&state_dir),
     }
 }
 
@@ -562,6 +590,8 @@ pub enum StatementAction<'a> {
     EvaluateCrateIf(&'a CrateIfBlock),
     /// Capture and store cargo metadata under the given name.
     SnapshotMetadata(&'a SnapshotMetadataNode),
+    /// A wait barrier: pending → create state_dir and print message; released → skip.
+    WaitForContinue(&'a WaitForContinueNode),
 }
 
 /// The next statement that should be executed in a running task.
@@ -678,6 +708,22 @@ fn find_next_in_crate_stmts<'a>(
                 );
                 if nested.is_some() {
                     return nested;
+                }
+            }
+            CrateStatement::WaitForContinue(node) => {
+                if is_wait_barrier_released(&state_dir) {
+                    // Already released — skip.
+                } else if is_wait_barrier_waiting(&state_dir) {
+                    // Waiting for release — block this target.
+                    return None;
+                } else {
+                    // Pending — surface it as the next action.
+                    return Some(NextStatement {
+                        cursor,
+                        manifest_dir,
+                        action: StatementAction::WaitForContinue(node),
+                        env_file_paths: env_file_paths.to_vec(),
+                    });
                 }
             }
         }
@@ -821,6 +867,22 @@ fn find_next_in_workspace_stmts<'a>(
                     }
                 }
                 // All member crates done — continue to next workspace statement.
+            }
+            WorkspaceStatement::WaitForContinue(node) => {
+                if is_wait_barrier_released(&state_dir) {
+                    // Already released — skip.
+                } else if is_wait_barrier_waiting(&state_dir) {
+                    // Waiting for release — block this target.
+                    return None;
+                } else {
+                    // Pending — surface it as the next action.
+                    return Some(NextStatement {
+                        cursor,
+                        manifest_dir,
+                        action: StatementAction::WaitForContinue(node),
+                        env_file_paths: env_file_paths.to_vec(),
+                    });
+                }
             }
         }
     }
@@ -1333,6 +1395,7 @@ fn evaluate_crate_if_block(
 /// # Errors
 ///
 /// Returns an error if any statement fails.
+#[expect(clippy::print_stdout, reason = "barrier message is part of the UI")]
 async fn run_crate_stmts_to_completion(
     stmts: &[CrateStatement],
     prefix: &ProgramCursor,
@@ -1443,6 +1506,24 @@ async fn run_crate_stmts_to_completion(
                 ))
                 .await?;
             }
+            CrateStatement::WaitForContinue(node) => {
+                if is_wait_barrier_released(&state_dir) {
+                    // Released — continue to next statement.
+                } else {
+                    // Pending or waiting — create state_dir (pending → waiting) and stop.
+                    if !state_dir.exists() {
+                        fs_err::create_dir_all(&state_dir)
+                            .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+                    }
+                    println!(
+                        "Wait barrier reached at {}: \"{}\". Release with `task continue --name <task-name> --cursor {}`.",
+                        cursor,
+                        node.description,
+                        cursor.to_path_string()
+                    );
+                    return Ok(());
+                }
+            }
         }
     }
     Ok(())
@@ -1455,6 +1536,7 @@ async fn run_crate_stmts_to_completion(
 /// # Errors
 ///
 /// Returns an error if any statement fails.
+#[expect(clippy::print_stdout, reason = "barrier message is part of the UI")]
 #[expect(
     clippy::too_many_arguments,
     reason = "all parameters are needed; the env-file threading adds one more than clippy's default limit"
@@ -1589,6 +1671,24 @@ async fn run_workspace_stmts_to_completion(
                     .await?;
                 }
             }
+            WorkspaceStatement::WaitForContinue(node) => {
+                if is_wait_barrier_released(&state_dir) {
+                    // Released — continue to next statement.
+                } else {
+                    // Pending or waiting — create state_dir (pending → waiting) and stop.
+                    if !state_dir.exists() {
+                        fs_err::create_dir_all(&state_dir)
+                            .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+                    }
+                    println!(
+                        "Wait barrier reached at {}: \"{}\". Release with `task continue --name <task-name> --cursor {}`.",
+                        cursor,
+                        node.description,
+                        cursor.to_path_string()
+                    );
+                    return Ok(());
+                }
+            }
         }
     }
     Ok(())
@@ -1674,7 +1774,8 @@ fn find_last_completed_crate_stmt(
             }
             CrateStatement::Run(_)
             | CrateStatement::ManualStep(_)
-            | CrateStatement::SnapshotMetadata(_) => {}
+            | CrateStatement::SnapshotMetadata(_)
+            | CrateStatement::WaitForContinue(_) => {}
         }
         if is_crate_stmt_completed(stmt, &cursor, state_base) {
             return Some(cursor);
@@ -1747,7 +1848,8 @@ fn find_last_completed_workspace_stmt(
             }
             WorkspaceStatement::Run(_)
             | WorkspaceStatement::ManualStep(_)
-            | WorkspaceStatement::SnapshotMetadata(_) => {}
+            | WorkspaceStatement::SnapshotMetadata(_)
+            | WorkspaceStatement::WaitForContinue(_) => {}
         }
         if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base) {
             return Some(cursor);
@@ -1879,6 +1981,18 @@ pub async fn run_single_step_command(
             StatementAction::SnapshotMetadata(step) => {
                 execute_snapshot_metadata_step(step, &next.cursor, next.manifest_dir, &state_base)
                     .await?;
+            }
+            StatementAction::WaitForContinue(node) => {
+                let state_dir = state_base.join(next.cursor.to_path());
+                fs_err::create_dir_all(&state_dir)
+                    .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+                println!(
+                    "Wait barrier reached at {}: \"{}\". Release with `task continue --name {} --cursor {}`.",
+                    next.cursor,
+                    node.description,
+                    params.name,
+                    next.cursor.to_path_string()
+                );
             }
         }
     } else {
@@ -2383,6 +2497,9 @@ fn crate_stmt_label(stmt: &CrateStatement) -> String {
         CrateStatement::WithEnvFile(block) => {
             format!("with_env_file \"{}\"", block.env_file)
         }
+        CrateStatement::WaitForContinue(node) => {
+            format!("wait_for_continue \"{}\"", node.description)
+        }
     }
 }
 
@@ -2402,6 +2519,9 @@ fn workspace_stmt_label(stmt: &WorkspaceStatement) -> String {
         WorkspaceStatement::ForCrateInWorkspace(_) => String::from("for crate in workspace"),
         WorkspaceStatement::WithEnvFile(block) => {
             format!("with_env_file \"{}\"", block.env_file)
+        }
+        WorkspaceStatement::WaitForContinue(node) => {
+            format!("wait_for_continue \"{}\"", node.description)
         }
     }
 }
@@ -2484,7 +2604,18 @@ fn print_crate_stmts_describe(
                 let label = crate_stmt_label(stmt);
                 println!("{indent}{cursor_str:<20}  {icon}  {label}");
             }
-            _ => {
+            CrateStatement::WaitForContinue(node) => {
+                let icon = if is_wait_barrier_released(&state_dir) {
+                    "\u{2705}"
+                } else if is_wait_barrier_waiting(&state_dir) {
+                    "\u{23F3}"
+                } else {
+                    "\u{2B1C}"
+                };
+                let label = format!("wait_for_continue \"{}\"", node.description);
+                println!("{indent}{cursor_str:<20}  {icon}  {label}");
+            }
+            CrateStatement::ManualStep(_) | CrateStatement::SnapshotMetadata(_) => {
                 let icon = if is_crate_stmt_completed(stmt, &cursor, state_base) {
                     "\u{2705}"
                 } else {
@@ -2615,7 +2746,18 @@ fn print_workspace_stmts_describe(
                 let label = workspace_stmt_label(stmt);
                 println!("{indent}{cursor_str:<20}  {icon}  {label}");
             }
-            _ => {
+            WorkspaceStatement::WaitForContinue(node) => {
+                let icon = if is_wait_barrier_released(&state_dir) {
+                    "\u{2705}"
+                } else if is_wait_barrier_waiting(&state_dir) {
+                    "\u{23F3}"
+                } else {
+                    "\u{2B1C}"
+                };
+                let label = format!("wait_for_continue \"{}\"", node.description);
+                println!("{indent}{cursor_str:<20}  {icon}  {label}");
+            }
+            WorkspaceStatement::ManualStep(_) | WorkspaceStatement::SnapshotMetadata(_) => {
                 let icon = if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base)
                 {
                     "\u{2705}"
@@ -2742,7 +2884,41 @@ pub async fn task_command(
         TaskSubCommand::Rewind(params) => {
             task_rewind_command(params, environment).await?;
         }
+        TaskSubCommand::Continue(params) => {
+            release_wait_barrier_command(params, environment).await?;
+        }
     }
+    Ok(())
+}
+
+/// Releases a wait barrier so execution can continue past it.
+///
+/// # Errors
+///
+/// Returns an error if the cursor string cannot be parsed or if the state files
+/// cannot be written.
+#[instrument]
+pub async fn release_wait_barrier_command(
+    params: ContinueBarrierParameters,
+    environment: crate::Environment,
+) -> Result<(), Error> {
+    use crate::program::cursor::ProgramCursor;
+
+    let cursor = ProgramCursor::from_path_string(&params.cursor)
+        .map_err(|e| Error::InvalidCursorString(params.cursor.clone(), e.to_string()))?;
+    let state_base = state_dir_for_task(&params.name, &environment)?;
+    let state_dir = state_base.join(cursor.to_path());
+    if !state_dir.exists() {
+        fs_err::create_dir_all(&state_dir)
+            .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+    }
+    let release_file = state_dir.join("barrier_released");
+    fs_err::write(&release_file, "")
+        .map_err(|e| Error::CouldNotWriteStateFile(release_file.clone(), e))?;
+    println!(
+        "Barrier at {} released. Execution can continue.",
+        cursor.to_path_string()
+    );
     Ok(())
 }
 
