@@ -455,9 +455,16 @@ fn crate_statement_parser<'src>()
 
         let with_env_file = kw("with_env_file")
             .ignore_then(string_literal())
-            .then(stmt.repeated().collect::<Vec<_>>().delimited_by(sym("{"), sym("}")))
+            .then(
+                stmt.repeated()
+                    .collect::<Vec<_>>()
+                    .delimited_by(sym("{"), sym("}")),
+            )
             .map(|(env_file, statements)| {
-                CrateStatement::WithEnvFile(WithEnvFileBlock { env_file, statements })
+                CrateStatement::WithEnvFile(WithEnvFileBlock {
+                    env_file,
+                    statements,
+                })
             });
 
         choice((run, manual, if_stmt, with_env_file, snapshot_metadata))
@@ -534,12 +541,26 @@ fn workspace_statement_parser<'src>()
 
         let with_env_file = kw("with_env_file")
             .ignore_then(string_literal())
-            .then(stmt.repeated().collect::<Vec<_>>().delimited_by(sym("{"), sym("}")))
+            .then(
+                stmt.repeated()
+                    .collect::<Vec<_>>()
+                    .delimited_by(sym("{"), sym("}")),
+            )
             .map(|(env_file, statements)| {
-                WorkspaceStatement::WithEnvFile(WithEnvFileBlock { env_file, statements })
+                WorkspaceStatement::WithEnvFile(WithEnvFileBlock {
+                    env_file,
+                    statements,
+                })
             });
 
-        choice((run, manual, if_stmt, for_crate_in_ws, with_env_file, snapshot_metadata))
+        choice((
+            run,
+            manual,
+            if_stmt,
+            for_crate_in_ws,
+            with_env_file,
+            snapshot_metadata,
+        ))
     })
 }
 
@@ -1007,9 +1028,7 @@ for crate {
 
     #[test]
     fn with_env_file_in_crate_context() {
-        let prog = parse_ok(
-            r#"for crate { with_env_file ".env" { run "cargo" "build"; } }"#,
-        );
+        let prog = parse_ok(r#"for crate { with_env_file ".env" { run "cargo" "build"; } }"#);
         let GlobalStatement::ForCrate(block) = &prog.statements[0] else {
             panic!("expected ForCrate");
         };
@@ -1027,9 +1046,8 @@ for crate {
 
     #[test]
     fn with_env_file_in_workspace_context() {
-        let prog = parse_ok(
-            r#"for workspace { with_env_file "secrets.env" { run "deploy" "prod"; } }"#,
-        );
+        let prog =
+            parse_ok(r#"for workspace { with_env_file "secrets.env" { run "deploy" "prod"; } }"#);
         let GlobalStatement::ForWorkspace(block) = &prog.statements[0] else {
             panic!("expected ForWorkspace");
         };
