@@ -205,4 +205,8 @@ pub enum Error {
     /// a cursor string given to `task continue` could not be parsed
     #[error("invalid cursor string {0:?}: {1}")]
     InvalidCursorString(String, String),
+    /// the command or one of its args contains a NUL byte, which POSIX `sh`
+    /// cannot represent
+    #[error("argument to `run` step contains an invalid byte (NUL): {0:?}")]
+    InvalidCommandArg(String),
 }

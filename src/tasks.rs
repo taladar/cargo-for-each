@@ -1168,14 +1168,11 @@ async fn execute_run_step(
         return Err(Error::CommandNotFound(command.clone()));
     }
 
-    let command_str = format!(
-        "{} {}",
-        command,
-        args.iter()
-            .map(|a| format!("\"{}\"", a.replace('"', "\\\"")))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
+    if command.contains('\0') || args.iter().any(|a| a.contains('\0')) {
+        return Err(Error::InvalidCommandArg(command.clone()));
+    }
+    let command_str =
+        shell_words::join(std::iter::once(command.as_str()).chain(args.iter().map(String::as_str)));
 
     println!("Running: {command_str}");
 
