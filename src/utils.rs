@@ -25,9 +25,7 @@ pub fn command_is_executable(command: &str, environment: &crate::Environment) ->
 #[must_use]
 pub fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
-    fs_err::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    fs_err::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// checks if the given path is an executable file
