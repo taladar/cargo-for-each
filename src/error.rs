@@ -209,4 +209,16 @@ pub enum Error {
     /// cannot represent
     #[error("argument to `run` step contains an invalid byte (NUL): {0:?}")]
     InvalidCommandArg(String),
+    /// `file_exists` was evaluated against a target whose manifest directory is
+    /// not registered in the config (neither as a workspace nor as a crate)
+    #[error(
+        "`file_exists` evaluated against unregistered target {0}: cannot determine workspace boundary"
+    )]
+    FileExistsTargetNotRegistered(std::path::PathBuf),
+    /// the path passed to `file_exists` resolves outside the enclosing
+    /// workspace's manifest directory
+    #[error(
+        "`file_exists {0:?}` resolves outside the enclosing workspace; only paths within the workspace manifest directory are allowed"
+    )]
+    FileExistsPathOutsideWorkspace(String),
 }

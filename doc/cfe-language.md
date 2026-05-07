@@ -478,7 +478,7 @@ Not available in `select` filter clauses.
 |--------|--------------------------|
 | `ask_user "question"` | The user answers `y` or `yes` at the prompt. |
 | `run "cmd" "arg"…` | The command exits with status 0. |
-| `file_exists "path"` | A file at the given path (relative to the target directory) exists. |
+| `file_exists "path"` | A file at the given path exists. Relative paths resolve against the target directory; absolute paths and `..` traversal are accepted only if the resulting path stays within the enclosing workspace's manifest directory. |
 | `working_directory_clean` | `git status --porcelain` produces no output in the target directory. |
 | `git_config "key" == "value"` | The Git configuration key equals the given value in the target's repository. |
 

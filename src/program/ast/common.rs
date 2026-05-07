@@ -131,7 +131,9 @@ pub enum CommonCondition {
         /// The arguments to pass to the command.
         args: Vec<String>,
     },
-    /// True if a file with the given name (or relative path) exists in the target's directory.
+    /// True if a file at the given path exists. Relative paths resolve against the target's
+    /// directory; absolute paths and `..` traversal are accepted only if the resulting path
+    /// stays within the enclosing workspace's manifest directory.
     FileExists(String),
     /// True if the working directory has no uncommitted changes (`git status --porcelain` is empty).
     WorkingDirectoryClean,

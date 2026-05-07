@@ -5,7 +5,7 @@
 //! execution to decide which branches to take in `if` blocks.
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use git2::Repository;
 
@@ -14,6 +14,49 @@ use crate::program::ast::common::CommonCondition;
 use crate::program::ast::crate_ctx::{CrateCondition, CrateTypeFilter};
 use crate::program::ast::workspace_ctx::WorkspaceCondition;
 use crate::targets::CrateType;
+
+/// Joins `rel_or_abs` to `base` and lexically normalizes `.`/`..` segments.
+///
+/// An absolute `rel_or_abs` overrides `base` (per `Path::join` semantics). The
+/// result is *not* resolved against the filesystem, so symlinks are not
+/// followed — callers that need anti-escape guarantees must canonicalize
+/// independently.
+fn lexically_resolve(base: &Path, rel_or_abs: &str) -> PathBuf {
+    let joined = base.join(rel_or_abs);
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    out
+}
+
+/// Returns the workspace manifest directory for a target's `manifest_dir`.
+///
+/// `manifest_dir` is the dir of either a registered workspace (in which case
+/// the workspace dir is itself) or a registered crate (in which case the
+/// workspace dir is the crate's enclosing workspace).
+fn workspace_boundary_for<'a>(manifest_dir: &Path, config: &'a crate::Config) -> Option<&'a Path> {
+    if let Some(w) = config
+        .workspaces
+        .iter()
+        .find(|w| w.manifest_dir == manifest_dir)
+    {
+        return Some(w.manifest_dir.as_path());
+    }
+    config
+        .crates
+        .iter()
+        .find(|c| c.manifest_dir == manifest_dir)
+        .map(|c| c.workspace_manifest_dir.as_path())
+}
 
 /// Looks up the actual value of `key` in the git config reachable from `manifest_dir`.
 ///
@@ -117,10 +160,6 @@ pub fn crate_condition_runtime_detail(
     clippy::module_name_repetitions,
     reason = "name is intentional within the evaluate module"
 )]
-#[expect(
-    clippy::only_used_in_recursion,
-    reason = "config is passed for extensibility; leaf arms may need it in future"
-)]
 pub fn evaluate_common_condition(
     cond: &CommonCondition,
     manifest_dir: &Path,
@@ -151,7 +190,15 @@ pub fn evaluate_common_condition(
             let output = crate::utils::execute_command(&mut cmd, environment, manifest_dir)?;
             Ok(output.status.success())
         }
-        CommonCondition::FileExists(filename) => Ok(manifest_dir.join(filename).exists()),
+        CommonCondition::FileExists(filename) => {
+            let workspace_dir = workspace_boundary_for(manifest_dir, config)
+                .ok_or_else(|| Error::FileExistsTargetNotRegistered(manifest_dir.to_path_buf()))?;
+            let resolved = lexically_resolve(manifest_dir, filename);
+            if !resolved.starts_with(workspace_dir) {
+                return Err(Error::FileExistsPathOutsideWorkspace(filename.clone()));
+            }
+            Ok(resolved.exists())
+        }
         CommonCondition::WorkingDirectoryClean => {
             if !crate::utils::command_is_executable("git", environment) {
                 return Err(Error::CommandNotFound("git".to_owned()));
@@ -396,7 +443,7 @@ mod tests {
         let dir = temp.path();
         fs_err::write(dir.join("hello.txt"), "").unwrap_or_else(|e| panic!("{e}"));
         let env = mock_env(&temp);
-        let config = empty_config();
+        let config = config_with_bin_crate(dir);
         let result = evaluate_common_condition(
             &CommonCondition::FileExists("hello.txt".to_owned()),
             dir,
@@ -411,7 +458,7 @@ mod tests {
     fn common_file_exists_false() {
         let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
         let env = mock_env(&temp);
-        let config = empty_config();
+        let config = config_with_bin_crate(temp.path());
         let result = evaluate_common_condition(
             &CommonCondition::FileExists("missing.txt".to_owned()),
             temp.path(),
@@ -423,10 +470,78 @@ mod tests {
     }
 
     #[test]
+    fn common_file_exists_rejects_absolute_path_outside_workspace() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let env = mock_env(&temp);
+        let config = config_with_bin_crate(temp.path());
+        let result = evaluate_common_condition(
+            &CommonCondition::FileExists("/etc/passwd".to_owned()),
+            temp.path(),
+            &env,
+            &config,
+            &[],
+        );
+        match result {
+            Err(Error::FileExistsPathOutsideWorkspace(p)) => assert_eq!(p, "/etc/passwd"),
+            other => panic!("expected FileExistsPathOutsideWorkspace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn common_file_exists_rejects_parent_dir_traversal() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let env = mock_env(&temp);
+        let config = config_with_bin_crate(temp.path());
+        let result = evaluate_common_condition(
+            &CommonCondition::FileExists("../../../etc/passwd".to_owned()),
+            temp.path(),
+            &env,
+            &config,
+            &[],
+        );
+        match result {
+            Err(Error::FileExistsPathOutsideWorkspace(p)) => assert_eq!(p, "../../../etc/passwd"),
+            other => panic!("expected FileExistsPathOutsideWorkspace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn common_file_exists_allows_crate_traversal_within_workspace() {
+        // A crate at <ws>/sub may reference files at <ws>/target/... via "..".
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let ws = temp.path();
+        let crate_dir = ws.join("sub");
+        fs_err::create_dir_all(&crate_dir).unwrap_or_else(|e| panic!("{e}"));
+        let target = ws.join("target");
+        fs_err::create_dir_all(&target).unwrap_or_else(|e| panic!("{e}"));
+        fs_err::write(target.join("artifact"), "").unwrap_or_else(|e| panic!("{e}"));
+        let env = mock_env(&temp);
+        let config = crate::Config {
+            workspaces: vec![Workspace {
+                manifest_dir: ws.to_path_buf(),
+                is_standalone: false,
+            }],
+            crates: vec![Crate {
+                manifest_dir: crate_dir.clone(),
+                workspace_manifest_dir: ws.to_path_buf(),
+                types: BTreeSet::from([CrateType::Bin]),
+            }],
+        };
+        let result = evaluate_common_condition(
+            &CommonCondition::FileExists("../target/artifact".to_owned()),
+            &crate_dir,
+            &env,
+            &config,
+            &[],
+        );
+        assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
+    }
+
+    #[test]
     fn common_not() {
         let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
         let env = mock_env(&temp);
-        let config = empty_config();
+        let config = config_with_bin_crate(temp.path());
         let result = evaluate_common_condition(
             &CommonCondition::Not(Box::new(CommonCondition::FileExists("x".to_owned()))),
             temp.path(),
@@ -441,7 +556,7 @@ mod tests {
     fn common_and_short_circuits() {
         let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
         let env = mock_env(&temp);
-        let config = empty_config();
+        let config = config_with_bin_crate(temp.path());
         let result = evaluate_common_condition(
             &CommonCondition::And(vec![
                 CommonCondition::FileExists("missing".to_owned()),
@@ -461,7 +576,7 @@ mod tests {
         let dir = temp.path();
         fs_err::write(dir.join("exists.txt"), "").unwrap_or_else(|e| panic!("{e}"));
         let env = mock_env(&temp);
-        let config = empty_config();
+        let config = config_with_bin_crate(dir);
         let result = evaluate_common_condition(
             &CommonCondition::Or(vec![
                 CommonCondition::FileExists("exists.txt".to_owned()),
