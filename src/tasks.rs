@@ -1103,7 +1103,7 @@ async fn execute_snapshot_metadata_step(
 ) -> Result<(), Error> {
     println!("Snapshot metadata: {:?}", step.name);
     let state_dir = state_base.join(cursor.to_path());
-    fs_err::create_dir_all(&state_dir)
+    crate::utils::create_user_dir_all(&state_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
     let metadata = MetadataCommand::new()
         .manifest_path(manifest_dir.join("Cargo.toml"))
@@ -1113,7 +1113,7 @@ async fn execute_snapshot_metadata_step(
         .map_err(Error::CouldNotSerializeMetadataSnapshot)?;
     let name_dir = state_base.join("snapshots").join(&step.name);
     let by_manifest_dir = name_dir.join("by_manifest");
-    fs_err::create_dir_all(&by_manifest_dir)
+    crate::utils::create_user_dir_all(&by_manifest_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(by_manifest_dir.clone(), e))?;
     let hex_key: String = manifest_dir
         .to_string_lossy()
@@ -1125,13 +1125,14 @@ async fn execute_snapshot_metadata_step(
     let mut filename = hex_key;
     filename.push_str(".json");
     let per_manifest_path = by_manifest_dir.join(&filename);
-    fs_err::write(&per_manifest_path, &json)
+    crate::utils::write_user_file(&per_manifest_path, &json)
         .map_err(|e| Error::CouldNotWriteStateFile(per_manifest_path.clone(), e))?;
     let latest_path = name_dir.join("latest.json");
-    fs_err::write(&latest_path, &json)
+    crate::utils::write_user_file(&latest_path, &json)
         .map_err(|e| Error::CouldNotWriteStateFile(latest_path.clone(), e))?;
     let marker = state_dir.join("snapshot_metadata_completed");
-    fs_err::write(&marker, "done").map_err(|e| Error::CouldNotWriteStateFile(marker.clone(), e))?;
+    crate::utils::write_user_file(&marker, "done")
+        .map_err(|e| Error::CouldNotWriteStateFile(marker.clone(), e))?;
     Ok(())
 }
 
@@ -1154,7 +1155,7 @@ async fn execute_run_step(
     extra_env: &[(String, String)],
 ) -> Result<(), Error> {
     let state_dir = state_base.join(cursor.to_path());
-    fs_err::create_dir_all(&state_dir)
+    crate::utils::create_user_dir_all(&state_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
 
     let command = expand_interpolations(&step.command, manifest_dir, state_base)?;
@@ -1181,12 +1182,12 @@ async fn execute_run_step(
     let script = format!(
         "#!/bin/sh\n{command_str}\nrc=$?\nprintf '%d' \"$rc\" > \"$CARGO_FOR_EACH_EXIT_STATUS_PATH\"\nexit \"$rc\"\n"
     );
-    fs_err::write(&wrapper_path, &script)
+    crate::utils::write_user_file(&wrapper_path, &script)
         .map_err(|e| Error::CouldNotWriteStateFile(wrapper_path.clone(), e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let perms = std::fs::Permissions::from_mode(0o755);
+        let perms = std::fs::Permissions::from_mode(0o700);
         fs_err::set_permissions(&wrapper_path, perms).map_err(Error::IoError)?;
     }
 
@@ -1208,7 +1209,7 @@ async fn execute_run_step(
 
     match crate::utils::execute_command(&mut cmd, environment, manifest_dir) {
         Err(e) => {
-            fs_err::write(&exit_status_path, "")
+            crate::utils::write_user_file(&exit_status_path, "")
                 .map_err(|we| Error::CouldNotWriteStateFile(exit_status_path, we))?;
             Err(e)
         }
@@ -1221,7 +1222,7 @@ async fn execute_run_step(
                 .unwrap_or(-1);
 
             if !exit_status_path.exists() {
-                fs_err::write(&exit_status_path, exit_code.to_string())
+                crate::utils::write_user_file(&exit_status_path, exit_code.to_string())
                     .map_err(|e| Error::CouldNotWriteStateFile(exit_status_path, e))?;
             }
 
@@ -1256,7 +1257,7 @@ async fn execute_manual_step(
     extra_env: &[(String, String)],
 ) -> Result<(), Error> {
     let state_dir = state_base.join(cursor.to_path());
-    fs_err::create_dir_all(&state_dir)
+    crate::utils::create_user_dir_all(&state_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
 
     let title = expand_interpolations(&step.title, manifest_dir, state_base)?;
@@ -1295,7 +1296,7 @@ async fn execute_manual_step(
     let confirmed = confirmation.trim().eq_ignore_ascii_case("y")
         || confirmation.trim().eq_ignore_ascii_case("yes");
     let manual_step_confirmed_path = state_dir.join("manual_step_confirmed");
-    fs_err::write(
+    crate::utils::write_user_file(
         &manual_step_confirmed_path,
         if confirmed { "y" } else { "n" },
     )
@@ -1326,7 +1327,7 @@ fn evaluate_workspace_if_block(
     extra_env: &[(String, String)],
 ) -> Result<(), Error> {
     let state_dir = state_base.join(cursor.to_path());
-    fs_err::create_dir_all(&state_dir)
+    crate::utils::create_user_dir_all(&state_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
 
     println!("Evaluating if at {cursor}:");
@@ -1364,7 +1365,7 @@ fn evaluate_workspace_if_block(
         n => println!("  → branch {n} taken"),
     }
     let chosen_branch_path = state_dir.join("chosen_branch");
-    fs_err::write(&chosen_branch_path, &chosen_str)
+    crate::utils::write_user_file(&chosen_branch_path, &chosen_str)
         .map_err(|e| Error::CouldNotWriteStateFile(chosen_branch_path, e))?;
     Ok(())
 }
@@ -1385,7 +1386,7 @@ fn evaluate_crate_if_block(
     extra_env: &[(String, String)],
 ) -> Result<(), Error> {
     let state_dir = state_base.join(cursor.to_path());
-    fs_err::create_dir_all(&state_dir)
+    crate::utils::create_user_dir_all(&state_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
 
     println!("Evaluating if at {cursor}:");
@@ -1423,7 +1424,7 @@ fn evaluate_crate_if_block(
         n => println!("  → branch {n} taken"),
     }
     let chosen_branch_path = state_dir.join("chosen_branch");
-    fs_err::write(&chosen_branch_path, &chosen_str)
+    crate::utils::write_user_file(&chosen_branch_path, &chosen_str)
         .map_err(|e| Error::CouldNotWriteStateFile(chosen_branch_path, e))?;
     Ok(())
 }
@@ -1561,7 +1562,7 @@ async fn run_crate_stmts_to_completion(
                 } else {
                     // Pending or waiting — create state_dir (pending → waiting) and stop.
                     if !state_dir.exists() {
-                        fs_err::create_dir_all(&state_dir)
+                        crate::utils::create_user_dir_all(&state_dir)
                             .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
                     }
                     println!(
@@ -1732,7 +1733,7 @@ async fn run_workspace_stmts_to_completion(
                 } else {
                     // Pending or waiting — create state_dir (pending → waiting) and stop.
                     if !state_dir.exists() {
-                        fs_err::create_dir_all(&state_dir)
+                        crate::utils::create_user_dir_all(&state_dir)
                             .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
                     }
                     println!(
@@ -1979,15 +1980,15 @@ pub async fn task_create_command(
     if task_dir.exists() {
         return Err(Error::AlreadyExists(format!("task {}", params.name)));
     }
-    fs_err::create_dir_all(&task_dir)
+    crate::utils::create_user_dir_all(&task_dir)
         .map_err(|e| Error::CouldNotCreateTaskDir(task_dir.clone(), e))?;
 
-    fs_err::copy(&params.program, task_dir.join("program.cfe")).map_err(|e| {
+    crate::utils::copy_user_file(&params.program, task_dir.join("program.cfe")).map_err(|e| {
         Error::CouldNotCopyFile(params.program.clone(), task_dir.join("program.cfe"), e)
     })?;
 
     let resolved_path = task_dir.join("resolved-program.toml");
-    fs_err::write(
+    crate::utils::write_user_file(
         &resolved_path,
         toml::to_string(&resolved).map_err(Error::CouldNotSerializeResolvedProgram)?,
     )
@@ -2069,7 +2070,7 @@ pub async fn run_single_step_command(
             }
             StatementAction::WaitForContinue(node) => {
                 let state_dir = state_base.join(next.cursor.to_path());
-                fs_err::create_dir_all(&state_dir)
+                crate::utils::create_user_dir_all(&state_dir)
                     .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
                 println!(
                     "Wait barrier reached at {}: \"{}\". Release with `task continue --name {} --cursor {}`.",
@@ -3000,11 +3001,11 @@ pub async fn release_wait_barrier_command(
     let state_base = state_dir_for_task(&params.name, &environment)?;
     let state_dir = state_base.join(cursor.to_path());
     if !state_dir.exists() {
-        fs_err::create_dir_all(&state_dir)
+        crate::utils::create_user_dir_all(&state_dir)
             .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
     }
     let release_file = state_dir.join("barrier_released");
-    fs_err::write(&release_file, "")
+    crate::utils::write_user_file(&release_file, "")
         .map_err(|e| Error::CouldNotWriteStateFile(release_file.clone(), e))?;
     println!(
         "Barrier at {} released. Execution can continue.",
@@ -3051,7 +3052,7 @@ mod tests {
         cursor: &ProgramCursor,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let dir = state_base.join(cursor.to_path());
-        fs_err::create_dir_all(&dir)?;
+        crate::utils::create_user_dir_all(&dir)?;
         Ok(dir)
     }
 
@@ -3110,7 +3111,7 @@ mod tests {
     fn run_completed_no_exit_status_file() -> TestResult {
         let temp = tempdir()?;
         let state_dir = temp.path().join("w0").join("s0");
-        fs_err::create_dir_all(&state_dir)?;
+        crate::utils::create_user_dir_all(&state_dir)?;
         assert!(!is_run_completed(&state_dir));
         Ok(())
     }
@@ -3119,8 +3120,8 @@ mod tests {
     fn run_completed_exit_status_zero() -> TestResult {
         let temp = tempdir()?;
         let state_dir = temp.path().join("w0").join("s0");
-        fs_err::create_dir_all(&state_dir)?;
-        fs_err::write(state_dir.join("exit_status"), "0")?;
+        crate::utils::create_user_dir_all(&state_dir)?;
+        crate::utils::write_user_file(state_dir.join("exit_status"), "0")?;
         assert!(is_run_completed(&state_dir));
         Ok(())
     }
@@ -3129,8 +3130,8 @@ mod tests {
     fn run_completed_exit_status_nonzero() -> TestResult {
         let temp = tempdir()?;
         let state_dir = temp.path().join("w0").join("s0");
-        fs_err::create_dir_all(&state_dir)?;
-        fs_err::write(state_dir.join("exit_status"), "1")?;
+        crate::utils::create_user_dir_all(&state_dir)?;
+        crate::utils::write_user_file(state_dir.join("exit_status"), "1")?;
         assert!(!is_run_completed(&state_dir));
         Ok(())
     }
@@ -3139,8 +3140,8 @@ mod tests {
     fn run_completed_exit_status_empty_is_failed() -> TestResult {
         let temp = tempdir()?;
         let state_dir = temp.path().join("w0").join("s0");
-        fs_err::create_dir_all(&state_dir)?;
-        fs_err::write(state_dir.join("exit_status"), "")?;
+        crate::utils::create_user_dir_all(&state_dir)?;
+        crate::utils::write_user_file(state_dir.join("exit_status"), "")?;
         assert!(!is_run_completed(&state_dir));
         Ok(())
     }
@@ -3154,8 +3155,8 @@ mod tests {
             .with(CursorSegment::CrateIteration(0))
             .with(CursorSegment::Statement(0));
         let state_dir = temp.path().join(cursor.to_path());
-        fs_err::create_dir_all(&state_dir)?;
-        fs_err::write(state_dir.join("exit_status"), "0")?;
+        crate::utils::create_user_dir_all(&state_dir)?;
+        crate::utils::write_user_file(state_dir.join("exit_status"), "0")?;
 
         let stmt = CrateStatement::Run(RunStep {
             command: "echo".to_owned(),
@@ -3192,7 +3193,7 @@ mod tests {
             .with(CursorSegment::CrateIteration(0))
             .with(CursorSegment::Statement(0));
         let stmt_dir = make_cursor_state_dir(&state_base, &cursor)?;
-        fs_err::write(stmt_dir.join("exit_status"), "0")?;
+        crate::utils::write_user_file(stmt_dir.join("exit_status"), "0")?;
 
         let program = crate_program(vec![CrateStatement::Run(RunStep {
             command: "echo".to_owned(),
@@ -3239,7 +3240,7 @@ mod tests {
             .with(CursorSegment::CrateIteration(0))
             .with(CursorSegment::Statement(0));
         let stmt0_dir = make_cursor_state_dir(&state_base, &cursor0)?;
-        fs_err::write(stmt0_dir.join("exit_status"), "0")?;
+        crate::utils::write_user_file(stmt0_dir.join("exit_status"), "0")?;
 
         let program = crate_program(vec![
             CrateStatement::Run(RunStep {
@@ -3275,7 +3276,7 @@ mod tests {
             .with(CursorSegment::CrateIteration(0))
             .with(CursorSegment::Statement(0));
         let stmt_dir = make_cursor_state_dir(&state_base, &cursor)?;
-        fs_err::write(stmt_dir.join("exit_status"), "1")?; // failed
+        crate::utils::write_user_file(stmt_dir.join("exit_status"), "1")?; // failed
 
         let program = crate_program(vec![CrateStatement::Run(RunStep {
             command: "echo".to_owned(),

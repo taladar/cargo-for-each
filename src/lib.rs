@@ -256,10 +256,10 @@ impl Config {
     pub fn save(&self, environment: &Environment) -> Result<(), crate::error::Error> {
         let config_file_path = config_file(environment)?;
         if let Some(config_dir_path) = config_file_path.parent() {
-            fs_err::create_dir_all(config_dir_path)
+            crate::utils::create_user_dir_all(config_dir_path)
                 .map_err(crate::error::Error::CouldNotCreateConfigFileParentDirs)?;
         }
-        fs_err::write(
+        crate::utils::write_user_file(
             &config_file_path,
             toml::to_string(self).map_err(crate::error::Error::CouldNotSerializeConfigFile)?,
         )

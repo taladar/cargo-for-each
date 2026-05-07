@@ -70,6 +70,95 @@ use crate::Environment;
 use crate::error::Error;
 use std::process::{Command, Output, Stdio};
 
+/// Writes `contents` to `path`, then tightens the file's permissions to mode 0o600 on Unix.
+///
+/// On non-Unix platforms this is equivalent to `fs_err::write` (the OS default ACL applies).
+///
+/// Use for any state, config, or snapshot file under the user's config or state directory —
+/// these may contain command lines, env-file paths, or program contents that should not be
+/// exposed to other local users.
+///
+/// # Errors
+///
+/// Returns the I/O error if the file cannot be written or its permissions cannot be set.
+pub fn write_user_file(
+    path: impl AsRef<std::path::Path>,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    fs_err::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs_err::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Copies `src` to `dst`, then tightens `dst`'s permissions to mode 0o600 on Unix.
+///
+/// On non-Unix platforms this is equivalent to `fs_err::copy`.
+///
+/// # Errors
+///
+/// Returns the I/O error if the file cannot be copied or its permissions cannot be set.
+pub fn copy_user_file(
+    src: impl AsRef<std::path::Path>,
+    dst: impl AsRef<std::path::Path>,
+) -> std::io::Result<u64> {
+    let dst = dst.as_ref();
+    let n = fs_err::copy(src.as_ref(), dst)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs_err::set_permissions(dst, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(n)
+}
+
+/// Recursively creates all directories in `path`, setting mode 0o700 on each newly-created
+/// directory on Unix.
+///
+/// Existing directories are left alone — we tighten only what we create, since users may
+/// intentionally have looser permissions on ancestor directories like `~/.config`.
+///
+/// # Errors
+///
+/// Returns the I/O error if a directory cannot be created or have its permissions set.
+pub fn create_user_dir_all(path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    create_user_dir_all_inner(path.as_ref())
+}
+
+/// Inner recursive worker for [`create_user_dir_all`]; on Unix sets mode 0o700 on each
+/// newly-created directory, on other platforms delegates to `fs_err::create_dir_all`.
+#[cfg(unix)]
+fn create_user_dir_all_inner(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    if path.as_os_str().is_empty() || path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_user_dir_all_inner(parent)?;
+    }
+    match fs_err::create_dir(path) {
+        Ok(()) => {
+            fs_err::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Inner worker for [`create_user_dir_all`] on non-Unix platforms; delegates straight to
+/// `fs_err::create_dir_all`.
+#[cfg(not(unix))]
+fn create_user_dir_all_inner(path: &std::path::Path) -> std::io::Result<()> {
+    fs_err::create_dir_all(path)
+}
+
 /// Executes a command, optionally suppressing its stdout/stderr and tracing them instead.
 ///
 /// If `environment.suppress_subprocess_output` is `true`, the command's stdout and stderr
@@ -127,6 +216,7 @@ pub fn execute_command(
 mod tests {
     use super::command_is_executable;
     use crate::Environment;
+    use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
     fn env_with_paths(paths: Vec<std::path::PathBuf>) -> Environment {
@@ -204,5 +294,75 @@ mod tests {
             !command_is_executable("/nonexistent/path/to/nothing", &env),
             "absolute path to non-existent file should not be found"
         );
+    }
+
+    /// `write_user_file` creates a file with mode 0o600 on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn write_user_file_sets_owner_only_mode() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempdir()?;
+        let path = temp.path().join("secret.toml");
+        super::write_user_file(&path, b"data")?;
+        let mode = fs_err::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600, got {mode:o}");
+        Ok(())
+    }
+
+    /// `write_user_file` tightens an existing world-readable file to 0o600.
+    #[cfg(unix)]
+    #[test]
+    fn write_user_file_tightens_existing_loose_file() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempdir()?;
+        let path = temp.path().join("preexisting.toml");
+        fs_err::write(&path, b"old")?;
+        fs_err::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        super::write_user_file(&path, b"new")?;
+        let mode = fs_err::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600, got {mode:o}");
+        Ok(())
+    }
+
+    /// `create_user_dir_all` creates each new directory with mode 0o700 on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn create_user_dir_all_sets_owner_only_mode() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempdir()?;
+        let nested = temp.path().join("a").join("b").join("c");
+        super::create_user_dir_all(&nested)?;
+        for p in [
+            temp.path().join("a"),
+            temp.path().join("a").join("b"),
+            nested,
+        ] {
+            let mode = fs_err::metadata(&p)?.permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o700,
+                "expected 0o700 on {}, got {mode:o}",
+                p.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// `create_user_dir_all` does not modify already-existing directories' permissions.
+    #[cfg(unix)]
+    #[test]
+    fn create_user_dir_all_leaves_existing_dirs_alone() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempdir()?;
+        let outer = temp.path().join("outer");
+        fs_err::create_dir(&outer)?;
+        fs_err::set_permissions(&outer, std::fs::Permissions::from_mode(0o755))?;
+        let inner = outer.join("inner");
+        super::create_user_dir_all(&inner)?;
+        let outer_mode = fs_err::metadata(&outer)?.permissions().mode() & 0o777;
+        let inner_mode = fs_err::metadata(&inner)?.permissions().mode() & 0o777;
+        assert_eq!(outer_mode, 0o755, "outer should be unchanged");
+        assert_eq!(inner_mode, 0o700, "newly created inner should be 0o700");
+        Ok(())
     }
 }
