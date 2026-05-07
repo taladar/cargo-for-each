@@ -60,12 +60,15 @@ pub struct WaitForContinueNode {
 
 /// A block that applies environment variables from a file to all nested statements.
 ///
-/// The env file is read at execution time, relative to the target's manifest directory.
+/// The env file is read at execution time. Relative paths resolve against the target's
+/// manifest directory; absolute paths are also accepted (useful for shared API-credential
+/// files kept outside the project).
 /// Variables from nested `with_env_file` blocks extend (and override, for duplicate keys)
 /// variables from outer blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WithEnvFileBlock<S> {
-    /// Path to the env file, relative to the target's manifest directory.
+    /// Path to the env file. Relative paths resolve against the target's manifest
+    /// directory; absolute paths are accepted as-is.
     pub env_file: String,
     /// Statements to execute with the env file's variables applied.
     pub statements: Vec<S>,

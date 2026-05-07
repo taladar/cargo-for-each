@@ -620,8 +620,8 @@ pub struct NextStatement<'a> {
     pub manifest_dir: &'a Path,
     /// What to do at this cursor position.
     pub action: StatementAction<'a>,
-    /// Env file paths (relative to `manifest_dir`) from enclosing `with_env_file` blocks,
-    /// ordered from outermost to innermost.
+    /// Env file paths from enclosing `with_env_file` blocks, ordered from outermost to
+    /// innermost. Each path is either relative to `manifest_dir` or absolute.
     pub env_file_paths: Vec<String>,
 }
 

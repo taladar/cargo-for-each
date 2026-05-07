@@ -289,7 +289,9 @@ with_env_file "relative/path/to/file.env" {
 }
 ```
 
-- The path is relative to the workspace root directory.
+- Relative paths are resolved against the workspace root directory.
+  Absolute paths are also accepted (useful for shared API-credential files
+  kept outside the project).
 - The file is parsed as a `.env`-style file: `KEY=VALUE` lines, `#` comments,
   blank lines ignored, values may be single- or double-quoted.
 - `export KEY=VALUE` lines are also accepted (the `export` prefix is stripped).
@@ -423,7 +425,8 @@ Same semantics as [workspace `wait_for_continue`](#44-wait_for_continue).
 
 ### 5.5 `with_env_file`
 
-Loads environment variables from a file relative to the crate directory.
+Loads environment variables from a file. Relative paths are resolved against
+the crate directory; absolute paths are also accepted.
 
 ```text
 with_env_file "relative/path/to/file.env" {
