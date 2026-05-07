@@ -80,14 +80,12 @@ impl Environment {
     ///
     /// fails if we can not retrieve the information from the environment
     pub fn new() -> Result<Self, crate::error::Error> {
+        let path_var = std::env::var("PATH")?;
         Ok(Self {
             config_dir: dirs::config_dir()
                 .ok_or(crate::error::Error::CouldNotDetermineUserConfigDir)?,
             state_dir: dirs::state_dir().ok_or(crate::error::Error::CouldNotDetermineStateDir)?,
-            paths: std::env::var("PATH")?
-                .split(':')
-                .map(std::path::PathBuf::from)
-                .collect(),
+            paths: std::env::split_paths(&path_var).collect(),
             suppress_subprocess_output: false,
         })
     }
@@ -112,13 +110,9 @@ impl Environment {
 
         // Start with the test-specific bin_dir, then append the real system PATH so
         // standard commands like `cargo` are also found via command_is_executable.
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = vec![bin_dir];
-        paths.extend(
-            std::env::var("PATH")
-                .unwrap_or_default()
-                .split(':')
-                .map(std::path::PathBuf::from),
-        );
+        paths.extend(std::env::split_paths(&path_var));
 
         Ok(Self {
             config_dir,

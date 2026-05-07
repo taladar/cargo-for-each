@@ -36,22 +36,38 @@ pub fn is_executable(path: &std::path::Path) -> bool {
 #[cfg(windows)]
 #[must_use]
 pub fn is_executable(path: &std::path::Path) -> bool {
-    // On Windows, executability is determined by file extension.
-    // We check against PATHEXT environment variable.
-    if path.extension().is_some() && path.is_file() {
-        return true;
+    use std::path::Path;
+
+    // On Windows, executability is determined by file extension. The PATHEXT
+    // environment variable lists which extensions are considered executable
+    // (case-insensitively); when unset, fall back to the documented Windows
+    // defaults so we don't accept arbitrary extensions like `.md`.
+    let pathext = std::env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+    let pathext_str = pathext.to_string_lossy();
+    let exts: Vec<&str> = pathext_str.split(';').filter(|s| !s.is_empty()).collect();
+
+    // If the input already has an extension, only treat it as executable when
+    // that extension is on the PATHEXT list. Otherwise non-executable files
+    // like `README.md` would qualify.
+    if let Some(ext) = path.extension() {
+        let ext_str = ext.to_string_lossy();
+        let matches = exts.iter().any(|e| {
+            e.strip_prefix('.')
+                .is_some_and(|e| e.eq_ignore_ascii_case(&ext_str))
+        });
+        return matches && path.is_file();
     }
-    if let Some(pathext) = std::env::var_os("PATHEXT") {
-        let pathexts = pathext.to_string_lossy();
-        for ext in pathexts.split(';').filter(|s| !s.is_empty()) {
-            let mut path_with_ext = path.as_os_str().to_owned();
-            path_with_ext.push(ext);
-            if Path::new(&path_with_ext).is_file() {
-                return true;
-            }
+
+    // No extension on the input — try appending each PATHEXT entry and accept
+    // the first match. This is how `cmd` resolves to `cmd.exe`.
+    for ext in &exts {
+        let mut path_with_ext = path.as_os_str().to_owned();
+        path_with_ext.push(ext);
+        if Path::new(&path_with_ext).is_file() {
+            return true;
         }
     }
-    path.is_file()
+    false
 }
 
 /// checks if the given path is an executable file
@@ -216,6 +232,7 @@ pub fn execute_command(
 mod tests {
     use super::command_is_executable;
     use crate::Environment;
+    #[cfg(unix)]
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
