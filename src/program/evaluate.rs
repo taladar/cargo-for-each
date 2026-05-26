@@ -84,18 +84,29 @@ pub fn common_condition_runtime_detail(
             Some(format!("actual git_config.{key} = {actual}"))
         }
         CommonCondition::Not(inner) => common_condition_runtime_detail(inner, manifest_dir),
-        CommonCondition::And(conditions) | CommonCondition::Or(conditions) => {
-            let details: Vec<_> = conditions
-                .iter()
-                .filter_map(|c| common_condition_runtime_detail(c, manifest_dir))
-                .collect();
-            if details.is_empty() {
-                None
-            } else {
-                Some(details.join(", "))
-            }
-        }
+        CommonCondition::And(conditions) => join_runtime_details(conditions, " && ", |c| {
+            common_condition_runtime_detail(c, manifest_dir)
+        }),
+        CommonCondition::Or(conditions) => join_runtime_details(conditions, " || ", |c| {
+            common_condition_runtime_detail(c, manifest_dir)
+        }),
         _ => None,
+    }
+}
+
+/// Joins the runtime-detail strings of `items` with `separator`, filtering
+/// out items that produce no detail. Returns `None` if no item produces a
+/// detail string.
+fn join_runtime_details<T, F: Fn(&T) -> Option<String>>(
+    items: &[T],
+    separator: &str,
+    detail: F,
+) -> Option<String> {
+    let details: Vec<_> = items.iter().filter_map(detail).collect();
+    if details.is_empty() {
+        None
+    } else {
+        Some(details.join(separator))
     }
 }
 
@@ -108,17 +119,12 @@ pub fn workspace_condition_runtime_detail(
     match cond {
         WorkspaceCondition::Common(inner) => common_condition_runtime_detail(inner, manifest_dir),
         WorkspaceCondition::Not(inner) => workspace_condition_runtime_detail(inner, manifest_dir),
-        WorkspaceCondition::And(conditions) | WorkspaceCondition::Or(conditions) => {
-            let details: Vec<_> = conditions
-                .iter()
-                .filter_map(|c| workspace_condition_runtime_detail(c, manifest_dir))
-                .collect();
-            if details.is_empty() {
-                None
-            } else {
-                Some(details.join(", "))
-            }
-        }
+        WorkspaceCondition::And(conditions) => join_runtime_details(conditions, " && ", |c| {
+            workspace_condition_runtime_detail(c, manifest_dir)
+        }),
+        WorkspaceCondition::Or(conditions) => join_runtime_details(conditions, " || ", |c| {
+            workspace_condition_runtime_detail(c, manifest_dir)
+        }),
         _ => None,
     }
 }
@@ -132,17 +138,12 @@ pub fn crate_condition_runtime_detail(
     match cond {
         CrateCondition::Common(inner) => common_condition_runtime_detail(inner, manifest_dir),
         CrateCondition::Not(inner) => crate_condition_runtime_detail(inner, manifest_dir),
-        CrateCondition::And(conditions) | CrateCondition::Or(conditions) => {
-            let details: Vec<_> = conditions
-                .iter()
-                .filter_map(|c| crate_condition_runtime_detail(c, manifest_dir))
-                .collect();
-            if details.is_empty() {
-                None
-            } else {
-                Some(details.join(", "))
-            }
-        }
+        CrateCondition::And(conditions) => join_runtime_details(conditions, " && ", |c| {
+            crate_condition_runtime_detail(c, manifest_dir)
+        }),
+        CrateCondition::Or(conditions) => join_runtime_details(conditions, " || ", |c| {
+            crate_condition_runtime_detail(c, manifest_dir)
+        }),
         _ => None,
     }
 }
