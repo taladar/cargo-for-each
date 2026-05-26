@@ -248,7 +248,7 @@ fn resolve_workspaces_from_canonical_dirs(
             &package_name_to_id,
             &selected_set,
             &canonical_selected,
-        );
+        )?;
 
         executions.push(ResolvedWorkspaceExecution {
             manifest_dir: canonical_ws_dir.clone(),
@@ -432,9 +432,9 @@ fn compute_inter_workspace_deps(
     package_name_to_id: &HashMap<String, PackageId>,
     selected_set: &HashSet<&PathBuf>,
     canonical_selected: &[PathBuf],
-) -> Vec<PathBuf> {
+) -> Result<Vec<PathBuf>, Error> {
     let Some(members) = workspace_packages.get(workspace_dir) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     // Build a map from member manifest_dir → workspace manifest_dir for all
@@ -462,16 +462,19 @@ fn compute_inter_workspace_deps(
             let Some(dep_pkg) = all_packages.get(dep_id) else {
                 continue;
             };
-            let Ok(dep_dir) = dep_pkg
-                .manifest_path
-                .parent()
-                .ok_or(())
-                .and_then(|p| p.canonicalize().ok().ok_or(()))
-            else {
-                continue;
-            };
+            // Match the hard-fail behaviour of the sibling resolvers
+            // (`resolve_workspace_member_crates`, `crate_executions_from_dirs`):
+            // a canonicalize failure here used to be silently swallowed via
+            // `.ok().ok_or(())`, which dropped the dep edge entirely and
+            // broke runtime dependency-readiness gating downstream.
+            let dep_dir = dep_pkg.manifest_path.parent().ok_or_else(|| {
+                Error::ManifestPathHasNoParentDir(dep_pkg.manifest_path.clone().into_std_path_buf())
+            })?;
+            let dep_dir_canonical = dep_dir.canonicalize().map_err(|e| {
+                Error::CouldNotDetermineCanonicalManifestPath(dep_dir.to_path_buf().into(), e)
+            })?;
 
-            if let Some(&dep_ws) = crate_to_workspace.get(&dep_dir) {
+            if let Some(&dep_ws) = crate_to_workspace.get(&dep_dir_canonical) {
                 // The dep lives in another selected workspace.
                 if dep_ws != workspace_dir && selected_set.contains(dep_ws) {
                     dep_workspaces.insert(dep_ws.clone());
@@ -480,7 +483,7 @@ fn compute_inter_workspace_deps(
         }
     }
 
-    dep_workspaces.into_iter().collect()
+    Ok(dep_workspaces.into_iter().collect())
 }
 
 /// Selects and resolves standalone crates that match any of the given filters.
