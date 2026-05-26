@@ -67,7 +67,12 @@ pub enum CrateStatement {
     ManualStep(ManualStepNode),
     /// Conditional branching using crate-level conditions.
     If(IfBlock<CrateCondition, Self>),
-    /// Capture and store cargo metadata for the current workspace under a name.
+    /// Capture and store cargo metadata for the current crate under a name.
+    ///
+    /// The snapshot is keyed by the current crate's canonical `manifest_dir`.
+    /// `cargo metadata` itself always returns workspace-level info, but the
+    /// snapshot file lives under the crate's manifest, distinct from snapshots
+    /// captured in workspace context.
     SnapshotMetadata(SnapshotMetadataNode),
     /// Execute nested statements with environment variables loaded from a file.
     WithEnvFile(WithEnvFileBlock<Self>),
