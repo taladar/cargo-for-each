@@ -1008,19 +1008,47 @@ fn expand_interpolations(s: &str, manifest_dir: &Path, state_base: &Path) -> Res
     Ok(result)
 }
 
+/// Derives a stable filename key from a manifest directory for snapshot storage.
+///
+/// Canonicalizes the directory (so `/foo/bar` and `/foo/./bar` collapse to the
+/// same key, and symlinks resolve to their target) and hex-encodes the raw
+/// bytes of the resulting `OsStr` (so non-UTF-8 paths cannot collide via
+/// lossy replacement characters as `to_string_lossy` would produce).
+fn manifest_hex_key(manifest_dir: &Path) -> Result<String, Error> {
+    const HEX_DIGITS: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
+    let canonical = fs_err::canonicalize(manifest_dir).map_err(|err| {
+        Error::CouldNotDetermineCanonicalManifestPath(manifest_dir.to_path_buf(), err)
+    })?;
+    let bytes = canonical.as_os_str().as_encoded_bytes();
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    // The high and low nibbles of a u8 are always in 0..16, so `HEX_DIGITS.get`
+    // will never be `None` in practice. The `unwrap_or('0')` is a defensive
+    // default solely to satisfy `clippy::indexing_slicing` / `unwrap_used`.
+    for &b in bytes {
+        let hi = usize::from(b.wrapping_shr(4));
+        let lo = usize::from(b & 0x0F);
+        hex.push(HEX_DIGITS.get(hi).copied().unwrap_or('0'));
+        hex.push(HEX_DIGITS.get(lo).copied().unwrap_or('0'));
+    }
+    Ok(hex)
+}
+
 /// Looks up a single `${name.field_path}` reference and returns its string value.
 ///
-/// The lookup first checks for a per-manifest snapshot captured when the current
-/// `manifest_dir` ran the step, then falls back to `latest.json` for cross-context
-/// scenarios.  The package for the current crate is found in the snapshot by matching
-/// its `manifest_path` against `manifest_dir/Cargo.toml`, and the dot-separated
-/// `field_path` is then navigated within that package's JSON.
+/// Snapshots are scoped to the `manifest_dir` that ran the capturing step:
+/// each context has its own `by_manifest/{hex}.json`. The package for the
+/// current crate is found in the snapshot by matching its `manifest_path`
+/// against `manifest_dir/Cargo.toml`, and the dot-separated `field_path` is
+/// then navigated within that package's JSON.
 ///
 /// # Errors
 ///
-/// Returns an error if no snapshot named `snapshot_name` exists, if the current
-/// crate's package cannot be found in the snapshot, or if `field_path` does not
-/// exist or is not navigable within the package JSON.
+/// Returns an error if no snapshot named `snapshot_name` exists for this
+/// context, if the current crate's package cannot be found in the snapshot,
+/// or if `field_path` does not exist or is not navigable within the package
+/// JSON.
 fn resolve_interpolation(
     snapshot_name: &str,
     field_path: &str,
@@ -1028,24 +1056,13 @@ fn resolve_interpolation(
     state_base: &Path,
 ) -> Result<String, Error> {
     let name_dir = state_base.join("snapshots").join(snapshot_name);
-    let hex_key: String = manifest_dir
-        .to_string_lossy()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .concat();
-    let mut filename = hex_key;
+    let mut filename = manifest_hex_key(manifest_dir)?;
     filename.push_str(".json");
     let per_manifest_path = name_dir.join("by_manifest").join(&filename);
-    let latest_path = name_dir.join("latest.json");
-    let json_path = if per_manifest_path.exists() {
-        per_manifest_path
-    } else if latest_path.exists() {
-        latest_path
-    } else {
+    if !per_manifest_path.exists() {
         return Err(Error::SnapshotNotFound(snapshot_name.to_owned()));
-    };
+    }
+    let json_path = per_manifest_path;
     let json = fs_err::read_to_string(&json_path).map_err(Error::IoError)?;
     let root: serde_json::Value =
         serde_json::from_str(&json).map_err(Error::CouldNotDeserializeMetadataSnapshot)?;
@@ -1081,11 +1098,10 @@ fn resolve_interpolation(
 /// Captures cargo metadata for the workspace rooted at `manifest_dir` and
 /// stores it under the name given in `step`.
 ///
-/// The snapshot is written to two locations within `state_base/snapshots/{name}/`:
-/// - `by_manifest/{hex_encoded_manifest_dir}.json`: for exact per-context lookup.
-/// - `latest.json`: overwritten on every capture to serve as a cross-context fallback.
-///
-/// A completion marker is written to `state_dir/snapshot_metadata_completed`.
+/// The snapshot is written to
+/// `state_base/snapshots/{name}/by_manifest/{hex_encoded_canonical_manifest_dir}.json`
+/// for per-context lookup. A completion marker is written to
+/// `state_dir/snapshot_metadata_completed`.
 ///
 /// # Errors
 ///
@@ -1115,21 +1131,11 @@ async fn execute_snapshot_metadata_step(
     let by_manifest_dir = name_dir.join("by_manifest");
     crate::utils::create_user_dir_all(&by_manifest_dir)
         .map_err(|e| Error::CouldNotCreateStateDir(by_manifest_dir.clone(), e))?;
-    let hex_key: String = manifest_dir
-        .to_string_lossy()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .concat();
-    let mut filename = hex_key;
+    let mut filename = manifest_hex_key(manifest_dir)?;
     filename.push_str(".json");
     let per_manifest_path = by_manifest_dir.join(&filename);
     crate::utils::write_user_file(&per_manifest_path, &json)
         .map_err(|e| Error::CouldNotWriteStateFile(per_manifest_path.clone(), e))?;
-    let latest_path = name_dir.join("latest.json");
-    crate::utils::write_user_file(&latest_path, &json)
-        .map_err(|e| Error::CouldNotWriteStateFile(latest_path.clone(), e))?;
     let marker = state_dir.join("snapshot_metadata_completed");
     crate::utils::write_user_file(&marker, "done")
         .map_err(|e| Error::CouldNotWriteStateFile(marker.clone(), e))?;
