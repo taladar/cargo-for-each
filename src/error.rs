@@ -238,4 +238,8 @@ pub enum Error {
         "cannot run with --jobs > 1 because the program contains interactive steps (manual_step or ask_user); rerun with --jobs 1"
     )]
     InteractiveStepsRequireSingleJob,
+    /// a command run as a condition (`if run "..."`) terminated by signal
+    /// rather than exiting normally; the boolean result is undefined
+    #[error("condition command `{0}` in `{1}` was killed by a signal")]
+    ConditionCommandKilledBySignal(String, PathBuf),
 }

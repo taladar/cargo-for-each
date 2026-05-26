@@ -188,7 +188,17 @@ pub fn evaluate_common_condition(
                 cmd.env(k, v);
             }
             let output = crate::utils::execute_command(&mut cmd, environment, manifest_dir)?;
-            Ok(output.status.success())
+            // A signal-killed process (status.code() == None on Unix) used to
+            // be reported as `false`, indistinguishable from a clean "exit 1"
+            // — making the surrounding `if` branch silently go the wrong way.
+            // Surface signal kills as an error instead.
+            match output.status.code() {
+                Some(code) => Ok(code == 0),
+                None => Err(Error::ConditionCommandKilledBySignal(
+                    command.clone(),
+                    manifest_dir.to_path_buf(),
+                )),
+            }
         }
         CommonCondition::FileExists(filename) => {
             let workspace_dir = workspace_boundary_for(manifest_dir, config)
