@@ -113,6 +113,13 @@ fn padding<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Rich<'src, cha
 
 /// Parses a double-quoted string literal, returning the unescaped content as a
 /// `String`.  Currently the only supported escape sequence is `\"`.
+///
+/// Note: unlike a typical literal parser, this consumes surrounding [`padding`]
+/// (whitespace and `// …` line comments) on both sides via `padded_by`. As a
+/// result, `"foo"  // comment\n"bar"` parses as two adjacent string literals
+/// with the intervening whitespace/comment consumed by the first literal's
+/// trailing padding. Callers that need a literal *without* this behavior must
+/// build it from the inner `just('"') … just('"')` primitives directly.
 fn string_literal<'src>()
 -> impl Parser<'src, &'src str, String, extra::Err<Rich<'src, char>>> + Clone {
     let escape = just('\\').ignore_then(just('"').to('"'));
