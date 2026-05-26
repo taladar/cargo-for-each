@@ -1220,17 +1220,18 @@ async fn execute_run_step(
             Err(e)
         }
         Ok(_) => {
-            let exit_code: i32 = fs_err::read_to_string(&exit_status_path)
-                .ok()
-                .as_deref()
-                .map(str::trim)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(-1);
-
-            if !exit_status_path.exists() {
-                crate::utils::write_user_file(&exit_status_path, exit_code.to_string())
-                    .map_err(|e| Error::CouldNotWriteStateFile(exit_status_path, e))?;
-            }
+            // The wrapper.sh that asciinema ran writes the command's exit code
+            // to `exit_status_path` before exiting. If we got Ok(_) the
+            // wrapper completed, so the file should exist; propagate any I/O
+            // or parse failure instead of silently masking it as exit_code=-1
+            // (which used to leave the file's actual content untouched, so
+            // later status reads disagreed with what was reported here).
+            let raw = fs_err::read_to_string(&exit_status_path)
+                .map_err(|e| Error::CouldNotReadStateFile(exit_status_path.clone(), e))?;
+            let exit_code: i32 = raw
+                .trim()
+                .parse()
+                .map_err(|_parse_err| Error::InvalidRecordedExitStatus(raw.clone()))?;
 
             if exit_code != 0 {
                 return Err(Error::CommandFailed(

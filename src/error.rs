@@ -133,6 +133,13 @@ pub enum Error {
     /// error writing state file
     #[error("error writing state file {0}: {1}")]
     CouldNotWriteStateFile(std::path::PathBuf, #[source] std::io::Error),
+    /// error reading state file
+    #[error("error reading state file {0}: {1}")]
+    CouldNotReadStateFile(std::path::PathBuf, #[source] std::io::Error),
+    /// the recorded exit_status file contained content that could not be
+    /// parsed as an integer exit code
+    #[error("recorded exit status is not a valid integer: {0:?}")]
+    InvalidRecordedExitStatus(String),
     /// an IO error occurred
     #[error("I/O error: {0}")]
     IoError(#[source] std::io::Error),
