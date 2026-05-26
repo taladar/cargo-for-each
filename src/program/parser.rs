@@ -96,9 +96,9 @@ fn format_error(error: Rich<'_, char>, source: &str, filename: &str) -> ParseErr
 /// Returns a parser that consumes zero or more whitespace characters and
 /// `// …` line comments, producing nothing.
 ///
-/// Each iteration of the internal `repeated()` consumes at least one character
-/// (a single whitespace character or an entire line comment) to avoid the
-/// chumsky "no progress" panic.
+/// Each iteration of the internal `repeated()` consumes at least one byte of
+/// input (either a single whitespace character or the leading `//` of a line
+/// comment, plus whatever follows) to avoid the chumsky "no progress" panic.
 fn padding<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Rich<'src, char>>> + Clone {
     // A single whitespace character (space, tab, newline, …).
     let single_ws = any().filter(|c: &char| c.is_whitespace()).ignored();
