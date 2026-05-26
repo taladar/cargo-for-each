@@ -731,7 +731,7 @@ fn find_next_in_crate_stmts<'a>(
             }
             CrateStatement::WaitForContinue(node) => {
                 if is_wait_barrier_released(&state_dir) {
-                    // Already released — skip.
+                    // Already released — fall through to the next statement.
                 } else if is_wait_barrier_waiting(&state_dir) {
                     // Waiting for release — block this target.
                     return None;
@@ -889,7 +889,7 @@ fn find_next_in_workspace_stmts<'a>(
             }
             WorkspaceStatement::WaitForContinue(node) => {
                 if is_wait_barrier_released(&state_dir) {
-                    // Already released — skip.
+                    // Already released — fall through to the next statement.
                 } else if is_wait_barrier_waiting(&state_dir) {
                     // Waiting for release — block this target.
                     return None;
