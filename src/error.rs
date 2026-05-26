@@ -115,7 +115,11 @@ pub enum Error {
     /// error executing a command
     #[error("error executing command `{0}` in `{1}`: {2}")]
     CommandExecutionFailed(String, PathBuf, #[source] std::io::Error),
-    /// A command failed to execute
+    /// A command exited with a non-zero status. The `i32` is the value the
+    /// asciinema wrapper recorded to the `exit_status` state file: on Unix,
+    /// signal kills are encoded by the wrapping shell as `128 + signum`
+    /// (e.g. `137` for `SIGKILL`), not as `None`. Empty/unparseable contents
+    /// surface as [`Error::InvalidRecordedExitStatus`] instead.
     #[error("command `{0}` failed in `{1}` with exit code {2}")]
     CommandFailed(String, PathBuf, i32),
     /// The specified command was not found in PATH
