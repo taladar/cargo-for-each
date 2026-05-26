@@ -50,7 +50,7 @@ pub enum WorkspaceCondition {
     Common(CommonCondition),
     /// True if this workspace is a standalone (single-crate) workspace.
     Standalone,
-    /// True if this workspace has multiple member crates.
+    /// True if this workspace has a `[workspace]` table (one or more members).
     HasMembers,
     /// True if the inner condition evaluates to false.
     Not(Box<Self>),
@@ -101,7 +101,7 @@ impl std::fmt::Display for WorkspaceCondition {
 pub enum WorkspaceSelectCondition {
     /// True if the workspace is a standalone (single-crate) workspace.
     Standalone,
-    /// True if the workspace has multiple member crates.
+    /// True if the workspace has a `[workspace]` table (one or more members).
     HasMembers,
     /// True if the inner condition evaluates to false.
     Not(Box<Self>),

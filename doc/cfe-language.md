@@ -518,7 +518,7 @@ Available in workspace `if` blocks (in addition to all common conditions).
 | Syntax | Evaluates to `true` when… |
 |--------|--------------------------|
 | `standalone` | The workspace contains only a single crate (no workspace `members` array in `Cargo.toml`). |
-| `has_members` | The workspace has multiple member crates. |
+| `has_members` | The workspace has a `[workspace]` table (one or more members). |
 
 #### Examples
 
@@ -582,7 +582,7 @@ These are evaluated statically at task-creation time; dynamic conditions
 | Syntax | Selects the workspace when… |
 |--------|----------------------------|
 | `standalone` | The workspace contains only a single crate. |
-| `has_members` | The workspace has multiple member crates. |
+| `has_members` | The workspace has a `[workspace]` table (one or more members). |
 
 #### Crate select filters
 
