@@ -174,7 +174,8 @@ pub struct Crate {
     pub manifest_dir: PathBuf,
     /// the directory that contains the workspace Cargo.toml file for this crate
     pub workspace_manifest_dir: PathBuf,
-    /// the types of this crate (only bin and lib can be combined so this should have at most two members)
+    /// the types of this crate (a package routinely has multiple kinds
+    /// alongside `lib`/`bin` — e.g. `custom_build`, `test`, `example`)
     pub types: BTreeSet<crate::targets::CrateType>,
 }
 
