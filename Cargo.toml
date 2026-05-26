@@ -69,11 +69,11 @@ tracing-subscriber = { version = "0.3.23", features = [
   "env-filter",
   "tracing-log"
 ] }
-tracing-test = "0.2.6"
 
 [dev-dependencies]
 pretty_assertions = { version = "1.4.1" }
 tempfile = "3.27.0"
+tracing-test = "0.2.6"
 
 [lints.clippy]
 allow_attributes = "deny"
