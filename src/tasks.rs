@@ -1509,8 +1509,9 @@ async fn run_crate_stmts_to_completion(
                     )?;
                 }
                 let chosen = fs_err::read_to_string(&chosen_branch_path)
-                    .unwrap_or_else(|_| "none".to_owned());
-                match chosen.trim() {
+                    .map_err(|e| Error::CouldNotReadStateFile(chosen_branch_path.clone(), e))?;
+                let trimmed = chosen.trim();
+                match trimmed {
                     "none" => {}
                     "else" => {
                         let p = cursor.clone().with(CursorSegment::ElseBranch);
@@ -1527,22 +1528,25 @@ async fn run_crate_stmts_to_completion(
                         .await?;
                     }
                     s => {
-                        if let Ok(n) = s.trim().parse::<usize>()
-                            && let Some(branch) = block.branches.get(n)
-                        {
-                            let p = cursor.clone().with(CursorSegment::IfBranch(n));
-                            Box::pin(run_crate_stmts_to_completion(
-                                &branch.statements,
-                                &p,
-                                manifest_dir,
-                                state_base,
-                                environment,
-                                config,
-                                extra_env,
-                                task_name,
-                            ))
-                            .await?;
-                        }
+                        let n: usize = s
+                            .parse()
+                            .map_err(|_parse_err| Error::InvalidChosenBranch(trimmed.to_owned()))?;
+                        let branch = block
+                            .branches
+                            .get(n)
+                            .ok_or_else(|| Error::InvalidChosenBranch(trimmed.to_owned()))?;
+                        let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                        Box::pin(run_crate_stmts_to_completion(
+                            &branch.statements,
+                            &p,
+                            manifest_dir,
+                            state_base,
+                            environment,
+                            config,
+                            extra_env,
+                            task_name,
+                        ))
+                        .await?;
                     }
                 }
             }
@@ -1660,8 +1664,9 @@ async fn run_workspace_stmts_to_completion(
                     )?;
                 }
                 let chosen = fs_err::read_to_string(&chosen_branch_path)
-                    .unwrap_or_else(|_| "none".to_owned());
-                match chosen.trim() {
+                    .map_err(|e| Error::CouldNotReadStateFile(chosen_branch_path.clone(), e))?;
+                let trimmed = chosen.trim();
+                match trimmed {
                     "none" => {}
                     "else" => {
                         let p = cursor.clone().with(CursorSegment::ElseBranch);
@@ -1679,23 +1684,26 @@ async fn run_workspace_stmts_to_completion(
                         .await?;
                     }
                     s => {
-                        if let Ok(n) = s.trim().parse::<usize>()
-                            && let Some(branch) = block.branches.get(n)
-                        {
-                            let p = cursor.clone().with(CursorSegment::IfBranch(n));
-                            Box::pin(run_workspace_stmts_to_completion(
-                                &branch.statements,
-                                &p,
-                                manifest_dir,
-                                member_crates,
-                                state_base,
-                                environment,
-                                config,
-                                extra_env,
-                                task_name,
-                            ))
-                            .await?;
-                        }
+                        let n: usize = s
+                            .parse()
+                            .map_err(|_parse_err| Error::InvalidChosenBranch(trimmed.to_owned()))?;
+                        let branch = block
+                            .branches
+                            .get(n)
+                            .ok_or_else(|| Error::InvalidChosenBranch(trimmed.to_owned()))?;
+                        let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                        Box::pin(run_workspace_stmts_to_completion(
+                            &branch.statements,
+                            &p,
+                            manifest_dir,
+                            member_crates,
+                            state_base,
+                            environment,
+                            config,
+                            extra_env,
+                            task_name,
+                        ))
+                        .await?;
                     }
                 }
             }
