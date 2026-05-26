@@ -115,23 +115,6 @@ pub enum CrateSelectCondition {
     Or(Vec<Self>),
 }
 
-/// Converts a [`CrateSelectCondition`] into a [`CrateCondition`].
-impl From<CrateSelectCondition> for CrateCondition {
-    fn from(cond: CrateSelectCondition) -> Self {
-        match cond {
-            CrateSelectCondition::Standalone => Self::Standalone,
-            CrateSelectCondition::CrateType(t) => Self::CrateType(t),
-            CrateSelectCondition::Not(inner) => Self::Not(Box::new(Self::from(*inner))),
-            CrateSelectCondition::And(conditions) => {
-                Self::And(conditions.into_iter().map(Self::from).collect())
-            }
-            CrateSelectCondition::Or(conditions) => {
-                Self::Or(conditions.into_iter().map(Self::from).collect())
-            }
-        }
-    }
-}
-
 impl std::fmt::Display for CrateCondition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

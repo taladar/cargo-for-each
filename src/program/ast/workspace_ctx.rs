@@ -111,23 +111,6 @@ pub enum WorkspaceSelectCondition {
     Or(Vec<Self>),
 }
 
-/// Converts a [`WorkspaceSelectCondition`] into a [`Branch`] condition by wrapping it.
-impl From<WorkspaceSelectCondition> for WorkspaceCondition {
-    fn from(cond: WorkspaceSelectCondition) -> Self {
-        match cond {
-            WorkspaceSelectCondition::Standalone => Self::Standalone,
-            WorkspaceSelectCondition::HasMembers => Self::HasMembers,
-            WorkspaceSelectCondition::Not(inner) => Self::Not(Box::new(Self::from(*inner))),
-            WorkspaceSelectCondition::And(conditions) => {
-                Self::And(conditions.into_iter().map(Self::from).collect())
-            }
-            WorkspaceSelectCondition::Or(conditions) => {
-                Self::Or(conditions.into_iter().map(Self::from).collect())
-            }
-        }
-    }
-}
-
 /// A filter applied to the set of workspaces selected by a `select workspaces` statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFilter {
