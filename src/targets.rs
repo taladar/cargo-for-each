@@ -96,6 +96,16 @@ pub struct ListParameters {
 
 /// implementation of the list subcommand
 ///
+/// # Stability
+///
+/// The line format printed to stdout — currently
+/// `{path} (standalone: {bool})` for workspaces and
+/// `{path} (workspace: {ws}, types: {types:?})` for crates — is intended
+/// for human consumption and is **not** a stable interface. In particular
+/// the `types: …` section uses Rust `Debug` for a `BTreeSet<CrateType>`
+/// (e.g. `{Bin, Lib}`). Scripts that parse this output will break across
+/// versions; use a future structured output flag instead when one exists.
+///
 /// # Errors
 ///
 /// This command can fail if the configuration file cannot be loaded or parsed.
