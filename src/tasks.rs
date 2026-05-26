@@ -2090,7 +2090,7 @@ pub async fn run_single_step_command(
                 crate::utils::create_user_dir_all(&state_dir)
                     .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
                 println!(
-                    "Wait barrier reached at {}: \"{}\". Release with `task continue --name {} --cursor {}`.",
+                    "Wait barrier reached at {}: \"{}\". Release with `cargo-for-each task continue --name {} --cursor {}`.",
                     next.cursor.to_path_string(),
                     node.description,
                     params.name,
