@@ -42,7 +42,7 @@ use clap::Parser;
 ///
 /// Returns an error if the config directory path cannot be determined.
 pub fn dir_path(environment: &crate::Environment) -> Result<PathBuf, Error> {
-    Ok(crate::config_dir_path(environment)?.join("tasks"))
+    Ok(crate::config_dir_path(environment).join("tasks"))
 }
 
 /// Returns the path to a specific task's configuration directory.

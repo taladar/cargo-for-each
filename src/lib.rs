@@ -227,10 +227,9 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error if the config file path cannot be determined,
-    /// if the file cannot be read, or if its content cannot be parsed.
+    /// Returns an error if the file cannot be read or if its content cannot be parsed.
     pub fn load(environment: &Environment) -> Result<Self, crate::error::Error> {
-        let config_file_path = config_file(environment)?;
+        let config_file_path = config_file(environment);
         if fs_err::exists(&config_file_path).map_err(crate::error::Error::CouldNotReadConfigFile)? {
             let file_content = fs_err::read_to_string(&config_file_path)
                 .map_err(crate::error::Error::CouldNotReadConfigFile)?;
@@ -244,11 +243,10 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error if the config file path cannot be determined,
-    /// if parent directories cannot be created, if the config cannot be serialized,
-    /// or if the config file cannot be written.
+    /// Returns an error if parent directories cannot be created, if the config
+    /// cannot be serialized, or if the config file cannot be written.
     pub fn save(&self, environment: &Environment) -> Result<(), crate::error::Error> {
-        let config_file_path = config_file(environment)?;
+        let config_file_path = config_file(environment);
         if let Some(config_dir_path) = config_file_path.parent() {
             crate::utils::create_user_dir_all(config_dir_path)
                 .map_err(crate::error::Error::CouldNotCreateConfigFileParentDirs)?;
@@ -262,21 +260,15 @@ impl Config {
 }
 
 /// returns the config dir path
-///
-/// # Errors
-///
-/// Returns an error if the user's config directory cannot be determined.
-pub fn config_dir_path(environment: &Environment) -> Result<PathBuf, crate::error::Error> {
-    Ok(environment.config_dir.join("cargo-for-each"))
+#[must_use]
+pub fn config_dir_path(environment: &Environment) -> PathBuf {
+    environment.config_dir.join("cargo-for-each")
 }
 
 /// returns the config file path
-///
-/// # Errors
-///
-/// Returns an error if the config directory path cannot be determined.
-pub fn config_file(environment: &Environment) -> Result<PathBuf, crate::error::Error> {
-    Ok(config_dir_path(environment)?.join("cargo-for-each.toml"))
+#[must_use]
+pub fn config_file(environment: &Environment) -> PathBuf {
+    config_dir_path(environment).join("cargo-for-each.toml")
 }
 
 #[cfg(test)]
