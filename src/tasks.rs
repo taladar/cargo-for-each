@@ -393,13 +393,25 @@ fn is_snapshot_metadata_completed(state_dir: &Path) -> bool {
     state_dir.exists() && state_dir.join("snapshot_metadata_completed").exists()
 }
 
-/// Returns `true` if the `wait_for_continue` barrier at `state_dir` is in the waiting state
-/// (state_dir exists but no `barrier_released` file).
+/// A `wait_for_continue` barrier has three on-disk states, distinguished by
+/// the presence of `state_dir` and the `barrier_released` marker inside it:
+///
+/// - **pending**: `state_dir` does not exist yet. The barrier has not been
+///   reached during execution.
+/// - **waiting**: `state_dir` exists but `barrier_released` does not. The
+///   executor has reached the barrier and is now blocked, waiting for
+///   `task continue` to release it.
+/// - **released**: `barrier_released` exists. The user has run
+///   `task continue` and the executor may proceed past this barrier.
+///
+/// Returns `true` only for the *waiting* state.
 fn is_wait_barrier_waiting(state_dir: &Path) -> bool {
     state_dir.exists() && !state_dir.join("barrier_released").exists()
 }
 
-/// Returns `true` if the `wait_for_continue` barrier at `state_dir` has been released.
+/// Returns `true` if the `wait_for_continue` barrier at `state_dir` is in the
+/// *released* state (see [`is_wait_barrier_waiting`] for the full tri-state
+/// description).
 fn is_wait_barrier_released(state_dir: &Path) -> bool {
     state_dir.join("barrier_released").exists()
 }
