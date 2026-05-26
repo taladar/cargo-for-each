@@ -16,6 +16,10 @@
 //! | `else`           | Else branch chosen in an `if` block          |
 //! | `env`            | Body of a `with_env_file` block              |
 //!
+//! The `s{N}` indices are scope-local: they restart at `s0` inside each
+//! block (`if` branch, `else` branch, `with_env_file` body, loop body),
+//! so siblings at different nesting depths can share the same `s{N}`.
+//!
 //! ### Examples
 //!
 //! ```text
