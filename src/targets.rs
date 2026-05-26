@@ -677,12 +677,3 @@ impl CrateType {
         crate_types
     }
 }
-
-/// represents a target within a resolved target set
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Target {
-    /// the manifest directory of the target
-    pub manifest_dir: PathBuf,
-    /// the manifest directories of the targets that this target depends on
-    pub dependencies: Vec<PathBuf>,
-}
