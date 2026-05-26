@@ -1580,7 +1580,7 @@ async fn run_crate_stmts_to_completion(
                     }
                     println!(
                         "Wait barrier reached at {}: \"{}\". Release with `cargo-for-each task continue --name {} --cursor {}`.",
-                        cursor,
+                        cursor.to_path_string(),
                         node.description,
                         task_name,
                         cursor.to_path_string()
@@ -1755,7 +1755,7 @@ async fn run_workspace_stmts_to_completion(
                     }
                     println!(
                         "Wait barrier reached at {}: \"{}\". Release with `cargo-for-each task continue --name {} --cursor {}`.",
-                        cursor,
+                        cursor.to_path_string(),
                         node.description,
                         task_name,
                         cursor.to_path_string()
@@ -2091,7 +2091,7 @@ pub async fn run_single_step_command(
                     .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
                 println!(
                     "Wait barrier reached at {}: \"{}\". Release with `task continue --name {} --cursor {}`.",
-                    next.cursor,
+                    next.cursor.to_path_string(),
                     node.description,
                     params.name,
                     next.cursor.to_path_string()
