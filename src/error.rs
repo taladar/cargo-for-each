@@ -232,4 +232,10 @@ pub enum Error {
     /// `wait_for_continue` statement in the task's program
     #[error("cursor {0:?} does not target a wait_for_continue statement in this task's program")]
     CursorNotAtBarrier(String),
+    /// the user requested parallel execution (`-j > 1`) of a program that
+    /// contains interactive steps (`manual_step` or an `ask_user` condition)
+    #[error(
+        "cannot run with --jobs > 1 because the program contains interactive steps (manual_step or ask_user); rerun with --jobs 1"
+    )]
+    InteractiveStepsRequireSingleJob,
 }

@@ -16,10 +16,12 @@ use tracing::instrument;
 
 use crate::error::Error;
 use crate::program::ast::common::{
-    ManualStepNode, RunStep, SnapshotMetadataNode, WaitForContinueNode,
+    CommonCondition, ManualStepNode, RunStep, SnapshotMetadataNode, WaitForContinueNode,
 };
-use crate::program::ast::crate_ctx::{CrateIfBlock, CrateStatement};
-use crate::program::ast::workspace_ctx::{WorkspaceIfBlock, WorkspaceStatement};
+use crate::program::ast::crate_ctx::{CrateCondition, CrateIfBlock, CrateStatement};
+use crate::program::ast::workspace_ctx::{
+    WorkspaceCondition, WorkspaceIfBlock, WorkspaceStatement,
+};
 use crate::program::cursor::{CursorSegment, ProgramCursor};
 use crate::program::evaluate::{
     crate_condition_runtime_detail, evaluate_crate_condition, evaluate_workspace_condition,
@@ -2190,6 +2192,90 @@ pub async fn run_single_target_command(
     Ok(())
 }
 
+/// Returns `true` if `program` contains any statement that reads from stdin
+/// (`manual_step`) or any condition that does (`ask_user`).
+///
+/// Used to refuse parallel execution: with `-j > 1` multiple workspace
+/// pipelines run concurrently and would race for the same stdin/stdout if
+/// they prompted simultaneously.
+fn program_has_interactive_steps(program: &Program) -> bool {
+    fn common_has_ask_user(cond: &CommonCondition) -> bool {
+        match cond {
+            CommonCondition::AskUser(_) => true,
+            CommonCondition::Not(inner) => common_has_ask_user(inner),
+            CommonCondition::And(conds) | CommonCondition::Or(conds) => {
+                conds.iter().any(common_has_ask_user)
+            }
+            CommonCondition::RunCommand { .. }
+            | CommonCondition::FileExists(_)
+            | CommonCondition::WorkingDirectoryClean
+            | CommonCondition::GitConfigEquals { .. } => false,
+        }
+    }
+    fn ws_cond_has_ask_user(cond: &WorkspaceCondition) -> bool {
+        match cond {
+            WorkspaceCondition::Common(c) => common_has_ask_user(c),
+            WorkspaceCondition::Not(inner) => ws_cond_has_ask_user(inner),
+            WorkspaceCondition::And(conds) | WorkspaceCondition::Or(conds) => {
+                conds.iter().any(ws_cond_has_ask_user)
+            }
+            WorkspaceCondition::Standalone | WorkspaceCondition::HasMembers => false,
+        }
+    }
+    fn crate_cond_has_ask_user(cond: &CrateCondition) -> bool {
+        match cond {
+            CrateCondition::Common(c) => common_has_ask_user(c),
+            CrateCondition::Not(inner) => crate_cond_has_ask_user(inner),
+            CrateCondition::And(conds) | CrateCondition::Or(conds) => {
+                conds.iter().any(crate_cond_has_ask_user)
+            }
+            CrateCondition::CrateType(_) | CrateCondition::Standalone => false,
+        }
+    }
+    fn crate_has_interactive(stmt: &CrateStatement) -> bool {
+        match stmt {
+            CrateStatement::ManualStep(_) => true,
+            CrateStatement::If(block) => {
+                block.branches.iter().any(|b| {
+                    crate_cond_has_ask_user(&b.condition)
+                        || b.statements.iter().any(crate_has_interactive)
+                }) || block.else_statements.iter().any(crate_has_interactive)
+            }
+            CrateStatement::WithEnvFile(block) => {
+                block.statements.iter().any(crate_has_interactive)
+            }
+            CrateStatement::Run(_)
+            | CrateStatement::SnapshotMetadata(_)
+            | CrateStatement::WaitForContinue(_) => false,
+        }
+    }
+    fn ws_has_interactive(stmt: &WorkspaceStatement) -> bool {
+        match stmt {
+            WorkspaceStatement::ManualStep(_) => true,
+            WorkspaceStatement::If(block) => {
+                block.branches.iter().any(|b| {
+                    ws_cond_has_ask_user(&b.condition)
+                        || b.statements.iter().any(ws_has_interactive)
+                }) || block.else_statements.iter().any(ws_has_interactive)
+            }
+            WorkspaceStatement::WithEnvFile(block) => {
+                block.statements.iter().any(ws_has_interactive)
+            }
+            WorkspaceStatement::ForCrateInWorkspace(block) => {
+                block.statements.iter().any(crate_has_interactive)
+            }
+            WorkspaceStatement::Run(_)
+            | WorkspaceStatement::SnapshotMetadata(_)
+            | WorkspaceStatement::WaitForContinue(_) => false,
+        }
+    }
+    program.statements.iter().any(|s| match s {
+        GlobalStatement::ForWorkspace(b) => b.statements.iter().any(ws_has_interactive),
+        GlobalStatement::ForCrate(b) => b.statements.iter().any(crate_has_interactive),
+        GlobalStatement::SelectWorkspaces(_) | GlobalStatement::SelectCrates(_) => false,
+    })
+}
+
 /// Runs all targets in dependency order with optional parallelism.
 ///
 /// Workspaces are executed first (in dependency order), followed by standalone
@@ -2199,7 +2285,9 @@ pub async fn run_single_target_command(
 ///
 /// Returns an error if the task cannot be loaded, if a statement fails (unless
 /// `keep_going` is set), if some steps failed with `keep_going`, or if a
-/// circular dependency is detected.
+/// circular dependency is detected. Also errors if the program contains
+/// interactive steps (`manual_step` / `ask_user`) and `--jobs > 1` was
+/// requested, since parallel pipelines would race for stdin.
 #[instrument]
 pub async fn run_all_targets_command(
     params: RunAllTargetsParameters,
@@ -2210,6 +2298,13 @@ pub async fn run_all_targets_command(
     let state_base = Arc::new(state_dir_for_task(&params.name, &environment)?);
     let keep_going = params.keep_going;
     let jobs = params.jobs.unwrap_or(1);
+    // Reject parallel execution of programs with interactive steps: with
+    // jobs > 1 multiple workspace/crate pipelines run concurrently via
+    // buffer_unordered below and would race for the same stdin/stdout when
+    // any of them prompted the user.
+    if jobs > 1 && program_has_interactive_steps(&program) {
+        return Err(Error::InteractiveStepsRequireSingleJob);
+    }
     let resolved = Arc::new(resolved);
 
     let ws_stmts: Arc<Vec<WorkspaceStatement>> = Arc::new(first_workspace_stmts(&program).to_vec());
