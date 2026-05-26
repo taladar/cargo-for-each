@@ -145,6 +145,10 @@ pub enum Error {
     #[error("recorded exit status is not a valid integer: {0:?}")]
     InvalidRecordedExitStatus(String),
     /// an IO error occurred
+    // Intentionally no `#[from]`: this enum has many specific `io::Error`-bearing
+    // variants (e.g. `CouldNotReadConfigFile`, `CouldNotWriteStateFile`) that
+    // require their own context. A blanket `From<io::Error>` would let callers
+    // accidentally drop that context and would conflict with the specific paths.
     #[error("I/O error: {0}")]
     IoError(#[source] std::io::Error),
     /// a git error occurred
