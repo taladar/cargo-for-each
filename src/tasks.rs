@@ -2967,8 +2967,21 @@ pub async fn task_command(
         }
         TaskSubCommand::Remove(params) => {
             let task_dir = named_dir_path(&params.name, &environment)?;
+            if !task_dir.exists() {
+                return Err(Error::TaskNotFound(params.name));
+            }
             fs_err::remove_dir_all(&task_dir)
                 .map_err(|e| Error::CouldNotRemoveTaskDir(task_dir.clone(), e))?;
+            // Also remove the execution-state directory (exit_status files,
+            // snapshots, asciinema casts, barrier markers); otherwise a task
+            // recreated with the same name inherits stale completion state.
+            // The state directory may not exist if the task was never run.
+            let state_dir = state_dir_for_task(&params.name, &environment)?;
+            match fs_err::remove_dir_all(&state_dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(Error::CouldNotRemoveTaskStateDir(state_dir, err)),
+            }
         }
         TaskSubCommand::Run(params) => {
             task_run_command(params, environment).await?;
