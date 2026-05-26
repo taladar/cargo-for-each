@@ -356,7 +356,10 @@ fn is_run_completed(state_dir: &Path) -> bool {
         == Some("0")
 }
 
-/// Returns `true` if the `run` step at `state_dir` has a recorded non-zero exit status.
+/// Returns `true` if the `run` step at `state_dir` has any recorded non-success
+/// status — i.e. the `exit_status` file exists and its trimmed contents are
+/// anything other than `"0"`, including the empty string written on
+/// launch-failure paths.
 ///
 /// Distinct from `is_run_completed`: a step that has not been started at all returns `false`.
 fn is_run_failed(state_dir: &Path) -> bool {
