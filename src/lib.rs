@@ -63,9 +63,11 @@ pub struct Options {
 /// so we can easily mock them for testing
 #[derive(Debug, Clone)]
 pub struct Environment {
-    /// user config dir (XDG\_CONFIG\_DIR)
+    /// user config dir (`XDG_CONFIG_HOME` on Linux, `~/Library/Application Support`
+    /// on macOS, `%APPDATA%` on Windows — see the `dirs` crate)
     pub config_dir: std::path::PathBuf,
-    /// user state dir (XDG\_STATE\_DIR)
+    /// user state dir (`XDG_STATE_HOME` on Linux; macOS/Windows fall back to
+    /// platform conventions — see the `dirs` crate)
     pub state_dir: std::path::PathBuf,
     /// paths from PATH
     pub paths: Vec<std::path::PathBuf>,
