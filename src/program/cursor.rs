@@ -80,6 +80,11 @@ impl fmt::Display for CursorSegmentParseError {
 
 impl std::error::Error for CursorSegmentParseError {}
 
+/// Returns `true` if `s` is non-empty and contains only ASCII digits (`0`–`9`).
+fn is_ascii_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 impl FromStr for CursorSegment {
     type Err = CursorSegmentParseError;
 
@@ -94,25 +99,38 @@ impl FromStr for CursorSegment {
         if s == "env" {
             return Ok(Self::WithEnvFile);
         }
-        if let Some(rest) = s.strip_prefix("w") {
+        // The single-letter prefix checks below require the rest to be all
+        // ASCII digits; otherwise we fall through so a future segment kind
+        // whose token happens to start with `w`, `c`, or `s` (e.g. `wait`,
+        // `cont`, `skip`) is not silently consumed as an invalid numeric
+        // segment.
+        if let Some(rest) = s.strip_prefix("w")
+            && is_ascii_digits(rest)
+        {
             let n = rest
                 .parse::<usize>()
                 .map_err(|_| CursorSegmentParseError(s.to_owned()))?;
             return Ok(Self::WorkspaceIteration(n));
         }
-        if let Some(rest) = s.strip_prefix("c") {
+        if let Some(rest) = s.strip_prefix("c")
+            && is_ascii_digits(rest)
+        {
             let n = rest
                 .parse::<usize>()
                 .map_err(|_| CursorSegmentParseError(s.to_owned()))?;
             return Ok(Self::CrateIteration(n));
         }
-        if let Some(rest) = s.strip_prefix("s") {
+        if let Some(rest) = s.strip_prefix("s")
+            && is_ascii_digits(rest)
+        {
             let n = rest
                 .parse::<usize>()
                 .map_err(|_| CursorSegmentParseError(s.to_owned()))?;
             return Ok(Self::Statement(n));
         }
-        if let Some(rest) = s.strip_prefix("if") {
+        if let Some(rest) = s.strip_prefix("if")
+            && is_ascii_digits(rest)
+        {
             let n = rest
                 .parse::<usize>()
                 .map_err(|_| CursorSegmentParseError(s.to_owned()))?;
