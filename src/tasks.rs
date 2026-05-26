@@ -36,7 +36,8 @@ use clap::Parser;
 
 // ── Path helpers ───────────────────────────────────────────────────────────────
 
-/// Returns the tasks configuration directory path.
+/// Returns the directory under which all task configuration lives:
+/// `<config_dir>/cargo-for-each/tasks/`.
 ///
 /// # Errors
 ///
@@ -45,7 +46,8 @@ pub fn dir_path(environment: &crate::Environment) -> Result<PathBuf, Error> {
     Ok(crate::config_dir_path(environment).join("tasks"))
 }
 
-/// Returns the path to a specific task's configuration directory.
+/// Returns a single task's configuration directory:
+/// `<config_dir>/cargo-for-each/tasks/<name>/`.
 ///
 /// # Errors
 ///
@@ -54,7 +56,11 @@ pub fn named_dir_path(name: &str, environment: &crate::Environment) -> Result<Pa
     Ok(dir_path(environment)?.join(name))
 }
 
-/// Returns the path to a specific task's execution state directory.
+/// Returns a single task's *execution state* directory:
+/// `<state_dir>/cargo-for-each/tasks/<name>/`.  Distinct from
+/// [`named_dir_path`]: configuration lives under the config dir; execution
+/// state (cursor markers, exit-status files, snapshots, barrier markers,
+/// asciicasts) lives here.
 ///
 /// # Errors
 ///
