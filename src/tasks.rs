@@ -3002,21 +3002,108 @@ pub async fn task_command(
     Ok(())
 }
 
+/// Walks `cursor` through `program` and returns whether the statement it
+/// addresses is a `wait_for_continue` (in either workspace or crate context).
+///
+/// Returns `false` when the cursor structure does not match the program (the
+/// terminal statement is not reachable) or when the terminal statement is a
+/// different kind.
+fn cursor_targets_wait_for_continue(program: &Program, cursor: &ProgramCursor) -> bool {
+    fn walk_crate(stmts: &[CrateStatement], segs: &[CursorSegment]) -> bool {
+        let Some((first, rest)) = segs.split_first() else {
+            return false;
+        };
+        let CursorSegment::Statement(n) = *first else {
+            return false;
+        };
+        let Some(stmt) = stmts.get(n) else {
+            return false;
+        };
+        if rest.is_empty() {
+            return matches!(stmt, CrateStatement::WaitForContinue(_));
+        }
+        match (stmt, rest.split_first()) {
+            (CrateStatement::If(block), Some((CursorSegment::IfBranch(b), rest))) => block
+                .branches
+                .get(*b)
+                .is_some_and(|branch| walk_crate(&branch.statements, rest)),
+            (CrateStatement::If(block), Some((CursorSegment::ElseBranch, rest))) => {
+                walk_crate(&block.else_statements, rest)
+            }
+            (CrateStatement::WithEnvFile(block), Some((CursorSegment::WithEnvFile, rest))) => {
+                walk_crate(&block.statements, rest)
+            }
+            _ => false,
+        }
+    }
+    fn walk_workspace(stmts: &[WorkspaceStatement], segs: &[CursorSegment]) -> bool {
+        let Some((first, rest)) = segs.split_first() else {
+            return false;
+        };
+        let CursorSegment::Statement(n) = *first else {
+            return false;
+        };
+        let Some(stmt) = stmts.get(n) else {
+            return false;
+        };
+        if rest.is_empty() {
+            return matches!(stmt, WorkspaceStatement::WaitForContinue(_));
+        }
+        match (stmt, rest.split_first()) {
+            (WorkspaceStatement::If(block), Some((CursorSegment::IfBranch(b), rest))) => block
+                .branches
+                .get(*b)
+                .is_some_and(|branch| walk_workspace(&branch.statements, rest)),
+            (WorkspaceStatement::If(block), Some((CursorSegment::ElseBranch, rest))) => {
+                walk_workspace(&block.else_statements, rest)
+            }
+            (WorkspaceStatement::WithEnvFile(block), Some((CursorSegment::WithEnvFile, rest))) => {
+                walk_workspace(&block.statements, rest)
+            }
+            (
+                WorkspaceStatement::ForCrateInWorkspace(block),
+                Some((CursorSegment::CrateIteration(_), rest)),
+            ) => walk_crate(&block.statements, rest),
+            _ => false,
+        }
+    }
+
+    let Some((first, rest)) = cursor.segments().split_first() else {
+        return false;
+    };
+    match first {
+        CursorSegment::WorkspaceIteration(_) => program.statements.iter().any(|s| match s {
+            GlobalStatement::ForWorkspace(b) => walk_workspace(&b.statements, rest),
+            _ => false,
+        }),
+        CursorSegment::CrateIteration(_) => program.statements.iter().any(|s| match s {
+            GlobalStatement::ForCrate(b) => walk_crate(&b.statements, rest),
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
 /// Releases a wait barrier so execution can continue past it.
 ///
 /// # Errors
 ///
-/// Returns an error if the cursor string cannot be parsed or if the state files
-/// cannot be written.
+/// Returns an error if the task does not exist, the program cannot be loaded,
+/// the cursor cannot be parsed, the cursor does not address a
+/// `wait_for_continue` statement in the program, or the state files cannot be
+/// written.
 #[instrument]
 pub async fn release_wait_barrier_command(
     params: ContinueBarrierParameters,
     environment: crate::Environment,
 ) -> Result<(), Error> {
-    use crate::program::cursor::ProgramCursor;
-
     let cursor = ProgramCursor::from_path_string(&params.cursor)
         .map_err(|e| Error::InvalidCursorString(params.cursor.clone(), e.to_string()))?;
+    // Loading the program also verifies the task exists (TaskNotFound).
+    let (program, _resolved) = load_task_data(&params.name, &environment)?;
+    if !cursor_targets_wait_for_continue(&program, &cursor) {
+        return Err(Error::CursorNotAtBarrier(cursor.to_path_string()));
+    }
     let state_base = state_dir_for_task(&params.name, &environment)?;
     let state_dir = state_base.join(cursor.to_path());
     if !state_dir.exists() {

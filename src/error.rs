@@ -221,4 +221,8 @@ pub enum Error {
         "`file_exists {0:?}` resolves outside the enclosing workspace; only paths within the workspace manifest directory are allowed"
     )]
     FileExistsPathOutsideWorkspace(String),
+    /// `task continue` was given a cursor that does not point at a
+    /// `wait_for_continue` statement in the task's program
+    #[error("cursor {0:?} does not target a wait_for_continue statement in this task's program")]
+    CursorNotAtBarrier(String),
 }
