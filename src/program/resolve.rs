@@ -127,6 +127,12 @@ fn evaluate_crate_select_condition(
     workspace_standalone_map: &HashMap<PathBuf, bool>,
 ) -> bool {
     match cond {
+        // If `krate.workspace_manifest_dir` is not in the standalone map
+        // (orphan crate, or the workspace was removed from the config), fall
+        // back to `false` — i.e. treat unknown enclosing workspaces as
+        // non-standalone so they are filtered out by `where standalone`.
+        // Safe today because both sides use uncanonicalized paths; revisit
+        // if either side switches to canonical paths.
         CrateSelectCondition::Standalone => workspace_standalone_map
             .get(&krate.workspace_manifest_dir)
             .copied()
