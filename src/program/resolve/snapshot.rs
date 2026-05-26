@@ -14,11 +14,16 @@ use std::path::PathBuf;
 /// program AST is stored separately as the raw `.cfe` source text.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedProgram {
-    /// Workspaces to iterate over, in inter-workspace dependency order.
+    /// Workspaces to iterate over, in the order produced by the resolver
+    /// (currently config/cargo iteration order).  Inter-workspace dependency
+    /// constraints are recorded in [`ResolvedWorkspaceExecution::dependencies`]
+    /// and enforced at runtime by the dep-readiness gate, not by this list's
+    /// order.
     ///
     /// Each element corresponds to one iteration of a `for workspace { … }` block.
     pub workspace_executions: Vec<ResolvedWorkspaceExecution>,
-    /// Standalone crates to iterate over, in dependency order.
+    /// Standalone crates to iterate over, in resolver order.  Dependency
+    /// ordering is enforced at runtime, not by the order of this vec.
     ///
     /// Each element corresponds to one iteration of a `for crate { … }` block.
     pub crate_executions: Vec<ResolvedCrateExecution>,
@@ -32,7 +37,9 @@ pub struct ResolvedWorkspaceExecution {
     /// Other workspaces (by their canonical manifest dir) that must complete
     /// before this one may start.  An empty vec means no inter-workspace deps.
     pub dependencies: Vec<PathBuf>,
-    /// Member crates of this workspace, in intra-workspace dependency order.
+    /// Member crates of this workspace, in cargo's reported order.
+    /// Intra-workspace dependency ordering is enforced at runtime via the
+    /// dep-readiness gate, not by the order of this vec.
     ///
     /// Each element corresponds to one iteration of a `for crate in workspace { … }` block.
     pub member_crates: Vec<ResolvedCrateExecution>,
