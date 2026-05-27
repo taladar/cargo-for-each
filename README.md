@@ -87,7 +87,8 @@ List all registered crates.
 
 | Flag | Description |
 |------|-------------|
-| `--type <TYPE>` | Only list crates of the given type (`bin`, `lib`, `proc-macro`, `cdylib`, `dylib`, `rlib`, `staticlib`, `bench`, `test`, `example`, `custom-build`). |
+| `--crate-type <CRATE_TYPE>` | Only list crates whose compile-time output kinds include this crate type (`bin`, `lib`, `proc-macro`, `cdylib`, `dylib`, `rlib`, `staticlib`). |
+| `--target-kind <TARGET_KIND>` | Only list crates whose auxiliary cargo targets include this kind (`bench`, `test`, `example`, `custom-build`). Almost every package implicitly has a `test` target, so this filter on its own rarely narrows much. |
 | `--standalone <BOOL>` | Filter by whether the crate belongs to a standalone workspace. |
 
 #### `target add`

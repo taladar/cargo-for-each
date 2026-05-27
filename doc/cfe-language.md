@@ -545,6 +545,11 @@ if has_members {
 
 Available in crate `if` blocks (in addition to all common conditions).
 
+`type ==` tests cargo's compile-time *crate output kinds* (what a successful
+`cargo build` produces); `target_kind ==` tests the auxiliary cargo *target
+kinds* attached to the package. The two are distinct operators with disjoint
+value sets — writing `type == test` is a parse error.
+
 | Syntax | Evaluates to `true` when… |
 |--------|--------------------------|
 | `type == bin` | The crate produces an executable binary. |
@@ -554,10 +559,10 @@ Available in crate `if` blocks (in addition to all common conditions).
 | `type == dylib` | The crate is a Rust dynamic library. |
 | `type == rlib` | The crate is a Rust static library (rlib). |
 | `type == staticlib` | The crate is a C-compatible static library. |
-| `type == bench` | The crate has a benchmark target. |
-| `type == test` | The crate has an integration test target. |
-| `type == example` | The crate has an example target. |
-| `type == custom_build` | The crate has a custom build script (`build.rs`). |
+| `target_kind == bench` | The crate has a benchmark target. |
+| `target_kind == test` | The crate has an integration test target. (Almost every package implicitly has one, so this filter on its own rarely narrows much.) |
+| `target_kind == example` | The crate has an example target. |
+| `target_kind == custom_build` | The crate has a custom build script (`build.rs`). |
 | `standalone` | The crate lives in a standalone (single-crate) workspace. |
 
 #### Examples
@@ -591,6 +596,10 @@ These are evaluated statically at task-creation time; dynamic conditions
 
 #### Crate select filters
 
+`type ==` tests cargo's compile-time *crate output kinds*; `target_kind ==`
+tests the auxiliary cargo *target kinds*. As in §6.3, the two operators are
+distinct with disjoint value sets.
+
 | Syntax | Selects the crate when… |
 |--------|------------------------|
 | `standalone` | The crate lives in a standalone workspace. |
@@ -601,10 +610,10 @@ These are evaluated statically at task-creation time; dynamic conditions
 | `type == dylib` | The crate is a Rust dynamic library. |
 | `type == rlib` | The crate is a Rust static library (rlib). |
 | `type == staticlib` | The crate is a C-compatible static library. |
-| `type == bench` | The crate has a benchmark target. |
-| `type == test` | The crate has an integration test target. |
-| `type == example` | The crate has an example target. |
-| `type == custom_build` | The crate has a custom build script (`build.rs`). |
+| `target_kind == bench` | The crate has a benchmark target. |
+| `target_kind == test` | The crate has an integration test target. (Almost every package implicitly has one, so this filter on its own rarely narrows much.) |
+| `target_kind == example` | The crate has an example target. |
+| `target_kind == custom_build` | The crate has a custom build script (`build.rs`). |
 
 ### 6.5 Boolean operators
 
