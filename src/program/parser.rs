@@ -11,7 +11,7 @@ use super::ast::common::{
 };
 use super::ast::crate_ctx::{
     CrateCondition, CrateFilter, CrateSelectCondition, CrateStatement, CrateTypeFilter,
-    ForCrateBlock,
+    ForCrateBlock, TargetKindFilter,
 };
 use super::ast::workspace_ctx::{
     ForCrateInWorkspaceBlock, ForWorkspaceBlock, WorkspaceCondition, WorkspaceFilter,
@@ -281,12 +281,18 @@ fn crate_condition_parser<'src>()
                 kw("dylib").to(CrateTypeFilter::DyLib),
                 kw("rlib").to(CrateTypeFilter::RLib),
                 kw("staticlib").to(CrateTypeFilter::StaticLib),
-                kw("bench").to(CrateTypeFilter::Bench),
-                kw("test").to(CrateTypeFilter::Test),
-                kw("example").to(CrateTypeFilter::Example),
-                kw("custom_build").to(CrateTypeFilter::CustomBuild),
             )))
             .map(CrateCondition::CrateType);
+
+        let target_kind = kw("target_kind")
+            .ignore_then(sym("=="))
+            .ignore_then(choice((
+                kw("bench").to(TargetKindFilter::Bench),
+                kw("test").to(TargetKindFilter::Test),
+                kw("example").to(TargetKindFilter::Example),
+                kw("custom_build").to(TargetKindFilter::CustomBuild),
+            )))
+            .map(CrateCondition::TargetKind);
 
         let standalone = kw("standalone").to(CrateCondition::Standalone);
 
@@ -299,6 +305,7 @@ fn crate_condition_parser<'src>()
             wdc,
             git_config_equals,
             crate_type,
+            target_kind,
             standalone,
             paren,
         ));
@@ -388,14 +395,19 @@ fn crate_select_condition_parser<'src>()
                 kw("dylib").to(CrateTypeFilter::DyLib),
                 kw("rlib").to(CrateTypeFilter::RLib),
                 kw("staticlib").to(CrateTypeFilter::StaticLib),
-                kw("bench").to(CrateTypeFilter::Bench),
-                kw("test").to(CrateTypeFilter::Test),
-                kw("example").to(CrateTypeFilter::Example),
-                kw("custom_build").to(CrateTypeFilter::CustomBuild),
             )))
             .map(CrateSelectCondition::CrateType);
+        let target_kind = kw("target_kind")
+            .ignore_then(sym("=="))
+            .ignore_then(choice((
+                kw("bench").to(TargetKindFilter::Bench),
+                kw("test").to(TargetKindFilter::Test),
+                kw("example").to(TargetKindFilter::Example),
+                kw("custom_build").to(TargetKindFilter::CustomBuild),
+            )))
+            .map(CrateSelectCondition::TargetKind);
         let paren = cond.clone().delimited_by(sym("("), sym(")"));
-        let atom = choice((standalone, crate_type, paren));
+        let atom = choice((standalone, crate_type, target_kind, paren));
 
         let not_expr = sym("!")
             .repeated()
@@ -897,6 +909,48 @@ mod tests {
                     else_statements: vec![],
                 })]
             })]
+        );
+    }
+
+    #[test]
+    fn crate_if_target_kind_test() {
+        let prog = parse_ok(r#"for crate { if target_kind == test { run "cargo" "test"; } }"#);
+        assert_eq!(
+            prog.statements,
+            vec![GlobalStatement::ForCrate(ForCrateBlock {
+                statements: vec![CrateStatement::If(IfBlock {
+                    branches: vec![Branch {
+                        condition: CrateCondition::TargetKind(TargetKindFilter::Test),
+                        statements: vec![CrateStatement::Run(RunStep {
+                            command: "cargo".to_owned(),
+                            args: vec!["test".to_owned()],
+                        })],
+                    }],
+                    else_statements: vec![],
+                })]
+            })]
+        );
+    }
+
+    #[test]
+    fn select_crates_where_target_kind_bench() {
+        let prog = parse_ok("select crates where target_kind == bench;");
+        assert_eq!(
+            prog.statements,
+            vec![GlobalStatement::SelectCrates(CrateFilter {
+                condition: Some(CrateSelectCondition::TargetKind(TargetKindFilter::Bench))
+            })]
+        );
+    }
+
+    #[test]
+    fn type_rejects_target_kind_keyword() {
+        // `test` is a target-kind, not a crate-type; using it after `type ==`
+        // must fail to parse so users get a clear error instead of an
+        // always-true filter.
+        assert!(
+            parse("for crate { if type == test { run \"x\"; } }", "<test>").is_err(),
+            "`type == test` should be rejected at parse time",
         );
     }
 

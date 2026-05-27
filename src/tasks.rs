@@ -2250,7 +2250,9 @@ fn program_has_interactive_steps(program: &Program) -> bool {
             CrateCondition::And(conds) | CrateCondition::Or(conds) => {
                 conds.iter().any(crate_cond_has_ask_user)
             }
-            CrateCondition::CrateType(_) | CrateCondition::Standalone => false,
+            CrateCondition::CrateType(_)
+            | CrateCondition::TargetKind(_)
+            | CrateCondition::Standalone => false,
         }
     }
     fn crate_has_interactive(stmt: &CrateStatement) -> bool {

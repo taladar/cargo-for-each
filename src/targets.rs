@@ -61,9 +61,16 @@ pub async fn target_command(
 /// Parameters for filtering crates
 #[derive(clap::Parser, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CrateFilterParameters {
-    /// only list crates of this type
+    /// only list crates whose compile-time output kinds include this crate
+    /// type (e.g. `bin`, `lib`, `proc-macro`)
     #[clap(long)]
-    pub r#type: Option<CrateType>,
+    pub crate_type: Option<CrateType>,
+    /// only list crates whose auxiliary cargo targets include this kind
+    /// (`test`, `bench`, `example`, `custom-build`). Almost every package
+    /// has at least a `test` target, so this filter on its own rarely
+    /// narrows much.
+    #[clap(long)]
+    pub target_kind: Option<TargetKind>,
     /// only list crates that are standalone or not
     #[clap(long)]
     pub standalone: Option<bool>,
@@ -100,9 +107,9 @@ pub struct ListParameters {
 ///
 /// The line format printed to stdout — currently
 /// `{path} (standalone: {bool})` for workspaces and
-/// `{path} (workspace: {ws}, types: {types:?})` for crates — is intended
-/// for human consumption and is **not** a stable interface. In particular
-/// the `types: …` section uses Rust `Debug` for a `BTreeSet<CrateType>`
+/// `{path} (workspace: {ws}, crate_types: {…}, target_kinds: {…})` for crates
+/// — is intended for human consumption and is **not** a stable interface.
+/// In particular both type sections use Rust `Debug` for `BTreeSet`s
 /// (e.g. `{Bin, Lib}`). Scripts that parse this output will break across
 /// versions; use a future structured output flag instead when one exists.
 ///
@@ -141,8 +148,13 @@ pub async fn list_command(
                 .collect();
 
             for krate in config.crates {
-                if let Some(crate_type) = &params.r#type
-                    && !krate.types.contains(crate_type)
+                if let Some(crate_type) = &params.crate_type
+                    && !krate.crate_types.contains(crate_type)
+                {
+                    continue;
+                }
+                if let Some(target_kind) = &params.target_kind
+                    && !krate.target_kinds.contains(target_kind)
                 {
                     continue;
                 }
@@ -166,16 +178,18 @@ pub async fn list_command(
                 }
                 if krate.manifest_dir == krate.workspace_manifest_dir {
                     println!(
-                        "{} (types: {:?})",
+                        "{} (crate_types: {:?}, target_kinds: {:?})",
                         krate.manifest_dir.display(),
-                        krate.types
+                        krate.crate_types,
+                        krate.target_kinds,
                     );
                 } else {
                     println!(
-                        "{} (workspace: {}, types: {:?})",
+                        "{} (workspace: {}, crate_types: {:?}, target_kinds: {:?})",
                         krate.manifest_dir.display(),
                         krate.workspace_manifest_dir.display(),
-                        krate.types
+                        krate.crate_types,
+                        krate.target_kinds,
                     );
                 }
             }
@@ -276,6 +290,7 @@ pub async fn add_command(
         };
         let package = workspace_metadata.get_package_by_id(package_id)?;
         let crate_types = CrateType::from_package(package);
+        let target_kinds = TargetKind::from_package(package);
         config.add_workspace(Workspace {
             manifest_dir: workspace_manifest_dir.clone(),
             is_standalone: true,
@@ -283,7 +298,8 @@ pub async fn add_command(
         config.add_crate(Crate {
             manifest_dir: workspace_manifest_dir.clone(),
             workspace_manifest_dir,
-            types: crate_types,
+            crate_types,
+            target_kinds,
         });
     } else {
         tracing::debug!("Identified Cargo.toml as workspace");
@@ -299,10 +315,12 @@ pub async fn add_command(
                 ));
             };
             let crate_types = CrateType::from_package(package);
+            let target_kinds = TargetKind::from_package(package);
             config.add_crate(Crate {
                 manifest_dir: package_manifest_dir.to_path_buf(),
                 workspace_manifest_dir: workspace_manifest_dir.clone(),
-                types: crate_types,
+                crate_types,
+                target_kinds,
             });
         }
     }
@@ -476,16 +494,18 @@ pub async fn refresh_command(environment: crate::Environment) -> Result<(), crat
             // Only add if it doesn't exist. `add_crate` also de-dupes.
             if !config.crates.iter().any(|c| c.manifest_dir == manifest_dir) {
                 let crate_types = CrateType::from_package(package);
+                let target_kinds = TargetKind::from_package(package);
                 config.add_crate(Crate {
                     manifest_dir,
                     workspace_manifest_dir: workspace.manifest_dir.clone(),
-                    types: crate_types,
+                    crate_types,
+                    target_kinds,
                 });
             }
         }
     }
 
-    // 4. Update crate_types for all existing crates.
+    // 4. Update crate_types/target_kinds for all existing crates.
     //    Same warn-and-continue rationale as step 3.
     for krate in &mut config.crates {
         let manifest_path = krate.manifest_dir.join("Cargo.toml");
@@ -509,14 +529,24 @@ pub async fn refresh_command(environment: crate::Environment) -> Result<(), crat
         // Using get_package_by_manifest_path is correct for single crates/workspace members.
         if let Ok(package) = cargo_metadata.get_package_by_manifest_path(&manifest_path) {
             let new_crate_types = CrateType::from_package(package);
-            if krate.types != new_crate_types {
+            let new_target_kinds = TargetKind::from_package(package);
+            if krate.crate_types != new_crate_types {
                 tracing::debug!(
-                    "Updating types for {} from {:?} to {:?}",
+                    "Updating crate_types for {} from {:?} to {:?}",
                     krate.manifest_dir.display(),
-                    krate.types,
+                    krate.crate_types,
                     new_crate_types
                 );
-                krate.types = new_crate_types;
+                krate.crate_types = new_crate_types;
+            }
+            if krate.target_kinds != new_target_kinds {
+                tracing::debug!(
+                    "Updating target_kinds for {} from {:?} to {:?}",
+                    krate.manifest_dir.display(),
+                    krate.target_kinds,
+                    new_target_kinds
+                );
+                krate.target_kinds = new_target_kinds;
             }
         } else {
             tracing::warn!(
@@ -608,7 +638,13 @@ impl CargoPackageExt for cargo_metadata::Package {
     }
 }
 
-/// represents the type of Rust crate
+/// The compile-time output kind of a Rust crate.
+///
+/// This corresponds to entries that may legitimately appear in a `Cargo.toml`
+/// `[lib].crate-type` (`lib`, `rlib`, `dylib`, `cdylib`, `staticlib`,
+/// `proc-macro`) plus the `bin` produced by `[[bin]]` targets. The auxiliary
+/// build artifacts cargo also generates per package — tests, benches,
+/// examples, the build script — live in [`TargetKind`] instead.
 #[derive(
     Debug,
     Clone,
@@ -636,14 +672,6 @@ pub enum CrateType {
     RLib,
     /// a C-compatible static library
     StaticLib,
-    /// a benchmark target
-    Bench,
-    /// an integration test target
-    Test,
-    /// an example target
-    Example,
-    /// a custom build script (build.rs)
-    CustomBuild,
 }
 
 impl CrateType {
@@ -672,18 +700,56 @@ impl CrateType {
         if package.has_target(&cargo_metadata::TargetKind::StaticLib) {
             crate_types.insert(Self::StaticLib);
         }
+        crate_types
+    }
+}
+
+/// An auxiliary cargo target kind attached to a package.
+///
+/// These are the cargo target kinds that are **not** a compile-time crate
+/// output: integration tests, benchmarks, examples, and the build script.
+/// Almost every package implicitly has at least a `Test` kind, so filters on
+/// `TargetKind` should not be used as a substitute for a [`CrateType`] filter.
+#[derive(
+    Debug,
+    Clone,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+pub enum TargetKind {
+    /// a benchmark target
+    Bench,
+    /// an integration test target
+    Test,
+    /// an example target
+    Example,
+    /// a custom build script (build.rs)
+    CustomBuild,
+}
+
+impl TargetKind {
+    /// determine the set of `TargetKind` for a given package
+    #[must_use]
+    pub fn from_package(package: &cargo_metadata::Package) -> BTreeSet<Self> {
+        let mut target_kinds = BTreeSet::new();
         if package.has_target(&cargo_metadata::TargetKind::Bench) {
-            crate_types.insert(Self::Bench);
+            target_kinds.insert(Self::Bench);
         }
         if package.has_target(&cargo_metadata::TargetKind::Test) {
-            crate_types.insert(Self::Test);
+            target_kinds.insert(Self::Test);
         }
         if package.has_target(&cargo_metadata::TargetKind::Example) {
-            crate_types.insert(Self::Example);
+            target_kinds.insert(Self::Example);
         }
         if package.has_target(&cargo_metadata::TargetKind::CustomBuild) {
-            crate_types.insert(Self::CustomBuild);
+            target_kinds.insert(Self::CustomBuild);
         }
-        crate_types
+        target_kinds
     }
 }

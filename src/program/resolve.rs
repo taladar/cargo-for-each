@@ -9,10 +9,12 @@ use std::path::{Path, PathBuf};
 use cargo_metadata::{DependencyKind, PackageId};
 
 use crate::error::Error;
-use crate::program::ast::crate_ctx::{CrateFilter, CrateSelectCondition, CrateTypeFilter};
+use crate::program::ast::crate_ctx::{
+    CrateFilter, CrateSelectCondition, CrateTypeFilter, TargetKindFilter,
+};
 use crate::program::ast::workspace_ctx::{WorkspaceFilter, WorkspaceSelectCondition};
 use crate::program::{GlobalStatement, Program};
-use crate::targets::CrateType;
+use crate::targets::{CrateType, TargetKind};
 
 pub use snapshot::{ResolvedCrateExecution, ResolvedProgram, ResolvedWorkspaceExecution};
 
@@ -138,17 +140,19 @@ fn evaluate_crate_select_condition(
             .copied()
             .unwrap_or(false),
         CrateSelectCondition::CrateType(filter) => match filter {
-            CrateTypeFilter::Bin => krate.types.contains(&CrateType::Bin),
-            CrateTypeFilter::Lib => krate.types.contains(&CrateType::Lib),
-            CrateTypeFilter::ProcMacro => krate.types.contains(&CrateType::ProcMacro),
-            CrateTypeFilter::CDyLib => krate.types.contains(&CrateType::CDyLib),
-            CrateTypeFilter::DyLib => krate.types.contains(&CrateType::DyLib),
-            CrateTypeFilter::RLib => krate.types.contains(&CrateType::RLib),
-            CrateTypeFilter::StaticLib => krate.types.contains(&CrateType::StaticLib),
-            CrateTypeFilter::Bench => krate.types.contains(&CrateType::Bench),
-            CrateTypeFilter::Test => krate.types.contains(&CrateType::Test),
-            CrateTypeFilter::Example => krate.types.contains(&CrateType::Example),
-            CrateTypeFilter::CustomBuild => krate.types.contains(&CrateType::CustomBuild),
+            CrateTypeFilter::Bin => krate.crate_types.contains(&CrateType::Bin),
+            CrateTypeFilter::Lib => krate.crate_types.contains(&CrateType::Lib),
+            CrateTypeFilter::ProcMacro => krate.crate_types.contains(&CrateType::ProcMacro),
+            CrateTypeFilter::CDyLib => krate.crate_types.contains(&CrateType::CDyLib),
+            CrateTypeFilter::DyLib => krate.crate_types.contains(&CrateType::DyLib),
+            CrateTypeFilter::RLib => krate.crate_types.contains(&CrateType::RLib),
+            CrateTypeFilter::StaticLib => krate.crate_types.contains(&CrateType::StaticLib),
+        },
+        CrateSelectCondition::TargetKind(filter) => match filter {
+            TargetKindFilter::Bench => krate.target_kinds.contains(&TargetKind::Bench),
+            TargetKindFilter::Test => krate.target_kinds.contains(&TargetKind::Test),
+            TargetKindFilter::Example => krate.target_kinds.contains(&TargetKind::Example),
+            TargetKindFilter::CustomBuild => krate.target_kinds.contains(&TargetKind::CustomBuild),
         },
         CrateSelectCondition::Not(inner) => {
             !evaluate_crate_select_condition(inner, krate, workspace_standalone_map)

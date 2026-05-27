@@ -11,9 +11,9 @@ use git2::Repository;
 
 use crate::error::Error;
 use crate::program::ast::common::CommonCondition;
-use crate::program::ast::crate_ctx::{CrateCondition, CrateTypeFilter};
+use crate::program::ast::crate_ctx::{CrateCondition, CrateTypeFilter, TargetKindFilter};
 use crate::program::ast::workspace_ctx::WorkspaceCondition;
-use crate::targets::CrateType;
+use crate::targets::{CrateType, TargetKind};
 
 /// Joins `rel_or_abs` to `base` and lexically normalizes `.`/`..` segments.
 ///
@@ -355,15 +355,23 @@ pub fn evaluate_crate_condition(
                 CrateTypeFilter::DyLib => CrateType::DyLib,
                 CrateTypeFilter::RLib => CrateType::RLib,
                 CrateTypeFilter::StaticLib => CrateType::StaticLib,
-                CrateTypeFilter::Bench => CrateType::Bench,
-                CrateTypeFilter::Test => CrateType::Test,
-                CrateTypeFilter::Example => CrateType::Example,
-                CrateTypeFilter::CustomBuild => CrateType::CustomBuild,
             };
             Ok(config
                 .crates
                 .iter()
-                .any(|c| c.manifest_dir == manifest_dir && c.types.contains(&required)))
+                .any(|c| c.manifest_dir == manifest_dir && c.crate_types.contains(&required)))
+        }
+        CrateCondition::TargetKind(filter) => {
+            let required = match filter {
+                TargetKindFilter::Bench => TargetKind::Bench,
+                TargetKindFilter::Test => TargetKind::Test,
+                TargetKindFilter::Example => TargetKind::Example,
+                TargetKindFilter::CustomBuild => TargetKind::CustomBuild,
+            };
+            Ok(config
+                .crates
+                .iter()
+                .any(|c| c.manifest_dir == manifest_dir && c.target_kinds.contains(&required)))
         }
         CrateCondition::Standalone => {
             // A crate is "standalone" if its workspace is a standalone workspace.
@@ -434,7 +442,8 @@ mod tests {
             crates: vec![Crate {
                 manifest_dir: dir.to_path_buf(),
                 workspace_manifest_dir: dir.to_path_buf(),
-                types: BTreeSet::from([CrateType::Bin]),
+                crate_types: BTreeSet::from([CrateType::Bin]),
+                target_kinds: BTreeSet::new(),
             }],
         }
     }
@@ -535,7 +544,8 @@ mod tests {
             crates: vec![Crate {
                 manifest_dir: crate_dir.clone(),
                 workspace_manifest_dir: ws.to_path_buf(),
-                types: BTreeSet::from([CrateType::Bin]),
+                crate_types: BTreeSet::from([CrateType::Bin]),
+                target_kinds: BTreeSet::new(),
             }],
         };
         let result = evaluate_common_condition(
@@ -773,5 +783,59 @@ mod tests {
         let config = config_with_bin_crate(dir);
         let result = evaluate_crate_condition(&CrateCondition::Standalone, dir, &env, &config, &[]);
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
+    }
+
+    #[test]
+    fn crate_target_kind_test_true() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = temp.path();
+        let env = mock_env(&temp);
+        let config = crate::Config {
+            workspaces: vec![Workspace {
+                manifest_dir: dir.to_path_buf(),
+                is_standalone: true,
+            }],
+            crates: vec![Crate {
+                manifest_dir: dir.to_path_buf(),
+                workspace_manifest_dir: dir.to_path_buf(),
+                crate_types: BTreeSet::from([CrateType::Bin]),
+                target_kinds: BTreeSet::from([TargetKind::Test]),
+            }],
+        };
+        let result = evaluate_crate_condition(
+            &CrateCondition::TargetKind(TargetKindFilter::Test),
+            dir,
+            &env,
+            &config,
+            &[],
+        );
+        assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), true);
+    }
+
+    #[test]
+    fn crate_target_kind_bench_false_when_only_test() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = temp.path();
+        let env = mock_env(&temp);
+        let config = crate::Config {
+            workspaces: vec![Workspace {
+                manifest_dir: dir.to_path_buf(),
+                is_standalone: true,
+            }],
+            crates: vec![Crate {
+                manifest_dir: dir.to_path_buf(),
+                workspace_manifest_dir: dir.to_path_buf(),
+                crate_types: BTreeSet::from([CrateType::Bin]),
+                target_kinds: BTreeSet::from([TargetKind::Test]),
+            }],
+        };
+        let result = evaluate_crate_condition(
+            &CrateCondition::TargetKind(TargetKindFilter::Bench),
+            dir,
+            &env,
+            &config,
+            &[],
+        );
+        assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), false);
     }
 }

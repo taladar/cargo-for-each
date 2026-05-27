@@ -5,7 +5,12 @@ use super::common::{
     WaitForContinueNode, WithEnvFileBlock,
 };
 
-/// The type of a Rust crate, used as a filter in crate-context conditions.
+/// The compile-time output kind of a Rust crate, used as a filter in
+/// crate-context conditions (`type == bin`, etc.).
+///
+/// Mirrors the narrowed [`crate::targets::CrateType`] enum: only the kinds
+/// that legitimately appear in `[lib].crate-type` plus `bin`. Auxiliary
+/// cargo target kinds live in [`TargetKindFilter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrateTypeFilter {
     /// A binary crate (produces an executable).
@@ -22,14 +27,6 @@ pub enum CrateTypeFilter {
     RLib,
     /// A C-compatible static library.
     StaticLib,
-    /// A benchmark target.
-    Bench,
-    /// An integration test target.
-    Test,
-    /// An example target.
-    Example,
-    /// A custom build script (`build.rs`).
-    CustomBuild,
 }
 
 impl std::fmt::Display for CrateTypeFilter {
@@ -42,6 +39,32 @@ impl std::fmt::Display for CrateTypeFilter {
             Self::DyLib => write!(f, "dylib"),
             Self::RLib => write!(f, "rlib"),
             Self::StaticLib => write!(f, "staticlib"),
+        }
+    }
+}
+
+/// An auxiliary cargo target kind, used as a filter in crate-context
+/// conditions (`target_kind == test`, etc.).
+///
+/// Mirrors [`crate::targets::TargetKind`]: the cargo target kinds that are
+/// **not** a compile-time crate output. Almost every package implicitly has
+/// at least `Test`, so filters on these are rarely useful as the sole
+/// criterion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKindFilter {
+    /// A benchmark target.
+    Bench,
+    /// An integration test target.
+    Test,
+    /// An example target.
+    Example,
+    /// A custom build script (`build.rs`).
+    CustomBuild,
+}
+
+impl std::fmt::Display for TargetKindFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
             Self::Bench => write!(f, "bench"),
             Self::Test => write!(f, "test"),
             Self::Example => write!(f, "example"),
@@ -89,8 +112,10 @@ pub enum CrateStatement {
 pub enum CrateCondition {
     /// A condition from the common set available in all contexts.
     Common(CommonCondition),
-    /// True if this crate matches the given type filter.
+    /// True if this crate's compile-time output kinds include the given type.
     CrateType(CrateTypeFilter),
+    /// True if this crate's auxiliary cargo targets include the given kind.
+    TargetKind(TargetKindFilter),
     /// True if this crate lives in a standalone (single-crate) workspace.
     Standalone,
     /// True if the inner condition evaluates to false.
@@ -110,8 +135,10 @@ pub enum CrateCondition {
 pub enum CrateSelectCondition {
     /// True if the crate lives in a standalone (single-crate) workspace.
     Standalone,
-    /// True if the crate matches the given type filter.
+    /// True if the crate's compile-time output kinds include the given type.
     CrateType(CrateTypeFilter),
+    /// True if the crate's auxiliary cargo targets include the given kind.
+    TargetKind(TargetKindFilter),
     /// True if the inner condition evaluates to false.
     Not(Box<Self>),
     /// True if all inner conditions evaluate to true (short-circuits on first false).
@@ -125,6 +152,7 @@ impl std::fmt::Display for CrateCondition {
         match self {
             Self::Common(inner) => write!(f, "{inner}"),
             Self::CrateType(filter) => write!(f, "type == {filter}"),
+            Self::TargetKind(filter) => write!(f, "target_kind == {filter}"),
             Self::Standalone => write!(f, "standalone"),
             Self::Not(inner) => write!(f, "!{inner}"),
             Self::And(conditions) => {

@@ -174,9 +174,14 @@ pub struct Crate {
     pub manifest_dir: PathBuf,
     /// the directory that contains the workspace Cargo.toml file for this crate
     pub workspace_manifest_dir: PathBuf,
-    /// the types of this crate (a package routinely has multiple kinds
-    /// alongside `lib`/`bin` — e.g. `custom_build`, `test`, `example`)
-    pub types: BTreeSet<crate::targets::CrateType>,
+    /// the compile-time output kinds of this crate (e.g. `bin`, `lib`,
+    /// `proc-macro`). May be empty for packages that only declare auxiliary
+    /// targets.
+    pub crate_types: BTreeSet<crate::targets::CrateType>,
+    /// the auxiliary cargo target kinds attached to this package (e.g. `test`,
+    /// `bench`, `example`, `custom_build`). Almost every normal package has at
+    /// least `Test`.
+    pub target_kinds: BTreeSet<crate::targets::TargetKind>,
 }
 
 /// represents the cargo-for-each configuration file
