@@ -60,6 +60,9 @@ pub enum Error {
     /// error writing config file
     #[error("error writing config file: {0}")]
     CouldNotWriteConfigFile(#[source] std::io::Error),
+    /// could not open or acquire the config-directory lock file
+    #[error("could not acquire config lock at {0}: {1}")]
+    CouldNotAcquireConfigLock(std::path::PathBuf, #[source] std::io::Error),
     /// the specified task was not found
     #[error("the specified task {0} was not found")]
     TaskNotFound(String),

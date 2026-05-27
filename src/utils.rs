@@ -86,28 +86,61 @@ use crate::Environment;
 use crate::error::Error;
 use std::process::{Command, Output, Stdio};
 
-/// Writes `contents` to `path`, then tightens the file's permissions to mode 0o600 on Unix.
+/// Writes `contents` to `path` *atomically* via a same-directory temp file +
+/// rename. On Unix the temp file is created with mode 0o600; on Windows the
+/// destination inherits the parent directory's ACL.
 ///
-/// On non-Unix platforms this is equivalent to `fs_err::write` (the OS default ACL applies).
+/// Atomicity matters because a crash, `^C`, or ENOSPC between truncate and the
+/// final byte of a plain `open(O_TRUNC) + write` would leave the destination
+/// truncated or empty — and several callers (the global config file, task
+/// state files like `exit_status`, snapshot blobs) treat an empty file as a
+/// valid-but-empty value, silently losing the user's data.
 ///
-/// Use for any state, config, or snapshot file under the user's config or state directory —
-/// these may contain command lines, env-file paths, or program contents that should not be
-/// exposed to other local users.
+/// Use for any state, config, or snapshot file under the user's config or
+/// state directory — these may contain command lines, env-file paths, or
+/// program contents that should not be exposed to other local users.
+///
+/// The destination's parent directory must already exist; callers create it
+/// with [`create_user_dir_all`] as needed.
 ///
 /// # Errors
 ///
-/// Returns the I/O error if the file cannot be written or its permissions cannot be set.
+/// Returns the I/O error if the temp file cannot be created or written, if
+/// `path`'s parent cannot be determined, if permissions cannot be tightened,
+/// or if the atomic-rename step fails.
 pub fn write_user_file(
     path: impl AsRef<std::path::Path>,
     contents: impl AsRef<[u8]>,
 ) -> std::io::Result<()> {
+    use std::io::Write as _;
     let path = path.as_ref();
-    fs_err::write(path, contents)?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "write_user_file: target path has no parent directory: {}",
+                path.display()
+            ),
+        )
+    })?;
+
+    // `tempfile::NamedTempFile::new_in` creates with mode 0o600 on Unix and
+    // with the parent directory's default ACL on Windows, matching what we
+    // want for the final file. We write the full contents, then atomically
+    // rename via persist().
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(contents.as_ref())?;
+    // Re-assert 0o600 explicitly: if the temp file existed earlier (in
+    // practice it shouldn't, since NamedTempFile uses O_EXCL) or if the
+    // platform's umask widened the create-mode, this guarantees the final
+    // file has the owner-only bits set before it becomes visible at `path`.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        fs_err::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
 
@@ -233,7 +266,7 @@ mod tests {
     use super::command_is_executable;
     use crate::Environment;
     #[cfg(unix)]
-    use pretty_assertions::assert_eq;
+    use pretty_assertions::{assert_eq, assert_ne};
     use tempfile::tempdir;
 
     fn env_with_paths(paths: Vec<std::path::PathBuf>) -> Environment {
@@ -338,6 +371,29 @@ mod tests {
         super::write_user_file(&path, b"new")?;
         let mode = fs_err::metadata(&path)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected 0o600, got {mode:o}");
+        Ok(())
+    }
+
+    /// `write_user_file` replaces the destination via rename, so the new
+    /// contents land at a different inode than the old contents. This locks
+    /// in the temp-file-then-rename approach against accidental regressions
+    /// to a plain `open(O_TRUNC) + write` that would share the inode.
+    #[cfg(unix)]
+    #[test]
+    fn write_user_file_replaces_via_rename() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt as _;
+        let temp = tempdir()?;
+        let path = temp.path().join("inode_check.toml");
+        fs_err::write(&path, b"old contents")?;
+        let inode_before = fs_err::metadata(&path)?.ino();
+        super::write_user_file(&path, b"new contents")?;
+        let inode_after = fs_err::metadata(&path)?.ino();
+        assert_ne!(
+            inode_before, inode_after,
+            "write_user_file must rename a fresh inode into place, not overwrite in-place"
+        );
+        let contents = fs_err::read_to_string(&path)?;
+        assert_eq!(contents, "new contents");
         Ok(())
     }
 

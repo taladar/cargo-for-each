@@ -216,6 +216,10 @@ pub async fn add_command(
     add_parameters: AddParameters,
     environment: crate::Environment,
 ) -> Result<(), crate::error::Error> {
+    // Hold the config lock for the entire load → cargo-metadata → mutate →
+    // save cycle. Without it, two concurrent `target add` invocations both
+    // load the same baseline and the later save drops the earlier entry.
+    let _lock = crate::ConfigLock::acquire(&environment)?;
     let mut config = crate::Config::load(&environment)?;
     let manifest_path =
         std::path::absolute(add_parameters.manifest_path.clone()).map_err(|err| {
@@ -348,6 +352,7 @@ pub async fn remove_command(
     remove_parameters: RemoveParameters,
     environment: crate::Environment,
 ) -> Result<(), crate::error::Error> {
+    let _lock = crate::ConfigLock::acquire(&environment)?;
     let mut config = crate::Config::load(&environment)?;
     let manifest_path =
         std::path::absolute(remove_parameters.manifest_path.clone()).map_err(|err| {
@@ -422,6 +427,7 @@ fn cargo_toml_present(manifest_dir: &Path) -> bool {
 /// This command can fail due to issues with loading or saving the configuration, errors during cargo metadata execution, if expected packages are not found in cargo metadata output, or other file system errors during config saving.
 #[instrument]
 pub async fn refresh_command(environment: crate::Environment) -> Result<(), crate::error::Error> {
+    let _lock = crate::ConfigLock::acquire(&environment)?;
     let mut config = crate::Config::load(&environment)?;
 
     // 1. Remove workspaces that no longer exist.

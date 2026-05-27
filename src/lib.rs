@@ -267,6 +267,75 @@ impl Config {
     }
 }
 
+/// RAII guard holding an exclusive advisory lock on the sidecar lock file
+/// at `<config_dir>/cargo-for-each.lock` for the lifetime of the guard.
+///
+/// Wrap any load-modify-save sequence on the global config (`target add`,
+/// `target remove`, `target refresh`, future commands) in:
+///
+/// ```ignore
+/// let _lock = ConfigLock::acquire(&environment)?;
+/// let mut config = Config::load(&environment)?;
+/// // … mutate …
+/// config.save(&environment)?;
+/// ```
+///
+/// Concurrent invocations block at `acquire` until the previous one drops
+/// its guard, eliminating the last-writer-wins race where two `target add`
+/// calls both read the same baseline and one's entry gets dropped.
+///
+/// The lock is advisory (`std::fs::File::lock`, stabilised in Rust 1.89) —
+/// processes that bypass `ConfigLock` are not blocked. Releasing happens
+/// automatically on drop; no explicit unlock is required.
+#[derive(Debug)]
+#[must_use = "the lock is released as soon as the guard is dropped"]
+pub struct ConfigLock {
+    /// Held only to keep the OS-level lock alive; never read.
+    _file: fs_err::File,
+}
+
+impl ConfigLock {
+    /// Acquire an exclusive lock on the per-config lock file, blocking until
+    /// the lock is available.
+    ///
+    /// Creates the lock file (and any missing parent directories) on first
+    /// use with mode 0o600 / 0o700 respectively.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config directory cannot be created, the lock
+    /// file cannot be opened, or the kernel lock call fails.
+    pub fn acquire(environment: &Environment) -> Result<Self, crate::error::Error> {
+        let lock_path = config_dir_path(environment).join("cargo-for-each.lock");
+        if let Some(parent) = lock_path.parent() {
+            crate::utils::create_user_dir_all(parent)
+                .map_err(crate::error::Error::CouldNotCreateConfigFileParentDirs)?;
+        }
+        // An empty lock file is sufficient as a sync primitive; we never read
+        // or write its contents. `truncate(false)` keeps it empty across runs
+        // without destroying anything users might place there.
+        let file = fs_err::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| crate::error::Error::CouldNotAcquireConfigLock(lock_path.clone(), e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Best-effort tightening; an error here (e.g. the lock file
+            // pre-exists with non-modifiable perms) is not worth aborting
+            // the whole load/modify/save flow over.
+            let _result = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        file.file()
+            .lock()
+            .map_err(|e| crate::error::Error::CouldNotAcquireConfigLock(lock_path, e))?;
+        Ok(Self { _file: file })
+    }
+}
+
 /// returns the config dir path
 #[must_use]
 pub fn config_dir_path(environment: &Environment) -> PathBuf {
@@ -281,6 +350,11 @@ pub fn config_file(environment: &Environment) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::panic,
+        reason = "test helpers panic on unexpected match arms; clearer than assert with message"
+    )]
+
     use super::*;
     use crate::{
         targets::{
@@ -721,6 +795,79 @@ mod tests {
             "expected SomeStepsFailed with keep_going=true on a failing step, got {result:?}"
         );
 
+        Ok(())
+    }
+
+    // ── ConfigLock ─────────────────────────────────────────────────────────────
+
+    /// While a `ConfigLock` is held, a second `try_lock` on the same lock
+    /// file path returns `WouldBlock`. Once the first guard is dropped, the
+    /// second attempt succeeds.
+    ///
+    /// This is the property that makes concurrent `target add` invocations
+    /// serialize: the second process blocks at `ConfigLock::acquire` until
+    /// the first finishes its load → modify → save cycle.
+    #[test]
+    fn config_lock_blocks_concurrent_acquire() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+
+        let lock_path = config_dir_path(&environment).join("cargo-for-each.lock");
+        // First guard takes the lock.
+        let guard = ConfigLock::acquire(&environment)?;
+
+        // Open the same lock file with a separate handle and confirm we
+        // cannot acquire the exclusive lock — i.e. the OS reports
+        // contention, mirroring what a second process would see.
+        let probe = fs_err::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        match probe.file().try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => {
+                // Expected: another holder already has the exclusive lock.
+            }
+            Ok(()) => panic!("expected try_lock to report WouldBlock while ConfigLock is held"),
+            Err(std::fs::TryLockError::Error(e)) => {
+                panic!("unexpected try_lock I/O error: {e}")
+            }
+        }
+
+        // Drop the first guard and confirm the lock becomes acquirable.
+        drop(guard);
+        // The probe handle is still open; another try_lock must now succeed.
+        match probe.file().try_lock() {
+            Ok(()) => {
+                // Expected: we got the lock.
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                panic!("lock should be available after the first guard was dropped")
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                panic!("unexpected try_lock I/O error: {e}")
+            }
+        }
+        Ok(())
+    }
+
+    /// `ConfigLock::acquire` creates the config directory and the lock file
+    /// on first use, so callers don't need to pre-create anything.
+    #[test]
+    fn config_lock_creates_lock_file_and_parent_dirs() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+        let lock_path = config_dir_path(&environment).join("cargo-for-each.lock");
+        assert!(
+            !lock_path.exists(),
+            "precondition: lock file should not exist yet"
+        );
+        let _guard = ConfigLock::acquire(&environment)?;
+        assert!(
+            lock_path.exists(),
+            "ConfigLock::acquire should have created the lock file"
+        );
         Ok(())
     }
 }
