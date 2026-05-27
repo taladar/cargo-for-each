@@ -198,8 +198,13 @@ and let a suspended target resume on the next invocation.
 
 #### `task rewind single-step`
 
-Undo the last completed statement across all targets. The state for that
-statement is deleted so it will be re-executed on the next run.
+Undo the last completed statement of the most recently rewindable target.
+Targets are searched in reverse iteration order — standalone crates first
+(highest index first), then workspaces (highest index first) — and the first
+target with completed work has its last completed statement deleted so it
+will be re-executed on the next run. With `--jobs > 1` the search order is
+**not** wall-clock "last finished"; it follows the target index, which can
+differ from completion time when targets run in parallel.
 
 | Flag | Description |
 |------|-------------|
@@ -207,8 +212,11 @@ statement is deleted so it will be re-executed on the next run.
 
 #### `task rewind single-target`
 
-Undo all completed statements for the last target that finished, resetting it
-to the beginning.
+Reset the most recently rewindable target to the beginning. The target is
+chosen the same way as for `rewind single-step` — reverse iteration order,
+standalone crates before workspaces — so with `--jobs > 1` this is not
+necessarily the target that finished last by wall-clock time. All execution
+state for the chosen target is deleted.
 
 | Flag | Description |
 |------|-------------|
