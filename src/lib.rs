@@ -5,6 +5,9 @@
 //! (cargo-for-each) text files and executed against registered target
 //! workspaces and crates.
 
+/// Implements the `check` subcommand: a read-only audit that reports
+/// target/task/config inconsistencies without mutating anything.
+pub mod check;
 /// Handles application-specific errors.
 pub mod error;
 /// Implements the `.cfe` program language: AST, parser, evaluation, and resolution.
@@ -28,6 +31,8 @@ pub enum Command {
     Target(crate::targets::TargetParameters),
     /// manage tasks
     Task(crate::tasks::TaskParameters),
+    /// Audit the configuration and on-disk state for inconsistencies. Read-only.
+    Check(crate::check::CheckParameters),
 
     /// Generate man page
     GenerateManpage {
@@ -140,6 +145,9 @@ pub async fn run_app(
         }
         Command::Task(task_parameters) => {
             crate::tasks::task_command(task_parameters, environment).await?;
+        }
+        Command::Check(check_parameters) => {
+            crate::check::check_command(check_parameters, environment).await?;
         }
 
         Command::GenerateManpage { output_dir } => {

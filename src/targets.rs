@@ -103,6 +103,10 @@ pub struct ListParameters {
 
 /// implementation of the list subcommand
 ///
+/// Lists only well-formed entries: crates whose `workspace_manifest_dir` is
+/// no longer registered (orphans) are silently skipped. Use
+/// `cargo-for-each check` to discover orphans and other configuration drift.
+///
 /// # Stability
 ///
 /// The line format printed to stdout — currently
@@ -158,23 +162,19 @@ pub async fn list_command(
                 {
                     continue;
                 }
-                if let Some(standalone) = params.standalone {
-                    match workspace_standalone_map.get(&krate.workspace_manifest_dir) {
-                        // Known workspace: respect the filter.
-                        Some(&is_standalone) if is_standalone != standalone => continue,
-                        Some(_) => {}
-                        // Orphan crate: workspace was removed from config but
-                        // the crate entry still references it. The user is
-                        // likely filtering precisely to find these, so we
-                        // surface the orphan rather than silently hiding it.
-                        None => {
-                            tracing::warn!(
-                                "Crate {} references unknown workspace {} (listing as orphan)",
-                                krate.manifest_dir.display(),
-                                krate.workspace_manifest_dir.display(),
-                            );
-                        }
-                    }
+                // Orphan crates (workspace_manifest_dir not registered) are
+                // never listed — they would bypass the `--standalone` filter
+                // and visually masquerade as well-formed entries.  Discover
+                // them via `cargo-for-each check` instead.
+                let Some(&is_standalone) =
+                    workspace_standalone_map.get(&krate.workspace_manifest_dir)
+                else {
+                    continue;
+                };
+                if let Some(requested) = params.standalone
+                    && is_standalone != requested
+                {
+                    continue;
                 }
                 if krate.manifest_dir == krate.workspace_manifest_dir {
                     println!(
@@ -410,7 +410,7 @@ pub async fn remove_command(
 /// I/O error (permission denied, broken mount, etc.) is logged and the
 /// entry is kept, since silently dropping a config entry on a transient
 /// failure is destructive.
-fn cargo_toml_present(manifest_dir: &Path) -> bool {
+pub(crate) fn cargo_toml_present(manifest_dir: &Path) -> bool {
     let cargo_toml = manifest_dir.join("Cargo.toml");
     match fs_err::symlink_metadata(&cargo_toml) {
         Ok(_) => true,

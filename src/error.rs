@@ -180,6 +180,17 @@ pub enum Error {
     /// some steps failed
     #[error("some steps failed")]
     SomeStepsFailed,
+    /// `check` surfaced one or more error-severity findings; the user-facing
+    /// messages have already been printed before this variant is returned.
+    /// Exists so the binary exits non-zero on errors and so callers can
+    /// distinguish check failures from other errors.
+    #[error("check found {errors} error(s) and {warnings} warning(s)")]
+    CheckFoundIssues {
+        /// number of error-severity findings printed
+        errors: usize,
+        /// number of warning-severity findings printed
+        warnings: usize,
+    },
     /// circular dependency or deadlock detected
     #[error("circular dependency or deadlock detected")]
     CircularDependency,
