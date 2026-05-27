@@ -155,7 +155,8 @@ fn padding<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Rich<'src, cha
 // ─── String literals ──────────────────────────────────────────────────────────
 
 /// Parses a double-quoted string literal, returning the unescaped content as a
-/// `String`.  Currently the only supported escape sequence is `\"`.
+/// `String`.  Supported escape sequences are `\"` (literal double quote) and
+/// `\\` (literal backslash); no others are recognised.
 ///
 /// Note: unlike a typical literal parser, this consumes surrounding [`padding`]
 /// (whitespace and `// …` line comments) on both sides via `padded_by`. As a
@@ -165,7 +166,7 @@ fn padding<'src>() -> impl Parser<'src, &'src str, (), extra::Err<Rich<'src, cha
 /// build it from the inner `just('"') … just('"')` primitives directly.
 fn string_literal<'src>()
 -> impl Parser<'src, &'src str, String, extra::Err<Rich<'src, char>>> + Clone {
-    let escape = just('\\').ignore_then(just('"').to('"'));
+    let escape = just('\\').ignore_then(just('"').to('"').or(just('\\').to('\\')));
     let regular = none_of("\"\\");
     just('"')
         .ignore_then(escape.or(regular).repeated().collect::<String>())
@@ -1077,6 +1078,31 @@ mod tests {
             },
             _ => panic!("expected ForWorkspace"),
         }
+    }
+
+    #[test]
+    fn string_with_escaped_backslash() {
+        // `\\` in source -> single backslash in the parsed string; covers the
+        // Windows-path case `with_env_file "C:\\creds\\.env"`.
+        let prog = parse_ok(r#"for workspace { with_env_file "C:\\creds\\.env" { run "true"; } }"#);
+        match &prog.statements[0] {
+            GlobalStatement::ForWorkspace(b) => match &b.statements[0] {
+                WorkspaceStatement::WithEnvFile(block) => {
+                    assert_eq!(block.env_file, r"C:\creds\.env");
+                }
+                _ => panic!("expected WithEnvFile"),
+            },
+            _ => panic!("expected ForWorkspace"),
+        }
+    }
+
+    #[test]
+    fn bare_backslash_in_string_is_still_rejected() {
+        // Only `\"` and `\\` are recognised escapes — every other `\<char>`
+        // sequence must still fail to parse so an unrecognised escape
+        // surfaces as an error instead of being silently passed through.
+        let src = r#"for workspace { manual_step "T" "bad: \x"; }"#;
+        parse(src, "test.cfe").unwrap_err();
     }
 
     #[test]

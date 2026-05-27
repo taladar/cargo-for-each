@@ -58,13 +58,18 @@ select workspaces;  // inline comment
 
 ### String literals
 
-All string parameters are **double-quoted**. The only supported escape
-sequence inside a string is `\"` (a literal double-quote character).
+All string parameters are **double-quoted**. Two escape sequences are
+recognised inside a string: `\"` (a literal double-quote character) and
+`\\` (a literal backslash). No others are accepted — in particular a
+lone `\` followed by anything other than `"` or `\` is a parse error,
+so Windows-style paths must be written with `\\` between segments:
+`"C:\\path\\to\\file.env"`.
 
 ```text
 "hello world"
 "path/to/file.env"
 "She said \"hello\""
+"C:\\Users\\me\\.cargo\\config.toml"
 ```
 
 ---
