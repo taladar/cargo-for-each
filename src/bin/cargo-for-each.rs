@@ -1,9 +1,49 @@
 #![doc = include_str!("../../README.md")]
 
+use std::ffi::{OsStr, OsString};
+
 use tracing_subscriber::{
     EnvFilter, Layer as _, Registry, filter::LevelFilter, layer::SubscriberExt as _,
     util::SubscriberInitExt as _,
 };
+
+/// Cargo invokes external subcommands with the subcommand name as `argv[1]`:
+/// `cargo for-each foo bar` runs `cargo-for-each for-each foo bar`. If we
+/// hand that to clap unchanged, clap sees `for-each` as the first
+/// positional/subcommand and errors out. This helper detects that case,
+/// drops `argv[1]`, and reports whether it did so — so the caller can
+/// override `bin_name` for help/usage text.
+///
+/// `argv[0]` (the program name) is always preserved; only the literal
+/// `argv[1] == "for-each"` is filtered. Later positional values equal to
+/// `"for-each"` (e.g. `cargo-for-each task create --name for-each`) are
+/// left alone.
+fn rewrite_argv_for_cargo_subcommand<I, S>(args: I) -> (bool, Vec<OsString>)
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let mut iter = args.into_iter().map(Into::into);
+    let Some(arg0) = iter.next() else {
+        return (false, Vec::new());
+    };
+    match iter.next() {
+        Some(arg1) if arg1 == OsStr::new("for-each") => {
+            let mut out: Vec<OsString> = Vec::new();
+            out.push(arg0);
+            out.extend(iter);
+            (true, out)
+        }
+        Some(arg1) => {
+            let mut out: Vec<OsString> = Vec::with_capacity(2);
+            out.push(arg0);
+            out.push(arg1);
+            out.extend(iter);
+            (false, out)
+        }
+        None => (false, vec![arg0]),
+    }
+}
 
 /// The main behavior of the binary should go here
 ///
@@ -11,7 +51,16 @@ use tracing_subscriber::{
 ///
 /// fails if the main behavior of the application fails
 async fn do_stuff() -> Result<(), cargo_for_each::error::Error> {
-    let options = <cargo_for_each::Options as clap::Parser>::parse();
+    let (is_cargo_subcommand, argv) = rewrite_argv_for_cargo_subcommand(std::env::args_os());
+    let mut cmd = <cargo_for_each::Options as clap::CommandFactory>::command();
+    if is_cargo_subcommand {
+        // Cosmetic: makes `cargo for-each --help` print
+        // `Usage: cargo for-each ...` instead of `Usage: cargo-for-each ...`.
+        cmd = cmd.bin_name("cargo for-each");
+    }
+    let matches = cmd.get_matches_from(argv);
+    let options = <cargo_for_each::Options as clap::FromArgMatches>::from_arg_matches(&matches)
+        .unwrap_or_else(|e| e.exit());
     tracing::debug!("{:#?}", options);
 
     let environment = cargo_for_each::Environment::new()?;
@@ -81,6 +130,96 @@ async fn main() -> Result<(), cargo_for_each::error::Error> {
 
 #[cfg(test)]
 mod test {
-    //use super::*;
-    //use pretty_assertions::{assert_eq, assert_ne};
+    #![expect(
+        clippy::panic,
+        reason = "test helpers panic on unexpected inputs that should never appear in fixtures"
+    )]
+
+    use super::rewrite_argv_for_cargo_subcommand;
+    use pretty_assertions::assert_eq;
+
+    /// Convenience: invoke the helper with `&str` arguments and unwrap the
+    /// `OsString` result back to `String` for easy comparison.
+    fn rewrite(args: &[&str]) -> (bool, Vec<String>) {
+        let (flag, argv) = rewrite_argv_for_cargo_subcommand(args.iter().copied());
+        let argv_strings: Vec<String> = argv
+            .into_iter()
+            .map(|s| {
+                s.into_string()
+                    .unwrap_or_else(|os| panic!("test args must be UTF-8: {os:?}"))
+            })
+            .collect();
+        (flag, argv_strings)
+    }
+
+    #[test]
+    fn empty_argv_passes_through_unchanged() {
+        let (is_cargo, argv) = rewrite(&[]);
+        assert!(!is_cargo);
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn program_name_only_passes_through_unchanged() {
+        let (is_cargo, argv) = rewrite(&["cargo-for-each"]);
+        assert!(!is_cargo);
+        assert_eq!(argv, vec!["cargo-for-each".to_owned()]);
+    }
+
+    #[test]
+    fn direct_invocation_with_subcommand_passes_through_unchanged() {
+        let (is_cargo, argv) = rewrite(&["cargo-for-each", "task", "list"]);
+        assert!(!is_cargo);
+        assert_eq!(
+            argv,
+            vec![
+                "cargo-for-each".to_owned(),
+                "task".to_owned(),
+                "list".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_invocation_strips_for_each_and_reports_true() {
+        // What cargo gives us when the user runs `cargo for-each task list`.
+        let (is_cargo, argv) = rewrite(&["cargo-for-each", "for-each", "task", "list"]);
+        assert!(is_cargo);
+        assert_eq!(
+            argv,
+            vec![
+                "cargo-for-each".to_owned(),
+                "task".to_owned(),
+                "list".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn for_each_as_value_in_later_position_is_preserved() {
+        // The literal "for-each" appears as a `--name` value, not at
+        // position 1: must not be stripped.
+        let (is_cargo, argv) = rewrite(&["cargo-for-each", "task", "create", "--name", "for-each"]);
+        assert!(!is_cargo);
+        assert_eq!(
+            argv,
+            vec![
+                "cargo-for-each".to_owned(),
+                "task".to_owned(),
+                "create".to_owned(),
+                "--name".to_owned(),
+                "for-each".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_invocation_with_no_subcommand_after_for_each_still_strips() {
+        // `cargo for-each` with no further args: helper still strips the
+        // trigger token so clap can produce a proper "missing subcommand"
+        // error instead of a confusing "unknown subcommand 'for-each'" one.
+        let (is_cargo, argv) = rewrite(&["cargo-for-each", "for-each"]);
+        assert!(is_cargo);
+        assert_eq!(argv, vec!["cargo-for-each".to_owned()]);
+    }
 }
