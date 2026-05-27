@@ -121,11 +121,11 @@ pub async fn list_command(
     list_parameters: ListParameters,
     environment: crate::Environment,
 ) -> Result<(), crate::error::Error> {
-    #[expect(clippy::print_stderr, reason = "This is part of the UI, not logging")]
-    let Ok(config) = crate::Config::load(&environment) else {
-        eprintln!("No config file found, nothing to list");
-        return Ok(());
-    };
+    // `Config::load` already returns `Ok(Self::default())` for a missing
+    // file, so the only ways to get `Err` here are real failures —
+    // permission-denied reads, other I/O errors, or malformed TOML — which
+    // the user should see, not have silently swallowed as "no config".
+    let config = crate::Config::load(&environment)?;
     #[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
     match list_parameters.target_filter {
         TargetFilter::Workspaces(params) => {
