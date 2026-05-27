@@ -280,6 +280,38 @@ Generate shell completion scripts.
 cargo install cargo-for-each
 ```
 
+## Logging
+
+`cargo-for-each` emits structured logs through `tracing` to up to three sinks,
+each filtered by its own environment variable:
+
+| Sink | Env var | Default level | Notes |
+|------|---------|---------------|-------|
+| terminal (stderr) | `RUST_LOG` | `warn` | shown to the user during a run |
+| log file | `CARGO_FOR_EACH_LOG` | `trace` | only written when `CARGO_FOR_EACH_LOG_DIR` is set |
+| journald (Linux only) | `CARGO_FOR_EACH_JOURNALD_LOG` | `info` | always on when journald's socket is reachable |
+
+Each top-level command is wrapped in `#[tracing::instrument]`, so at the
+default journald level the command name **and all of its arguments** —
+including the value of `--manifest-path`, `--program`, `--name`, etc. —
+are recorded in journald. The same arguments are visible to anything
+that can read `/proc/<pid>/cmdline` while the process is running, but
+journald keeps them long after the process exits, so paths a user
+typed once may persist there indefinitely.
+
+This is not a security boundary failure (journald entries are not more
+broadly readable than the command line itself) — it's a verbosity /
+retention note. If you want to keep journald free of `cargo-for-each`
+argument traces:
+
+- raise the threshold:
+  `CARGO_FOR_EACH_JOURNALD_LOG=warn cargo-for-each …`, or
+- shadow it for the whole shell session:
+  `export CARGO_FOR_EACH_JOURNALD_LOG=warn`.
+
+`RUST_LOG=warn` and `CARGO_FOR_EACH_LOG=warn` apply the same filtering
+to the other two sinks if needed.
+
 ## Further Reading
 
 - [`.cfe` Language Reference](doc/cfe-language.md) — full syntax reference for
