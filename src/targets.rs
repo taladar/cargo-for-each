@@ -375,7 +375,8 @@ pub async fn remove_command(
     // Filter out the workspace if it matches the manifest_dir
     let initial_workspace_count = config.workspaces.len();
     config.workspaces.retain(|w| w.manifest_dir != manifest_dir);
-    if config.workspaces.len() < initial_workspace_count {
+    let removed_workspace = config.workspaces.len() < initial_workspace_count;
+    if removed_workspace {
         tracing::debug!("Removed workspace at {}", manifest_dir.display());
     } else {
         tracing::warn!("No workspace found at {}", manifest_dir.display());
@@ -386,10 +387,15 @@ pub async fn remove_command(
     config
         .crates
         .retain(|c| c.manifest_dir != manifest_dir && c.workspace_manifest_dir != manifest_dir);
-    if config.crates.len() < initial_crate_count {
+    let removed_crate = config.crates.len() < initial_crate_count;
+    if removed_crate {
         tracing::debug!("Removed crates associated with {}", manifest_dir.display());
     } else {
         tracing::warn!("No crates found associated with {}", manifest_dir.display());
+    }
+
+    if !removed_workspace && !removed_crate {
+        return Err(crate::error::Error::TargetNotFound(manifest_path));
     }
 
     config.save(&environment)?;

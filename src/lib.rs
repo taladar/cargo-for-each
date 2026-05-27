@@ -360,8 +360,8 @@ mod tests {
     use super::*;
     use crate::{
         targets::{
-            AddParameters, ListParameters, TargetFilter, TargetParameters, TargetSubCommand,
-            WorkspaceFilterParameters,
+            AddParameters, ListParameters, RemoveParameters, TargetFilter, TargetParameters,
+            TargetSubCommand, WorkspaceFilterParameters,
         },
         tasks::{
             CreateTaskParameters, RunAllTargetsParameters, TaskParameters, TaskRunParameters,
@@ -1125,6 +1125,86 @@ mod tests {
                 .iter()
                 .any(|w| w.manifest_dir == canonical_deleted_dir),
             "no new workspace entry should have been added for a directory that no longer exists"
+        );
+        Ok(())
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_remove_returns_error_when_nothing_matched()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+        let temp_path = temp_dir.path();
+
+        // Create and register a workspace so the config file exists and is
+        // non-empty (so we'd notice an unwanted save).
+        let ws_dir = temp_path.join("ws");
+        fs_err::create_dir_all(&ws_dir)?;
+        fs_err::write(
+            ws_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\"]\nresolver = \"2\"\n",
+        )?;
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&ws_dir).args(["new", "--lib", "a"]);
+        execute_command(&mut cmd, &environment, &ws_dir)?;
+        run_app(
+            Options {
+                command: Command::Target(TargetParameters {
+                    sub_command: TargetSubCommand::Add(AddParameters {
+                        manifest_path: ws_dir.join("Cargo.toml"),
+                    }),
+                }),
+            },
+            environment.clone(),
+        )
+        .await?;
+
+        let config_before = Config::load(&environment)?;
+        let mtime_before = fs_err::metadata(config_file(&environment))?.modified()?;
+
+        // Make an unrelated Cargo.toml that's not registered.
+        let bogus_dir = temp_path.join("not-registered");
+        fs_err::create_dir_all(&bogus_dir)?;
+        fs_err::write(
+            bogus_dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )?;
+
+        let result = run_app(
+            Options {
+                command: Command::Target(TargetParameters {
+                    sub_command: TargetSubCommand::Remove(RemoveParameters {
+                        manifest_path: bogus_dir.join("Cargo.toml"),
+                    }),
+                }),
+            },
+            environment.clone(),
+        )
+        .await;
+
+        match result {
+            Err(crate::error::Error::TargetNotFound(path)) => {
+                assert_eq!(path, fs_err::canonicalize(bogus_dir.join("Cargo.toml"))?);
+            }
+            other => panic!("expected TargetNotFound, got {other:?}"),
+        }
+
+        let config_after = Config::load(&environment)?;
+        let mtime_after = fs_err::metadata(config_file(&environment))?.modified()?;
+        assert_eq!(
+            config_before.workspaces.len(),
+            config_after.workspaces.len(),
+            "config should be unchanged"
+        );
+        assert_eq!(
+            config_before.crates.len(),
+            config_after.crates.len(),
+            "config should be unchanged"
+        );
+        assert_eq!(
+            mtime_before, mtime_after,
+            "config file should not have been rewritten"
         );
         Ok(())
     }

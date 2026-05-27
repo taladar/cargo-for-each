@@ -66,6 +66,10 @@ pub enum Error {
     /// the specified task was not found
     #[error("the specified task {0} was not found")]
     TaskNotFound(String),
+    /// `target remove` was given a manifest path that matched no registered
+    /// workspace and no registered crate
+    #[error("no registered workspace or crate matches manifest path {0}")]
+    TargetNotFound(std::path::PathBuf),
     /// the supplied task name does not satisfy the validation rules
     #[error("invalid task name {0:?}: {1}")]
     InvalidTaskName(String, &'static str),
