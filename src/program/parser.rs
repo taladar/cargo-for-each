@@ -197,8 +197,13 @@ fn sym<'src>(
 /// Parses a [`WorkspaceCondition`] expression.
 ///
 /// Operator precedence: `!` (tightest) → `&&` → `||` (loosest).
-/// Includes common conditions (`ask_user`, `run`, `file_exists`, `working_directory_clean`)
-/// plus `standalone` and `has_members`.
+///
+/// Leaf conditions accepted:
+/// - common to every context: `ask_user "…"`, `run "cmd" "arg"…`,
+///   `file_exists "path"`, `working_directory_clean`,
+///   `git_config "key" == "value"`
+/// - workspace-specific: `standalone`, `has_members`
+/// - any of the above wrapped in `(...)`
 fn workspace_condition_parser<'src>()
 -> impl Parser<'src, &'src str, WorkspaceCondition, extra::Err<Rich<'src, char>>> + Clone {
     recursive(|cond| {
@@ -279,8 +284,17 @@ fn workspace_condition_parser<'src>()
 
 /// Parses a [`CrateCondition`] expression.
 ///
-/// Includes everything from [`common_condition_parser`] plus `type == bin|lib|proc_macro`
-/// and `standalone`.
+/// Operator precedence: `!` (tightest) → `&&` → `||` (loosest).
+///
+/// Leaf conditions accepted:
+/// - common to every context: `ask_user "…"`, `run "cmd" "arg"…`,
+///   `file_exists "path"`, `working_directory_clean`,
+///   `git_config "key" == "value"`
+/// - crate-specific:
+///   - `type == bin|lib|proc_macro|cdylib|dylib|rlib|staticlib`
+///   - `target_kind == bench|test|example|custom_build`
+///   - `standalone`
+/// - any of the above wrapped in `(...)`
 fn crate_condition_parser<'src>()
 -> impl Parser<'src, &'src str, CrateCondition, extra::Err<Rich<'src, char>>> + Clone {
     recursive(|cond| {
