@@ -2413,6 +2413,19 @@ pub async fn run_single_step_command(
                     let state_dir = state_base.join(next.cursor.to_path());
                     crate::utils::create_user_dir_all(&state_dir)
                         .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+                    // NOTE on a theoretical race: if a concurrent
+                    // `task continue` writes the `barrier_released` marker
+                    // between `find_next_statement` returning above and
+                    // this `println!` firing, the message below tells the
+                    // user to release a barrier that has already been
+                    // released. The next `task run` will resume past the
+                    // barrier correctly — only the message is misleading.
+                    // The window is one mkdir syscall plus a println
+                    // (sub-millisecond on local storage), and the
+                    // scenarios that trigger it (two parallel scripts, a
+                    // pre-release wrapper that races the runner) are
+                    // contrived for single-user usage. Deliberately
+                    // unfixed; do not flag.
                     println!(
                         "Wait barrier reached at {}: \"{}\". Release with `cargo-for-each task continue --name {} --cursor {}`.",
                         next.cursor.to_path_string(),
