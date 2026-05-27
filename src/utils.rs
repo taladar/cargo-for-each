@@ -16,11 +16,17 @@ pub fn command_is_executable(command: &str, environment: &crate::Environment) ->
     }
 }
 
-/// checks if the given path is an executable file
+/// Returns `true` iff the path exists, is a regular file, and is
+/// executable for at least one user (owner / group / others).
 ///
-/// on unix this checks for the executable bit, on windows it checks
-/// for valid extensions and on other platforms it just checks for
-/// the presence of a file
+/// Platform definitions of "executable":
+/// - **unix**: any of the `x` bits is set (`mode & 0o111 != 0`).
+/// - **windows**: the file's extension matches an entry in `PATHEXT`
+///   (case-insensitively); when `PATHEXT` is unset, the defaults
+///   `.COM;.EXE;.BAT;.CMD` are used.  Paths without an extension are
+///   probed by appending each `PATHEXT` entry in turn.
+/// - **other**: falls back to "file exists" — no executability
+///   information is consulted on these platforms.
 #[cfg(unix)]
 #[must_use]
 pub fn is_executable(path: &std::path::Path) -> bool {
@@ -28,11 +34,17 @@ pub fn is_executable(path: &std::path::Path) -> bool {
     fs_err::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// checks if the given path is an executable file
+/// Returns `true` iff the path exists, is a regular file, and is
+/// executable for at least one user (owner / group / others).
 ///
-/// on unix this checks for the executable bit, on windows it checks
-/// for valid extensions and on other platforms it just checks for
-/// the presence of a file
+/// Platform definitions of "executable":
+/// - **unix**: any of the `x` bits is set (`mode & 0o111 != 0`).
+/// - **windows**: the file's extension matches an entry in `PATHEXT`
+///   (case-insensitively); when `PATHEXT` is unset, the defaults
+///   `.COM;.EXE;.BAT;.CMD` are used.  Paths without an extension are
+///   probed by appending each `PATHEXT` entry in turn.
+/// - **other**: falls back to "file exists" — no executability
+///   information is consulted on these platforms.
 #[cfg(windows)]
 #[must_use]
 pub fn is_executable(path: &std::path::Path) -> bool {
@@ -70,11 +82,17 @@ pub fn is_executable(path: &std::path::Path) -> bool {
     false
 }
 
-/// checks if the given path is an executable file
+/// Returns `true` iff the path exists, is a regular file, and is
+/// executable for at least one user (owner / group / others).
 ///
-/// on unix this checks for the executable bit, on windows it checks
-/// for valid extensions and on other platforms it just checks for
-/// the presence of a file
+/// Platform definitions of "executable":
+/// - **unix**: any of the `x` bits is set (`mode & 0o111 != 0`).
+/// - **windows**: the file's extension matches an entry in `PATHEXT`
+///   (case-insensitively); when `PATHEXT` is unset, the defaults
+///   `.COM;.EXE;.BAT;.CMD` are used.  Paths without an extension are
+///   probed by appending each `PATHEXT` entry in turn.
+/// - **other**: falls back to "file exists" — no executability
+///   information is consulted on these platforms.
 #[cfg(all(not(unix), not(windows)))]
 #[must_use]
 pub fn is_executable(path: &std::path::Path) -> bool {
