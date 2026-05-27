@@ -57,6 +57,13 @@ pub fn parse(source: &str, filename: &str) -> Result<Program, Vec<ParseError>> {
     if errors.is_empty()
         && let Some(prog) = program
     {
+        // Reject programs with more than one top-level `for workspace` or
+        // more than one top-level `for crate` block. The runner uses only
+        // the first occurrence of each (see `first_workspace_stmts` /
+        // `first_crate_stmts` in `src/tasks.rs`), so silently parsing
+        // additional blocks would let users write programs that look like
+        // they should work but lose statements at runtime.
+        validate_unique_top_level_blocks(&prog)?;
         return Ok(prog);
     }
 
@@ -66,6 +73,42 @@ pub fn parse(source: &str, filename: &str) -> Result<Program, Vec<ParseError>> {
         .collect();
 
     Err(parse_errors)
+}
+
+/// Validates that a parsed program has at most one top-level `for workspace`
+/// block and at most one top-level `for crate` block.
+///
+/// Without this check, the parser accepts duplicates but the runner silently
+/// discards every block after the first — a surprising failure mode for
+/// anyone writing nontrivial programs.
+fn validate_unique_top_level_blocks(program: &Program) -> Result<(), Vec<ParseError>> {
+    let workspace_count = program
+        .statements
+        .iter()
+        .filter(|s| matches!(s, GlobalStatement::ForWorkspace(_)))
+        .count();
+    let crate_count = program
+        .statements
+        .iter()
+        .filter(|s| matches!(s, GlobalStatement::ForCrate(_)))
+        .count();
+
+    let mut errors: Vec<ParseError> = Vec::new();
+    if workspace_count > 1 {
+        errors.push(ParseError(format!(
+            "program contains {workspace_count} top-level `for workspace {{ ... }}` blocks; only one is allowed (merge their statements into a single block)"
+        )));
+    }
+    if crate_count > 1 {
+        errors.push(ParseError(format!(
+            "program contains {crate_count} top-level `for crate {{ ... }}` blocks; only one is allowed (merge their statements into a single block)"
+        )));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// Format a single chumsky `Rich` error into an ariadne diagnostic string.
@@ -1092,6 +1135,80 @@ mod tests {
         let errors = result.unwrap_err();
         assert!(!errors.is_empty());
         assert!(!errors[0].as_str().is_empty());
+    }
+
+    // ── duplicate-top-level-block rejection (KNOWN_ISSUES §11) ──────────────
+
+    #[test]
+    fn duplicate_for_workspace_block_is_rejected() {
+        let src = r#"
+            for workspace {
+                run "cargo" "check";
+            }
+            for workspace {
+                run "cargo" "test";
+            }
+        "#;
+        let errors = parse(src, "<test>").unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.as_str().contains("`for workspace")),
+            "expected duplicate-block error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_for_crate_block_is_rejected() {
+        let src = r#"
+            for crate {
+                run "cargo" "build";
+            }
+            for crate {
+                run "cargo" "test";
+            }
+        "#;
+        let errors = parse(src, "<test>").unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.as_str().contains("`for crate")),
+            "expected duplicate-block error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn one_for_workspace_and_one_for_crate_is_accepted() {
+        let src = r#"
+            for workspace {
+                run "cargo" "check";
+            }
+            for crate {
+                run "cargo" "build";
+            }
+        "#;
+        let program = parse_ok(src);
+        let workspace_blocks = program
+            .statements
+            .iter()
+            .filter(|s| matches!(s, GlobalStatement::ForWorkspace(_)))
+            .count();
+        let crate_blocks = program
+            .statements
+            .iter()
+            .filter(|s| matches!(s, GlobalStatement::ForCrate(_)))
+            .count();
+        assert_eq!(workspace_blocks, 1);
+        assert_eq!(crate_blocks, 1);
+    }
+
+    /// Both kinds of duplication produce errors when present together.
+    #[test]
+    fn duplicates_of_both_kinds_produce_two_errors() {
+        let src = r#"
+            for workspace { run "a"; }
+            for workspace { run "b"; }
+            for crate { run "c"; }
+            for crate { run "d"; }
+        "#;
+        let errors = parse(src, "<test>").unwrap_err();
+        assert_eq!(errors.len(), 2);
     }
 
     #[test]
