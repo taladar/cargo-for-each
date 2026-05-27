@@ -466,56 +466,89 @@ fn is_wait_barrier_released(state_dir: &Path) -> bool {
     state_dir.join("barrier_released").exists()
 }
 
-/// Returns `true` if all crate statements in `stmts` under `prefix` are completed.
+/// Reads the `chosen_branch` marker for the given `if`-block state directory.
+///
+/// Returns `Ok(None)` only for the *NotFound* case — the marker has not been
+/// written yet, so no branch was chosen. Any other I/O error (permission
+/// denied, ENOTDIR, invalid UTF-8, etc.) propagates as
+/// [`Error::CouldNotReadStateFile`]. Distinguishing the two prevents a
+/// transient glitch from silently re-running the if-block's branch
+/// evaluation, which can pick a different branch than originally chosen
+/// (because `ask_user` and `run`-style conditions are not deterministic) and
+/// overwrite the on-disk `chosen_branch` file.
+fn read_chosen_branch(state_dir: &Path) -> Result<Option<String>, Error> {
+    let path = state_dir.join("chosen_branch");
+    match fs_err::read_to_string(&path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::CouldNotReadStateFile(path, e)),
+    }
+}
+
+/// Returns `Ok(true)` if all crate statements in `stmts` under `prefix` are
+/// completed; `Ok(false)` if any are incomplete; `Err(...)` only on a real
+/// I/O failure reading state files (a missing marker is not an error — it
+/// just means "not completed").
 fn is_crate_stmts_completed(
     stmts: &[CrateStatement],
     prefix: &ProgramCursor,
     state_base: &Path,
-) -> bool {
-    stmts.iter().enumerate().all(|(i, stmt)| {
+) -> Result<bool, Error> {
+    for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
-        is_crate_stmt_completed(stmt, &cursor, state_base)
-    })
+        if !is_crate_stmt_completed(stmt, &cursor, state_base)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-/// Returns `true` if the given crate statement at `cursor` is completed.
+/// Returns `Ok(true)` if the given crate statement at `cursor` is completed;
+/// `Ok(false)` if not; `Err(...)` only on a real I/O failure (not on a
+/// missing state marker).
 fn is_crate_stmt_completed(
     stmt: &CrateStatement,
     cursor: &ProgramCursor,
     state_base: &Path,
-) -> bool {
+) -> Result<bool, Error> {
     let state_dir = state_base.join(cursor.to_path());
     match stmt {
-        CrateStatement::Run(_) => is_run_completed(&state_dir),
-        CrateStatement::ManualStep(_) => is_manual_completed(&state_dir),
-        CrateStatement::SnapshotMetadata(_) => is_snapshot_metadata_completed(&state_dir),
+        CrateStatement::Run(_) => Ok(is_run_completed(&state_dir)),
+        CrateStatement::ManualStep(_) => Ok(is_manual_completed(&state_dir)),
+        CrateStatement::SnapshotMetadata(_) => Ok(is_snapshot_metadata_completed(&state_dir)),
         CrateStatement::If(block) => {
-            let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) else {
-                return false;
+            let Some(chosen) = read_chosen_branch(&state_dir)? else {
+                return Ok(false);
             };
             match chosen.trim() {
-                "none" => true,
+                "none" => Ok(true),
                 "else" => {
                     let p = cursor.clone().with(CursorSegment::ElseBranch);
                     is_crate_stmts_completed(&block.else_statements, &p, state_base)
                 }
-                s => s.parse::<usize>().is_ok_and(|n| {
-                    block.branches.get(n).is_some_and(|branch| {
-                        let p = cursor.clone().with(CursorSegment::IfBranch(n));
-                        is_crate_stmts_completed(&branch.statements, &p, state_base)
-                    })
-                }),
+                s => match s.parse::<usize>() {
+                    Ok(n) => match block.branches.get(n) {
+                        Some(branch) => {
+                            let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                            is_crate_stmts_completed(&branch.statements, &p, state_base)
+                        }
+                        None => Ok(false),
+                    },
+                    Err(_) => Ok(false),
+                },
             }
         }
         CrateStatement::WithEnvFile(block) => {
             let p = cursor.clone().with(CursorSegment::WithEnvFile);
             is_crate_stmts_completed(&block.statements, &p, state_base)
         }
-        CrateStatement::WaitForContinue(_) => is_wait_barrier_released(&state_dir),
+        CrateStatement::WaitForContinue(_) => Ok(is_wait_barrier_released(&state_dir)),
     }
 }
 
-/// Returns `true` if all workspace statements in `stmts` under `prefix` are completed.
+/// Returns `Ok(true)` if all workspace statements in `stmts` under `prefix`
+/// are completed; `Ok(false)` if any are incomplete; `Err(...)` only on a
+/// real I/O failure.
 ///
 /// `member_crates` is required to evaluate `ForCrateInWorkspace` blocks.
 fn is_workspace_stmts_completed(
@@ -523,31 +556,35 @@ fn is_workspace_stmts_completed(
     prefix: &ProgramCursor,
     member_crates: &[ResolvedCrateExecution],
     state_base: &Path,
-) -> bool {
-    stmts.iter().enumerate().all(|(i, stmt)| {
+) -> Result<bool, Error> {
+    for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
-        is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base)
-    })
+        if !is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-/// Returns `true` if the given workspace statement at `cursor` is completed.
+/// Returns `Ok(true)` if the given workspace statement at `cursor` is
+/// completed; `Ok(false)` if not; `Err(...)` only on a real I/O failure.
 fn is_workspace_stmt_completed(
     stmt: &WorkspaceStatement,
     cursor: &ProgramCursor,
     member_crates: &[ResolvedCrateExecution],
     state_base: &Path,
-) -> bool {
+) -> Result<bool, Error> {
     let state_dir = state_base.join(cursor.to_path());
     match stmt {
-        WorkspaceStatement::Run(_) => is_run_completed(&state_dir),
-        WorkspaceStatement::ManualStep(_) => is_manual_completed(&state_dir),
-        WorkspaceStatement::SnapshotMetadata(_) => is_snapshot_metadata_completed(&state_dir),
+        WorkspaceStatement::Run(_) => Ok(is_run_completed(&state_dir)),
+        WorkspaceStatement::ManualStep(_) => Ok(is_manual_completed(&state_dir)),
+        WorkspaceStatement::SnapshotMetadata(_) => Ok(is_snapshot_metadata_completed(&state_dir)),
         WorkspaceStatement::If(block) => {
-            let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) else {
-                return false;
+            let Some(chosen) = read_chosen_branch(&state_dir)? else {
+                return Ok(false);
             };
             match chosen.trim() {
-                "none" => true,
+                "none" => Ok(true),
                 "else" => {
                     let p = cursor.clone().with(CursorSegment::ElseBranch);
                     is_workspace_stmts_completed(
@@ -557,17 +594,21 @@ fn is_workspace_stmt_completed(
                         state_base,
                     )
                 }
-                s => s.parse::<usize>().is_ok_and(|n| {
-                    block.branches.get(n).is_some_and(|branch| {
-                        let p = cursor.clone().with(CursorSegment::IfBranch(n));
-                        is_workspace_stmts_completed(
-                            &branch.statements,
-                            &p,
-                            member_crates,
-                            state_base,
-                        )
-                    })
-                }),
+                s => match s.parse::<usize>() {
+                    Ok(n) => match block.branches.get(n) {
+                        Some(branch) => {
+                            let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                            is_workspace_stmts_completed(
+                                &branch.statements,
+                                &p,
+                                member_crates,
+                                state_base,
+                            )
+                        }
+                        None => Ok(false),
+                    },
+                    Err(_) => Ok(false),
+                },
             }
         }
         WorkspaceStatement::WithEnvFile(block) => {
@@ -575,88 +616,100 @@ fn is_workspace_stmt_completed(
             is_workspace_stmts_completed(&block.statements, &p, member_crates, state_base)
         }
         WorkspaceStatement::ForCrateInWorkspace(block) => {
-            member_crates.iter().enumerate().all(|(c_idx, _)| {
+            for (c_idx, _) in member_crates.iter().enumerate() {
                 let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
-                is_crate_stmts_completed(&block.statements, &c_prefix, state_base)
-            })
+                if !is_crate_stmts_completed(&block.statements, &c_prefix, state_base)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
-        WorkspaceStatement::WaitForContinue(_) => is_wait_barrier_released(&state_dir),
+        WorkspaceStatement::WaitForContinue(_) => Ok(is_wait_barrier_released(&state_dir)),
     }
 }
 
-/// Returns `true` if all workspace statements for `ws_idx` are completed.
+/// Returns `Ok(true)` if all workspace statements for `ws_idx` are completed.
 fn is_workspace_completed(
     ws_idx: usize,
     ws_exec: &ResolvedWorkspaceExecution,
     ws_stmts: &[WorkspaceStatement],
     state_base: &Path,
-) -> bool {
+) -> Result<bool, Error> {
     let prefix = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
     is_workspace_stmts_completed(ws_stmts, &prefix, &ws_exec.member_crates, state_base)
 }
 
-/// Returns `true` if all statements for standalone crate `c_idx` are completed.
+/// Returns `Ok(true)` if all statements for standalone crate `c_idx` are completed.
 fn is_standalone_crate_completed(
     c_idx: usize,
     crate_stmts: &[CrateStatement],
     state_base: &Path,
-) -> bool {
+) -> Result<bool, Error> {
     let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
     is_crate_stmts_completed(crate_stmts, &prefix, state_base)
 }
 
-/// Returns `true` if all inter-workspace dependencies of `ws_exec` are completed.
+/// Returns `Ok(true)` if all inter-workspace dependencies of `ws_exec` are completed.
 fn are_workspace_deps_completed(
     ws_exec: &ResolvedWorkspaceExecution,
     ws_map: &HashMap<PathBuf, usize>,
     ws_stmts: &[WorkspaceStatement],
     resolved: &ResolvedProgram,
     state_base: &Path,
-) -> bool {
-    ws_exec.dependencies.iter().all(|dep_path| {
+) -> Result<bool, Error> {
+    for dep_path in &ws_exec.dependencies {
         let Some(&dep_idx) = ws_map.get(dep_path) else {
-            return true; // Dep not in selected set — treat as satisfied.
+            continue; // Dep not in selected set — treat as satisfied.
         };
         let Some(dep_exec) = resolved.workspace_executions.get(dep_idx) else {
-            return true;
+            continue;
         };
-        is_workspace_completed(dep_idx, dep_exec, ws_stmts, state_base)
-    })
+        if !is_workspace_completed(dep_idx, dep_exec, ws_stmts, state_base)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-/// Returns `true` if all dependencies of a standalone crate have completed.
+/// Returns `Ok(true)` if all dependencies of a standalone crate have completed.
 fn are_standalone_crate_deps_completed(
     crate_exec: &ResolvedCrateExecution,
     crate_map: &HashMap<PathBuf, usize>,
     crate_stmts: &[CrateStatement],
     state_base: &Path,
-) -> bool {
-    crate_exec.dependencies.iter().all(|dep_path| {
+) -> Result<bool, Error> {
+    for dep_path in &crate_exec.dependencies {
         let Some(&dep_idx) = crate_map.get(dep_path) else {
-            return true;
+            continue;
         };
-        is_standalone_crate_completed(dep_idx, crate_stmts, state_base)
-    })
+        if !is_standalone_crate_completed(dep_idx, crate_stmts, state_base)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-/// Returns `true` if all intra-workspace dependencies of a member crate are
-/// completed for the given `for crate in workspace` block.
+/// Returns `Ok(true)` if all intra-workspace dependencies of a member crate
+/// are completed for the given `for crate in workspace` block.
 fn are_member_crate_deps_completed(
     crate_exec: &ResolvedCrateExecution,
     crate_map: &HashMap<PathBuf, usize>,
     for_crate_prefix: &ProgramCursor,
     for_crate_stmts: &[CrateStatement],
     state_base: &Path,
-) -> bool {
-    crate_exec.dependencies.iter().all(|dep_path| {
+) -> Result<bool, Error> {
+    for dep_path in &crate_exec.dependencies {
         let Some(&dep_idx) = crate_map.get(dep_path) else {
-            return true;
+            continue;
         };
         let c_prefix = for_crate_prefix
             .clone()
             .with(CursorSegment::CrateIteration(dep_idx));
-        is_crate_stmts_completed(for_crate_stmts, &c_prefix, state_base)
-    })
+        if !is_crate_stmts_completed(for_crate_stmts, &c_prefix, state_base)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // ── Find-next helpers ──────────────────────────────────────────────────────────
@@ -716,14 +769,16 @@ pub enum NextOutcome<'a> {
 /// [`NextOutcome::Suspended`] if a `wait_for_continue` barrier in this scope
 /// (or in a nested scope) is in the *waiting* state with no executable
 /// statement available before it, or [`NextOutcome::Next`] with the next
-/// action.
+/// action. Errors are returned only for real I/O failures reading state
+/// files; a missing `chosen_branch` (i.e. not yet written) is treated as
+/// "evaluate the if-block now".
 fn find_next_in_crate_stmts<'a>(
     stmts: &'a [CrateStatement],
     prefix: &ProgramCursor,
     manifest_dir: &'a Path,
     state_base: &Path,
     env_file_paths: &[String],
-) -> NextOutcome<'a> {
+) -> Result<NextOutcome<'a>, Error> {
     let mut suspended = false;
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
@@ -732,59 +787,59 @@ fn find_next_in_crate_stmts<'a>(
         match stmt {
             CrateStatement::Run(step) => {
                 if !is_run_completed(&state_dir) {
-                    return NextOutcome::Next(NextStatement {
+                    return Ok(NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::RunCommand(step),
                         env_file_paths: env_file_paths.to_vec(),
-                    });
+                    }));
                 }
             }
             CrateStatement::ManualStep(step) => {
                 if !is_manual_completed(&state_dir) {
-                    return NextOutcome::Next(NextStatement {
+                    return Ok(NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::ManualStep(step),
                         env_file_paths: env_file_paths.to_vec(),
-                    });
+                    }));
                 }
             }
             CrateStatement::SnapshotMetadata(step) => {
                 if !is_snapshot_metadata_completed(&state_dir) {
-                    return NextOutcome::Next(NextStatement {
+                    return Ok(NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::SnapshotMetadata(step),
                         env_file_paths: env_file_paths.to_vec(),
-                    });
+                    }));
                 }
             }
-            CrateStatement::If(block) => {
-                match fs_err::read_to_string(state_dir.join("chosen_branch")) {
-                    Err(_) => {
-                        return NextOutcome::Next(NextStatement {
-                            cursor,
-                            manifest_dir,
-                            action: StatementAction::EvaluateCrateIf(block),
-                            env_file_paths: env_file_paths.to_vec(),
-                        });
-                    }
-                    Ok(chosen) => {
-                        let nested = match chosen.trim() {
-                            "none" => NextOutcome::Done,
-                            "else" => {
-                                let p = cursor.clone().with(CursorSegment::ElseBranch);
-                                find_next_in_crate_stmts(
-                                    &block.else_statements,
-                                    &p,
-                                    manifest_dir,
-                                    state_base,
-                                    env_file_paths,
-                                )
-                            }
-                            s => s.parse::<usize>().ok().map_or(NextOutcome::Done, |n| {
-                                block.branches.get(n).map_or(NextOutcome::Done, |branch| {
+            CrateStatement::If(block) => match read_chosen_branch(&state_dir)? {
+                None => {
+                    return Ok(NextOutcome::Next(NextStatement {
+                        cursor,
+                        manifest_dir,
+                        action: StatementAction::EvaluateCrateIf(block),
+                        env_file_paths: env_file_paths.to_vec(),
+                    }));
+                }
+                Some(chosen) => {
+                    let nested = match chosen.trim() {
+                        "none" => NextOutcome::Done,
+                        "else" => {
+                            let p = cursor.clone().with(CursorSegment::ElseBranch);
+                            find_next_in_crate_stmts(
+                                &block.else_statements,
+                                &p,
+                                manifest_dir,
+                                state_base,
+                                env_file_paths,
+                            )?
+                        }
+                        s => match s.parse::<usize>() {
+                            Ok(n) => match block.branches.get(n) {
+                                Some(branch) => {
                                     let p = cursor.clone().with(CursorSegment::IfBranch(n));
                                     find_next_in_crate_stmts(
                                         &branch.statements,
@@ -792,18 +847,20 @@ fn find_next_in_crate_stmts<'a>(
                                         manifest_dir,
                                         state_base,
                                         env_file_paths,
-                                    )
-                                })
-                            }),
-                        };
-                        match nested {
-                            NextOutcome::Next(_) => return nested,
-                            NextOutcome::Suspended => suspended = true,
-                            NextOutcome::Done => {}
-                        }
+                                    )?
+                                }
+                                None => NextOutcome::Done,
+                            },
+                            Err(_) => NextOutcome::Done,
+                        },
+                    };
+                    match nested {
+                        NextOutcome::Next(_) => return Ok(nested),
+                        NextOutcome::Suspended => suspended = true,
+                        NextOutcome::Done => {}
                     }
                 }
-            }
+            },
             CrateStatement::WithEnvFile(block) => {
                 let inner_prefix = cursor.clone().with(CursorSegment::WithEnvFile);
                 let mut inner_env_files = env_file_paths.to_vec();
@@ -814,9 +871,9 @@ fn find_next_in_crate_stmts<'a>(
                     manifest_dir,
                     state_base,
                     &inner_env_files,
-                );
+                )?;
                 match nested {
-                    NextOutcome::Next(_) => return nested,
+                    NextOutcome::Next(_) => return Ok(nested),
                     NextOutcome::Suspended => suspended = true,
                     NextOutcome::Done => {}
                 }
@@ -826,24 +883,24 @@ fn find_next_in_crate_stmts<'a>(
                     // Already released — fall through to the next statement.
                 } else if is_wait_barrier_waiting(&state_dir) {
                     // Waiting for release — this scope is suspended.
-                    return NextOutcome::Suspended;
+                    return Ok(NextOutcome::Suspended);
                 } else {
                     // Pending — surface it as the next action.
-                    return NextOutcome::Next(NextStatement {
+                    return Ok(NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::WaitForContinue(node),
                         env_file_paths: env_file_paths.to_vec(),
-                    });
+                    }));
                 }
             }
         }
     }
-    if suspended {
+    Ok(if suspended {
         NextOutcome::Suspended
     } else {
         NextOutcome::Done
-    }
+    })
 }
 
 /// Finds the first uncompleted workspace statement in `stmts` starting at `prefix`.
@@ -859,7 +916,7 @@ fn find_next_in_workspace_stmts<'a>(
     member_crates: &'a [ResolvedCrateExecution],
     state_base: &Path,
     env_file_paths: &[String],
-) -> NextOutcome<'a> {
+) -> Result<NextOutcome<'a>, Error> {
     let mut suspended = false;
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
@@ -868,60 +925,60 @@ fn find_next_in_workspace_stmts<'a>(
         match stmt {
             WorkspaceStatement::Run(step) => {
                 if !is_run_completed(&state_dir) {
-                    return NextOutcome::Next(NextStatement {
+                    return Ok(NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::RunCommand(step),
                         env_file_paths: env_file_paths.to_vec(),
-                    });
+                    }));
                 }
             }
             WorkspaceStatement::ManualStep(step) => {
                 if !is_manual_completed(&state_dir) {
-                    return NextOutcome::Next(NextStatement {
+                    return Ok(NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::ManualStep(step),
                         env_file_paths: env_file_paths.to_vec(),
-                    });
+                    }));
                 }
             }
             WorkspaceStatement::SnapshotMetadata(step) => {
                 if !is_snapshot_metadata_completed(&state_dir) {
-                    return NextOutcome::Next(NextStatement {
+                    return Ok(NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::SnapshotMetadata(step),
                         env_file_paths: env_file_paths.to_vec(),
-                    });
+                    }));
                 }
             }
-            WorkspaceStatement::If(block) => {
-                match fs_err::read_to_string(state_dir.join("chosen_branch")) {
-                    Err(_) => {
-                        return NextOutcome::Next(NextStatement {
-                            cursor,
-                            manifest_dir,
-                            action: StatementAction::EvaluateWorkspaceIf(block),
-                            env_file_paths: env_file_paths.to_vec(),
-                        });
-                    }
-                    Ok(chosen) => {
-                        let nested = match chosen.trim() {
-                            "none" => NextOutcome::Done,
-                            "else" => {
-                                let p = cursor.clone().with(CursorSegment::ElseBranch);
-                                find_next_in_workspace_stmts(
-                                    &block.else_statements,
-                                    &p,
-                                    manifest_dir,
-                                    member_crates,
-                                    state_base,
-                                    env_file_paths,
-                                )
-                            }
-                            s => s.parse::<usize>().ok().map_or(NextOutcome::Done, |n| {
-                                block.branches.get(n).map_or(NextOutcome::Done, |branch| {
+            WorkspaceStatement::If(block) => match read_chosen_branch(&state_dir)? {
+                None => {
+                    return Ok(NextOutcome::Next(NextStatement {
+                        cursor,
+                        manifest_dir,
+                        action: StatementAction::EvaluateWorkspaceIf(block),
+                        env_file_paths: env_file_paths.to_vec(),
+                    }));
+                }
+                Some(chosen) => {
+                    let nested = match chosen.trim() {
+                        "none" => NextOutcome::Done,
+                        "else" => {
+                            let p = cursor.clone().with(CursorSegment::ElseBranch);
+                            find_next_in_workspace_stmts(
+                                &block.else_statements,
+                                &p,
+                                manifest_dir,
+                                member_crates,
+                                state_base,
+                                env_file_paths,
+                            )?
+                        }
+                        s => match s.parse::<usize>() {
+                            Ok(n) => match block.branches.get(n) {
+                                Some(branch) => {
                                     let p = cursor.clone().with(CursorSegment::IfBranch(n));
                                     find_next_in_workspace_stmts(
                                         &branch.statements,
@@ -930,18 +987,20 @@ fn find_next_in_workspace_stmts<'a>(
                                         member_crates,
                                         state_base,
                                         env_file_paths,
-                                    )
-                                })
-                            }),
-                        };
-                        match nested {
-                            NextOutcome::Next(_) => return nested,
-                            NextOutcome::Suspended => suspended = true,
-                            NextOutcome::Done => {}
-                        }
+                                    )?
+                                }
+                                None => NextOutcome::Done,
+                            },
+                            Err(_) => NextOutcome::Done,
+                        },
+                    };
+                    match nested {
+                        NextOutcome::Next(_) => return Ok(nested),
+                        NextOutcome::Suspended => suspended = true,
+                        NextOutcome::Done => {}
                     }
                 }
-            }
+            },
             WorkspaceStatement::WithEnvFile(block) => {
                 let inner_prefix = cursor.clone().with(CursorSegment::WithEnvFile);
                 let mut inner_env_files = env_file_paths.to_vec();
@@ -953,9 +1012,9 @@ fn find_next_in_workspace_stmts<'a>(
                     member_crates,
                     state_base,
                     &inner_env_files,
-                );
+                )?;
                 match nested {
-                    NextOutcome::Next(_) => return nested,
+                    NextOutcome::Next(_) => return Ok(nested),
                     NextOutcome::Suspended => suspended = true,
                     NextOutcome::Done => {}
                 }
@@ -975,7 +1034,7 @@ fn find_next_in_workspace_stmts<'a>(
                         &cursor,
                         &block.statements,
                         state_base,
-                    ) {
+                    )? {
                         // An intra-workspace dep is incomplete; the dep itself
                         // either is suspended (caught below via the dep's own
                         // iteration) or will surface its own Next action when
@@ -990,9 +1049,9 @@ fn find_next_in_workspace_stmts<'a>(
                         &crate_exec.manifest_dir,
                         state_base,
                         env_file_paths,
-                    );
+                    )?;
                     match nested {
-                        NextOutcome::Next(_) => return nested,
+                        NextOutcome::Next(_) => return Ok(nested),
                         NextOutcome::Suspended => block_suspended = true,
                         NextOutcome::Done => {}
                     }
@@ -1002,7 +1061,7 @@ fn find_next_in_workspace_stmts<'a>(
                     // still has suspended (or dep-blocked-by-suspended)
                     // members — downstream workspace statements may depend
                     // on the work those members will do after the barrier.
-                    return NextOutcome::Suspended;
+                    return Ok(NextOutcome::Suspended);
                 }
             }
             WorkspaceStatement::WaitForContinue(node) => {
@@ -1010,24 +1069,24 @@ fn find_next_in_workspace_stmts<'a>(
                     // Already released — fall through to the next statement.
                 } else if is_wait_barrier_waiting(&state_dir) {
                     // Waiting for release — this scope is suspended.
-                    return NextOutcome::Suspended;
+                    return Ok(NextOutcome::Suspended);
                 } else {
                     // Pending — surface it as the next action.
-                    return NextOutcome::Next(NextStatement {
+                    return Ok(NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::WaitForContinue(node),
                         env_file_paths: env_file_paths.to_vec(),
-                    });
+                    }));
                 }
             }
         }
     }
-    if suspended {
+    Ok(if suspended {
         NextOutcome::Suspended
     } else {
         NextOutcome::Done
-    }
+    })
 }
 
 /// Finds the next uncompleted statement across all workspaces and standalone crates,
@@ -1038,12 +1097,17 @@ fn find_next_in_workspace_stmts<'a>(
 /// executable because at least one target is blocked at a `wait_for_continue`
 /// barrier (or transitively blocked by one), or [`NextOutcome::Next`] with
 /// the next action.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns an error only for real I/O failures reading state files (e.g.
+/// permission denied on a `chosen_branch` marker). A missing marker is
+/// treated as "evaluate the if-block now", not as an error.
 pub fn find_next_statement<'a>(
     program: &'a Program,
     resolved: &'a ResolvedProgram,
     state_base: &Path,
-) -> NextOutcome<'a> {
+) -> Result<NextOutcome<'a>, Error> {
     let mut suspended = false;
     let ws_stmts = first_workspace_stmts(program);
     let ws_map: HashMap<PathBuf, usize> = resolved
@@ -1054,7 +1118,7 @@ pub fn find_next_statement<'a>(
         .collect();
 
     for (ws_idx, ws_exec) in resolved.workspace_executions.iter().enumerate() {
-        if !are_workspace_deps_completed(ws_exec, &ws_map, ws_stmts, resolved, state_base) {
+        if !are_workspace_deps_completed(ws_exec, &ws_map, ws_stmts, resolved, state_base)? {
             // Upstream dep not yet complete; the dep itself will surface its
             // own outcome on its iteration.
             suspended = true;
@@ -1068,9 +1132,9 @@ pub fn find_next_statement<'a>(
             &ws_exec.member_crates,
             state_base,
             &[],
-        );
+        )?;
         match next {
-            NextOutcome::Next(_) => return next,
+            NextOutcome::Next(_) => return Ok(next),
             NextOutcome::Suspended => suspended = true,
             NextOutcome::Done => {}
         }
@@ -1085,7 +1149,7 @@ pub fn find_next_statement<'a>(
         .collect();
 
     for (c_idx, crate_exec) in resolved.crate_executions.iter().enumerate() {
-        if !are_standalone_crate_deps_completed(crate_exec, &crate_map, crate_stmts, state_base) {
+        if !are_standalone_crate_deps_completed(crate_exec, &crate_map, crate_stmts, state_base)? {
             suspended = true;
             continue;
         }
@@ -1096,19 +1160,19 @@ pub fn find_next_statement<'a>(
             &crate_exec.manifest_dir,
             state_base,
             &[],
-        );
+        )?;
         match next {
-            NextOutcome::Next(_) => return next,
+            NextOutcome::Next(_) => return Ok(next),
             NextOutcome::Suspended => suspended = true,
             NextOutcome::Done => {}
         }
     }
 
-    if suspended {
+    Ok(if suspended {
         NextOutcome::Suspended
     } else {
         NextOutcome::Done
-    }
+    })
 }
 
 // ── Statement execution ────────────────────────────────────────────────────────
@@ -1998,36 +2062,44 @@ fn find_last_completed_crate_stmt(
     stmts: &[CrateStatement],
     prefix: &ProgramCursor,
     state_base: &Path,
-) -> Option<ProgramCursor> {
+) -> Result<Option<ProgramCursor>, Error> {
     for (i, stmt) in stmts.iter().enumerate().rev() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
         // Check inside IfBlocks and WithEnvFile blocks for nested completed statements first.
         match stmt {
             CrateStatement::If(block) => {
                 let state_dir = state_base.join(cursor.to_path());
-                if let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) {
+                if let Some(chosen) = read_chosen_branch(&state_dir)? {
                     let nested = match chosen.trim() {
                         "else" => {
                             let p = cursor.clone().with(CursorSegment::ElseBranch);
-                            find_last_completed_crate_stmt(&block.else_statements, &p, state_base)
+                            find_last_completed_crate_stmt(&block.else_statements, &p, state_base)?
                         }
-                        s => s.parse::<usize>().ok().and_then(|n| {
-                            block.branches.get(n).and_then(|branch| {
-                                let p = cursor.clone().with(CursorSegment::IfBranch(n));
-                                find_last_completed_crate_stmt(&branch.statements, &p, state_base)
-                            })
-                        }),
+                        s => match s.parse::<usize>() {
+                            Ok(n) => match block.branches.get(n) {
+                                Some(branch) => {
+                                    let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                                    find_last_completed_crate_stmt(
+                                        &branch.statements,
+                                        &p,
+                                        state_base,
+                                    )?
+                                }
+                                None => None,
+                            },
+                            Err(_) => None,
+                        },
                     };
                     if nested.is_some() {
-                        return nested;
+                        return Ok(nested);
                     }
                 }
             }
             CrateStatement::WithEnvFile(block) => {
                 let p = cursor.clone().with(CursorSegment::WithEnvFile);
-                let nested = find_last_completed_crate_stmt(&block.statements, &p, state_base);
+                let nested = find_last_completed_crate_stmt(&block.statements, &p, state_base)?;
                 if nested.is_some() {
-                    return nested;
+                    return Ok(nested);
                 }
             }
             CrateStatement::Run(_)
@@ -2035,11 +2107,11 @@ fn find_last_completed_crate_stmt(
             | CrateStatement::SnapshotMetadata(_)
             | CrateStatement::WaitForContinue(_) => {}
         }
-        if is_crate_stmt_completed(stmt, &cursor, state_base) {
-            return Some(cursor);
+        if is_crate_stmt_completed(stmt, &cursor, state_base)? {
+            return Ok(Some(cursor));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Finds the cursor of the last completed workspace statement (searched in reverse).
@@ -2051,13 +2123,13 @@ fn find_last_completed_workspace_stmt(
     prefix: &ProgramCursor,
     member_crates: &[ResolvedCrateExecution],
     state_base: &Path,
-) -> Option<ProgramCursor> {
+) -> Result<Option<ProgramCursor>, Error> {
     for (i, stmt) in stmts.iter().enumerate().rev() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
         match stmt {
             WorkspaceStatement::If(block) => {
                 let state_dir = state_base.join(cursor.to_path());
-                if let Ok(chosen) = fs_err::read_to_string(state_dir.join("chosen_branch")) {
+                if let Some(chosen) = read_chosen_branch(&state_dir)? {
                     let nested = match chosen.trim() {
                         "else" => {
                             let p = cursor.clone().with(CursorSegment::ElseBranch);
@@ -2066,22 +2138,26 @@ fn find_last_completed_workspace_stmt(
                                 &p,
                                 member_crates,
                                 state_base,
-                            )
+                            )?
                         }
-                        s => s.parse::<usize>().ok().and_then(|n| {
-                            block.branches.get(n).and_then(|branch| {
-                                let p = cursor.clone().with(CursorSegment::IfBranch(n));
-                                find_last_completed_workspace_stmt(
-                                    &branch.statements,
-                                    &p,
-                                    member_crates,
-                                    state_base,
-                                )
-                            })
-                        }),
+                        s => match s.parse::<usize>() {
+                            Ok(n) => match block.branches.get(n) {
+                                Some(branch) => {
+                                    let p = cursor.clone().with(CursorSegment::IfBranch(n));
+                                    find_last_completed_workspace_stmt(
+                                        &branch.statements,
+                                        &p,
+                                        member_crates,
+                                        state_base,
+                                    )?
+                                }
+                                None => None,
+                            },
+                            Err(_) => None,
+                        },
                     };
                     if nested.is_some() {
-                        return nested;
+                        return Ok(nested);
                     }
                 }
             }
@@ -2092,18 +2168,18 @@ fn find_last_completed_workspace_stmt(
                     &p,
                     member_crates,
                     state_base,
-                );
+                )?;
                 if nested.is_some() {
-                    return nested;
+                    return Ok(nested);
                 }
             }
             WorkspaceStatement::ForCrateInWorkspace(block) => {
                 for (c_idx, _) in member_crates.iter().enumerate().rev() {
                     let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
                     let nested =
-                        find_last_completed_crate_stmt(&block.statements, &c_prefix, state_base);
+                        find_last_completed_crate_stmt(&block.statements, &c_prefix, state_base)?;
                     if nested.is_some() {
-                        return nested;
+                        return Ok(nested);
                     }
                 }
             }
@@ -2112,11 +2188,11 @@ fn find_last_completed_workspace_stmt(
             | WorkspaceStatement::SnapshotMetadata(_)
             | WorkspaceStatement::WaitForContinue(_) => {}
         }
-        if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base) {
-            return Some(cursor);
+        if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base)? {
+            return Ok(Some(cursor));
         }
     }
-    None
+    Ok(None)
 }
 
 // ── Command implementations ────────────────────────────────────────────────────
@@ -2216,7 +2292,7 @@ pub async fn run_single_step_command(
     let config = Config::load(&environment)?;
     let state_base = state_dir_for_task(&params.name, &environment)?;
 
-    match find_next_statement(&program, &resolved, &state_base) {
+    match find_next_statement(&program, &resolved, &state_base)? {
         NextOutcome::Next(next) => {
             println!(
                 "Running statement at {} for {}",
@@ -2345,10 +2421,10 @@ pub async fn run_single_target_command(
         .collect();
 
     for (ws_idx, ws_exec) in resolved.workspace_executions.iter().enumerate() {
-        if !are_workspace_deps_completed(ws_exec, &ws_map, ws_stmts, &resolved, &state_base) {
+        if !are_workspace_deps_completed(ws_exec, &ws_map, ws_stmts, &resolved, &state_base)? {
             continue;
         }
-        if is_workspace_completed(ws_idx, ws_exec, ws_stmts, &state_base) {
+        if is_workspace_completed(ws_idx, ws_exec, ws_stmts, &state_base)? {
             continue;
         }
         println!(
@@ -2383,10 +2459,10 @@ pub async fn run_single_target_command(
         .collect();
 
     for (c_idx, crate_exec) in resolved.crate_executions.iter().enumerate() {
-        if !are_standalone_crate_deps_completed(crate_exec, &crate_map, crate_stmts, &state_base) {
+        if !are_standalone_crate_deps_completed(crate_exec, &crate_map, crate_stmts, &state_base)? {
             continue;
         }
-        if is_standalone_crate_completed(c_idx, crate_stmts, &state_base) {
+        if is_standalone_crate_completed(c_idx, crate_stmts, &state_base)? {
             continue;
         }
         println!(
@@ -2812,7 +2888,7 @@ pub async fn rewind_single_target_command(
 
     // Standalone crates execute last — search them in reverse first.
     for (c_idx, _) in resolved.crate_executions.iter().enumerate().rev() {
-        if is_standalone_crate_completed(c_idx, crate_stmts, &state_base) {
+        if is_standalone_crate_completed(c_idx, crate_stmts, &state_base)? {
             let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
             let target_state_dir = state_base.join(prefix.to_path());
             if target_state_dir.exists() {
@@ -2829,7 +2905,7 @@ pub async fn rewind_single_target_command(
     }
 
     for (ws_idx, ws_exec) in resolved.workspace_executions.iter().enumerate().rev() {
-        if is_workspace_completed(ws_idx, ws_exec, ws_stmts, &state_base) {
+        if is_workspace_completed(ws_idx, ws_exec, ws_stmts, &state_base)? {
             let prefix = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
             let target_state_dir = state_base.join(prefix.to_path());
             if target_state_dir.exists() {
@@ -2871,7 +2947,7 @@ pub async fn rewind_single_step_command(
     // Standalone crates execute last — search in reverse first.
     for (c_idx, _) in resolved.crate_executions.iter().enumerate().rev() {
         let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
-        if let Some(cursor) = find_last_completed_crate_stmt(crate_stmts, &prefix, &state_base) {
+        if let Some(cursor) = find_last_completed_crate_stmt(crate_stmts, &prefix, &state_base)? {
             let step_state_dir = state_base.join(cursor.to_path());
             if step_state_dir.exists() {
                 fs_err::remove_dir_all(&step_state_dir)
@@ -2889,7 +2965,7 @@ pub async fn rewind_single_step_command(
             &prefix,
             &ws_exec.member_crates,
             &state_base,
-        ) {
+        )? {
             let step_state_dir = state_base.join(cursor.to_path());
             if step_state_dir.exists() {
                 fs_err::remove_dir_all(&step_state_dir)
@@ -2978,7 +3054,7 @@ fn print_crate_stmts_describe(
     prefix: &ProgramCursor,
     state_base: &Path,
     indent: &str,
-) {
+) -> Result<(), Error> {
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
         let state_dir = state_base.join(cursor.to_path());
@@ -3007,7 +3083,7 @@ fn print_crate_stmts_describe(
                         &cursor.with(CursorSegment::ElseBranch),
                         state_base,
                         &nested_indent,
-                    );
+                    )?;
                 } else if let Ok(n) = chosen.parse::<usize>()
                     && let Some(branch) = block.branches.get(n)
                 {
@@ -3017,12 +3093,13 @@ fn print_crate_stmts_describe(
                         &cursor.with(CursorSegment::IfBranch(n)),
                         state_base,
                         &nested_indent,
-                    );
+                    )?;
                 }
             }
             CrateStatement::WithEnvFile(block) => {
                 let env_prefix = cursor.clone().with(CursorSegment::WithEnvFile);
-                let icon = if is_crate_stmts_completed(&block.statements, &env_prefix, state_base) {
+                let icon = if is_crate_stmts_completed(&block.statements, &env_prefix, state_base)?
+                {
                     "\u{2705}"
                 } else {
                     "\u{2B1C}"
@@ -3035,7 +3112,7 @@ fn print_crate_stmts_describe(
                     &env_prefix,
                     state_base,
                     &nested_indent,
-                );
+                )?;
             }
             CrateStatement::Run(_) => {
                 let state_dir = state_base.join(cursor.to_path());
@@ -3061,7 +3138,7 @@ fn print_crate_stmts_describe(
                 println!("{indent}{cursor_str:<20}  {icon}  {label}");
             }
             CrateStatement::ManualStep(_) | CrateStatement::SnapshotMetadata(_) => {
-                let icon = if is_crate_stmt_completed(stmt, &cursor, state_base) {
+                let icon = if is_crate_stmt_completed(stmt, &cursor, state_base)? {
                     "\u{2705}"
                 } else {
                     "\u{2B1C}"
@@ -3071,6 +3148,7 @@ fn print_crate_stmts_describe(
             }
         }
     }
+    Ok(())
 }
 
 /// Recursively prints workspace statements with their cursor, completion icon, and label.
@@ -3081,7 +3159,7 @@ fn print_workspace_stmts_describe(
     member_crates: &[ResolvedCrateExecution],
     state_base: &Path,
     indent: &str,
-) {
+) -> Result<(), Error> {
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
         let state_dir = state_base.join(cursor.to_path());
@@ -3111,7 +3189,7 @@ fn print_workspace_stmts_describe(
                         member_crates,
                         state_base,
                         &nested_indent,
-                    );
+                    )?;
                 } else if let Ok(n) = chosen.parse::<usize>()
                     && let Some(branch) = block.branches.get(n)
                 {
@@ -3122,11 +3200,11 @@ fn print_workspace_stmts_describe(
                         member_crates,
                         state_base,
                         &nested_indent,
-                    );
+                    )?;
                 }
             }
             WorkspaceStatement::ForCrateInWorkspace(block) => {
-                let icon = if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base)
+                let icon = if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base)?
                 {
                     "\u{2705}"
                 } else {
@@ -3139,7 +3217,7 @@ fn print_workspace_stmts_describe(
                     let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
                     let c_prefix_str = c_prefix.to_path_string();
                     let crate_icon =
-                        if is_crate_stmts_completed(&block.statements, &c_prefix, state_base) {
+                        if is_crate_stmts_completed(&block.statements, &c_prefix, state_base)? {
                             "\u{2705}"
                         } else {
                             "\u{2B1C}"
@@ -3153,7 +3231,7 @@ fn print_workspace_stmts_describe(
                         &c_prefix,
                         state_base,
                         &nested_indent,
-                    );
+                    )?;
                 }
             }
             WorkspaceStatement::WithEnvFile(block) => {
@@ -3163,7 +3241,7 @@ fn print_workspace_stmts_describe(
                     &env_prefix,
                     member_crates,
                     state_base,
-                ) {
+                )? {
                     "\u{2705}"
                 } else {
                     "\u{2B1C}"
@@ -3177,7 +3255,7 @@ fn print_workspace_stmts_describe(
                     member_crates,
                     state_base,
                     &nested_indent,
-                );
+                )?;
             }
             WorkspaceStatement::Run(_) => {
                 let state_dir = state_base.join(cursor.to_path());
@@ -3203,7 +3281,7 @@ fn print_workspace_stmts_describe(
                 println!("{indent}{cursor_str:<20}  {icon}  {label}");
             }
             WorkspaceStatement::ManualStep(_) | WorkspaceStatement::SnapshotMetadata(_) => {
-                let icon = if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base)
+                let icon = if is_workspace_stmt_completed(stmt, &cursor, member_crates, state_base)?
                 {
                     "\u{2705}"
                 } else {
@@ -3214,6 +3292,7 @@ fn print_workspace_stmts_describe(
             }
         }
     }
+    Ok(())
 }
 
 /// Displays the current execution status of every target in a task.
@@ -3236,7 +3315,7 @@ pub async fn task_describe_command(
     if !resolved.workspace_executions.is_empty() {
         println!("Workspaces:");
         for (ws_idx, ws_exec) in resolved.workspace_executions.iter().enumerate() {
-            let done = is_workspace_completed(ws_idx, ws_exec, ws_stmts, &state_base);
+            let done = is_workspace_completed(ws_idx, ws_exec, ws_stmts, &state_base)?;
             let icon = if done { "\u{2705}" } else { "\u{2B1C}" };
             println!("  {} {}", icon, ws_exec.manifest_dir.display());
             print_workspace_stmts_describe(
@@ -3245,7 +3324,7 @@ pub async fn task_describe_command(
                 &ws_exec.member_crates,
                 &state_base,
                 "    ",
-            );
+            )?;
         }
     }
 
@@ -3253,7 +3332,7 @@ pub async fn task_describe_command(
     if !resolved.crate_executions.is_empty() {
         println!("Standalone crates:");
         for (c_idx, crate_exec) in resolved.crate_executions.iter().enumerate() {
-            let done = is_standalone_crate_completed(c_idx, crate_stmts, &state_base);
+            let done = is_standalone_crate_completed(c_idx, crate_stmts, &state_base)?;
             let icon = if done { "\u{2705}" } else { "\u{2B1C}" };
             println!("  {} {}", icon, crate_exec.manifest_dir.display());
             print_crate_stmts_describe(
@@ -3261,7 +3340,7 @@ pub async fn task_describe_command(
                 &ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx)),
                 &state_base,
                 "    ",
-            );
+            )?;
         }
     }
 
@@ -3725,7 +3804,7 @@ mod tests {
             command: "echo".to_owned(),
             args: vec![],
         });
-        assert!(is_crate_stmt_completed(&stmt, &cursor, temp.path()));
+        assert!(is_crate_stmt_completed(&stmt, &cursor, temp.path())?);
         Ok(())
     }
 
@@ -3740,7 +3819,7 @@ mod tests {
             command: "echo".to_owned(),
             args: vec![],
         });
-        assert!(!is_crate_stmt_completed(&stmt, &cursor, temp.path()));
+        assert!(!is_crate_stmt_completed(&stmt, &cursor, temp.path())?);
         Ok(())
     }
 
@@ -3764,7 +3843,7 @@ mod tests {
         })]);
         let resolved = resolved_with_one_crate(dir);
         assert!(matches!(
-            find_next_statement(&program, &resolved, &state_base),
+            find_next_statement(&program, &resolved, &state_base)?,
             NextOutcome::Done
         ));
         Ok(())
@@ -3782,7 +3861,7 @@ mod tests {
             args: vec![],
         })]);
         let resolved = resolved_with_one_crate(dir);
-        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base) else {
+        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base)? else {
             return Err("expected NextOutcome::Next".into());
         };
         assert_eq!(
@@ -3819,7 +3898,7 @@ mod tests {
             }),
         ]);
         let resolved = resolved_with_one_crate(dir);
-        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base) else {
+        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base)? else {
             return Err("expected NextOutcome::Next".into());
         };
         assert_eq!(
@@ -3849,7 +3928,7 @@ mod tests {
             args: vec![],
         })]);
         let resolved = resolved_with_one_crate(dir);
-        let outcome = find_next_statement(&program, &resolved, &state_base);
+        let outcome = find_next_statement(&program, &resolved, &state_base)?;
         assert!(
             matches!(outcome, NextOutcome::Next(_)),
             "Failed statement should be returned for retry"
@@ -3869,7 +3948,7 @@ mod tests {
             args: vec!["build".to_owned()],
         })]);
         let resolved = resolved_with_one_workspace(dir);
-        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base) else {
+        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base)? else {
             return Err("expected NextOutcome::Next".into());
         };
         assert_eq!(
@@ -3931,7 +4010,7 @@ mod tests {
             .with(CursorSegment::Statement(0)); // WaitForContinue
         let _state_dir = make_cursor_state_dir(&state_base, &barrier_cursor)?;
 
-        let outcome = find_next_statement(&program, &resolved, &state_base);
+        let outcome = find_next_statement(&program, &resolved, &state_base)?;
         assert!(
             matches!(outcome, NextOutcome::Suspended),
             "expected Suspended, got {outcome:?}"
@@ -3953,7 +4032,7 @@ mod tests {
             description: "pause".to_owned(),
         })]);
         let resolved = resolved_with_one_crate(dir);
-        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base) else {
+        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base)? else {
             return Err("expected NextOutcome::Next for pending barrier".into());
         };
         assert_eq!(
@@ -3992,7 +4071,7 @@ mod tests {
             }),
         ]);
         let resolved = resolved_with_one_crate(dir);
-        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base) else {
+        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base)? else {
             return Err("expected NextOutcome::Next past released barrier".into());
         };
         assert_eq!(
@@ -4005,6 +4084,52 @@ mod tests {
     }
 
     // ── validate_task_name ────────────────────────────────────────────────────
+
+    /// Regression test for KNOWN_ISSUES.md §10: a transient I/O error reading
+    /// `chosen_branch` must propagate as an error, not be silently swallowed
+    /// as "branch not yet chosen". The previous `Err(_) => …` pattern would
+    /// have caused the runner to re-evaluate the if-block's branch
+    /// conditions and overwrite the existing `chosen_branch` — picking a
+    /// different branch than originally chosen because `ask_user` /
+    /// `run`-style conditions are not deterministic.
+    ///
+    /// We simulate a non-NotFound I/O error by making `chosen_branch` itself
+    /// a directory; `read_to_string` then fails with `IsADirectory` /
+    /// `EISDIR`, which is not `NotFound`.
+    #[test]
+    fn find_next_propagates_chosen_branch_io_error() -> TestResult {
+        use crate::program::ast::common::CommonCondition;
+        use crate::program::ast::crate_ctx::{CrateBranch, CrateCondition, CrateIfBlock};
+
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let state_base = env.state_dir.join("cargo-for-each").join("tasks").join("t");
+        let dir = PathBuf::from("/tmp");
+
+        // Construct a tiny if-block program.
+        let program = crate_program(vec![CrateStatement::If(CrateIfBlock {
+            branches: vec![CrateBranch {
+                condition: CrateCondition::Common(CommonCondition::WorkingDirectoryClean),
+                statements: vec![],
+            }],
+            else_statements: vec![],
+        })]);
+        let resolved = resolved_with_one_crate(dir);
+
+        // Force a non-NotFound read error by making chosen_branch a directory.
+        let if_cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        let if_state_dir = make_cursor_state_dir(&state_base, &if_cursor)?;
+        fs_err::create_dir_all(if_state_dir.join("chosen_branch"))?;
+
+        let outcome = find_next_statement(&program, &resolved, &state_base);
+        assert!(
+            matches!(outcome, Err(Error::CouldNotReadStateFile(_, _))),
+            "expected CouldNotReadStateFile, got {outcome:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn validate_task_name_accepts_plain_names() {
