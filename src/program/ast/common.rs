@@ -24,8 +24,9 @@ pub struct ManualStepNode {
 /// or `CrateCondition`), and `S` is the statement type for the body of each branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IfBlock<C, S> {
-    /// The ordered list of if/else-if branches. At least one is always present.
-    pub branches: Vec<Branch<C, S>>,
+    /// The ordered list of if/else-if branches. The [`NonEmptyBranches`]
+    /// newtype enforces "at least one always present" at the type level.
+    pub branches: NonEmptyBranches<C, S>,
     /// Statements in the else block. Empty means no else clause.
     pub else_statements: Vec<S>,
 }
@@ -37,6 +38,76 @@ pub struct Branch<C, S> {
     pub condition: C,
     /// The statements executed when this branch is chosen.
     pub statements: Vec<S>,
+}
+
+/// A non-empty list of [`Branch`]es, used by [`IfBlock`] to enforce the
+/// "at least one branch" invariant at the type level.  Construct via
+/// [`Self::try_new`] or [`Self::from_first_and_rest`]; access via the
+/// `Deref` impl to a `[Branch<C, S>]` slice (so `iter`, `get`, `len`,
+/// etc. all work).
+///
+/// The wrapped `Vec` is private precisely to prevent direct construction
+/// like `IfBlock { branches: vec![], … }` from bypassing the invariant —
+/// that's the regression the original "doc-only" version of this rule
+/// invited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonEmptyBranches<C, S>(Vec<Branch<C, S>>);
+
+/// Error returned by [`NonEmptyBranches::try_new`] when the supplied
+/// `Vec` is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyBranchesError;
+
+impl std::fmt::Display for EmptyBranchesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an `if` block must have at least one branch")
+    }
+}
+
+impl std::error::Error for EmptyBranchesError {}
+
+impl<C, S> NonEmptyBranches<C, S> {
+    /// Construct from a `Vec`, returning an error if it is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmptyBranchesError`] when `branches.is_empty()`.
+    pub fn try_new(branches: Vec<Branch<C, S>>) -> Result<Self, EmptyBranchesError> {
+        if branches.is_empty() {
+            Err(EmptyBranchesError)
+        } else {
+            Ok(Self(branches))
+        }
+    }
+
+    /// Construct from a guaranteed-non-empty `(first, rest)` pair.
+    ///
+    /// Useful at sites where non-emptiness is enforced upstream — e.g. the
+    /// chumsky parser combinator that requires at least one branch before
+    /// any `else if` repetitions.
+    pub fn from_first_and_rest(first: Branch<C, S>, rest: Vec<Branch<C, S>>) -> Self {
+        let mut all = Vec::with_capacity(rest.len().saturating_add(1));
+        all.push(first);
+        all.extend(rest);
+        Self(all)
+    }
+}
+
+impl<C, S> std::ops::Deref for NonEmptyBranches<C, S> {
+    type Target = [Branch<C, S>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a, C, S> IntoIterator for &'a NonEmptyBranches<C, S> {
+    type Item = &'a Branch<C, S>;
+    type IntoIter = std::slice::Iter<'a, Branch<C, S>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 /// A step that captures the current workspace's cargo metadata under a user-specified name.
@@ -153,4 +224,60 @@ pub enum CommonCondition {
         /// The value to compare against.
         value: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::panic,
+        reason = "test helpers panic on unexpected error shapes; clearer than assert"
+    )]
+
+    use pretty_assertions::assert_eq;
+
+    use super::{Branch, EmptyBranchesError, NonEmptyBranches};
+
+    /// Trivial dummy condition / statement types so we can instantiate the
+    /// generic [`NonEmptyBranches`] without pulling in the workspace/crate
+    /// AST modules.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Cond;
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Stmt;
+
+    fn branch() -> Branch<Cond, Stmt> {
+        Branch {
+            condition: Cond,
+            statements: vec![],
+        }
+    }
+
+    #[test]
+    fn try_new_rejects_empty() {
+        let result: Result<NonEmptyBranches<Cond, Stmt>, _> = NonEmptyBranches::try_new(vec![]);
+        assert_eq!(result, Err(EmptyBranchesError));
+    }
+
+    #[test]
+    fn try_new_accepts_non_empty() {
+        let result = NonEmptyBranches::try_new(vec![branch()]);
+        let nb = match result {
+            Ok(v) => v,
+            Err(e) => panic!("expected Ok, got {e}"),
+        };
+        assert_eq!(nb.len(), 1);
+    }
+
+    #[test]
+    fn from_first_and_rest_carries_first_then_rest() {
+        let nb = NonEmptyBranches::from_first_and_rest(branch(), vec![branch(), branch()]);
+        assert_eq!(nb.len(), 3);
+    }
+
+    #[test]
+    fn iter_via_deref_yields_all_branches() {
+        let nb = NonEmptyBranches::from_first_and_rest(branch(), vec![branch()]);
+        let count = nb.iter().count();
+        assert_eq!(count, 2);
+    }
 }

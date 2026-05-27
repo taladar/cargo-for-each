@@ -6,8 +6,8 @@
 use chumsky::prelude::*;
 
 use super::ast::common::{
-    Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
-    WaitForContinueNode, WithEnvFileBlock,
+    Branch, CommonCondition, IfBlock, ManualStepNode, NonEmptyBranches, RunStep,
+    SnapshotMetadataNode, WaitForContinueNode, WithEnvFileBlock,
 };
 use super::ast::crate_ctx::{
     CrateCondition, CrateFilter, CrateSelectCondition, CrateStatement, CrateTypeFilter,
@@ -609,13 +609,9 @@ fn crate_if_parser<'src>(
     branch
         .then(else_if_branch.repeated().collect::<Vec<_>>())
         .then(else_block.or_not())
-        .map(|((first_branch, mut extra_branches), else_stmts)| {
-            let mut branches = vec![first_branch];
-            branches.append(&mut extra_branches);
-            IfBlock {
-                branches,
-                else_statements: else_stmts.unwrap_or_default(),
-            }
+        .map(|((first_branch, extra_branches), else_stmts)| IfBlock {
+            branches: NonEmptyBranches::from_first_and_rest(first_branch, extra_branches),
+            else_statements: else_stmts.unwrap_or_default(),
         })
 }
 
@@ -709,13 +705,9 @@ fn workspace_if_parser<'src>(
     branch
         .then(else_if_branch.repeated().collect::<Vec<_>>())
         .then(else_block.or_not())
-        .map(|((first_branch, mut extra_branches), else_stmts)| {
-            let mut branches = vec![first_branch];
-            branches.append(&mut extra_branches);
-            IfBlock {
-                branches,
-                else_statements: else_stmts.unwrap_or_default(),
-            }
+        .map(|((first_branch, extra_branches), else_stmts)| IfBlock {
+            branches: NonEmptyBranches::from_first_and_rest(first_branch, extra_branches),
+            else_statements: else_stmts.unwrap_or_default(),
         })
 }
 
@@ -957,13 +949,16 @@ mod tests {
             prog.statements,
             vec![GlobalStatement::ForCrate(ForCrateBlock {
                 statements: vec![CrateStatement::If(IfBlock {
-                    branches: vec![Branch {
-                        condition: CrateCondition::CrateType(CrateTypeFilter::Lib),
-                        statements: vec![CrateStatement::Run(RunStep {
-                            command: "cargo".to_owned(),
-                            args: vec!["publish".to_owned()],
-                        })],
-                    }],
+                    branches: NonEmptyBranches::from_first_and_rest(
+                        Branch {
+                            condition: CrateCondition::CrateType(CrateTypeFilter::Lib),
+                            statements: vec![CrateStatement::Run(RunStep {
+                                command: "cargo".to_owned(),
+                                args: vec!["publish".to_owned()],
+                            })],
+                        },
+                        vec![],
+                    ),
                     else_statements: vec![],
                 })]
             })]
@@ -977,13 +972,16 @@ mod tests {
             prog.statements,
             vec![GlobalStatement::ForCrate(ForCrateBlock {
                 statements: vec![CrateStatement::If(IfBlock {
-                    branches: vec![Branch {
-                        condition: CrateCondition::TargetKind(TargetKindFilter::Test),
-                        statements: vec![CrateStatement::Run(RunStep {
-                            command: "cargo".to_owned(),
-                            args: vec!["test".to_owned()],
-                        })],
-                    }],
+                    branches: NonEmptyBranches::from_first_and_rest(
+                        Branch {
+                            condition: CrateCondition::TargetKind(TargetKindFilter::Test),
+                            statements: vec![CrateStatement::Run(RunStep {
+                                command: "cargo".to_owned(),
+                                args: vec!["test".to_owned()],
+                            })],
+                        },
+                        vec![],
+                    ),
                     else_statements: vec![],
                 })]
             })]
@@ -1027,15 +1025,18 @@ mod tests {
             prog.statements,
             vec![GlobalStatement::ForWorkspace(ForWorkspaceBlock {
                 statements: vec![WorkspaceStatement::If(IfBlock {
-                    branches: vec![Branch {
-                        condition: WorkspaceCondition::Common(
-                            CommonCondition::WorkingDirectoryClean
-                        ),
-                        statements: vec![WorkspaceStatement::Run(RunStep {
-                            command: "cargo".to_owned(),
-                            args: vec!["release".to_owned()],
-                        })],
-                    }],
+                    branches: NonEmptyBranches::from_first_and_rest(
+                        Branch {
+                            condition: WorkspaceCondition::Common(
+                                CommonCondition::WorkingDirectoryClean,
+                            ),
+                            statements: vec![WorkspaceStatement::Run(RunStep {
+                                command: "cargo".to_owned(),
+                                args: vec!["release".to_owned()],
+                            })],
+                        },
+                        vec![],
+                    ),
                     else_statements: vec![WorkspaceStatement::ManualStep(ManualStepNode {
                         title: "Fix it".to_owned(),
                         instructions: "Commit your changes first.".to_owned(),

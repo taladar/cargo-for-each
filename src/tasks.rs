@@ -4158,10 +4158,13 @@ mod tests {
 
         // Construct a tiny if-block program.
         let program = crate_program(vec![CrateStatement::If(CrateIfBlock {
-            branches: vec![CrateBranch {
-                condition: CrateCondition::Common(CommonCondition::WorkingDirectoryClean),
-                statements: vec![],
-            }],
+            branches: crate::program::ast::common::NonEmptyBranches::from_first_and_rest(
+                CrateBranch {
+                    condition: CrateCondition::Common(CommonCondition::WorkingDirectoryClean),
+                    statements: vec![],
+                },
+                vec![],
+            ),
             else_statements: vec![],
         })]);
         let resolved = resolved_with_one_crate(dir);
