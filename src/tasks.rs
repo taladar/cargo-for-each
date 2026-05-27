@@ -36,6 +36,46 @@ use clap::Parser;
 
 // ── Path helpers ───────────────────────────────────────────────────────────────
 
+/// Validates a user-supplied task name so it can be joined safely into
+/// `<config_dir>/cargo-for-each/tasks/` and the equivalent state-dir path
+/// without escaping.
+///
+/// Rejects:
+/// - empty names,
+/// - names with leading/trailing whitespace (avoids confusion between
+///   `"foo"` and `" foo "` directory entries on case-insensitive filesystems),
+/// - names containing `/`, `\`, or NUL bytes (path separators on at least
+///   one supported platform, even if not on the current one),
+/// - names that don't reduce to exactly one `Component::Normal` (catches
+///   `..`, `.`, absolute paths, and anything else with implicit path
+///   semantics).
+fn validate_task_name(name: &str) -> Result<(), Error> {
+    use std::ffi::OsStr;
+    use std::path::Component;
+
+    let bad = |reason: &'static str| Error::InvalidTaskName(name.to_owned(), reason);
+
+    if name.is_empty() {
+        return Err(bad("must not be empty"));
+    }
+    if name.trim() != name {
+        return Err(bad("must not have leading or trailing whitespace"));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(bad("must not contain path separators or NUL bytes"));
+    }
+    let mut components = Path::new(name).components();
+    let Some(Component::Normal(only)) = components.next() else {
+        return Err(bad(
+            "must be a single non-empty path component (no '..', '.', or absolute paths)",
+        ));
+    };
+    if only != OsStr::new(name) || components.next().is_some() {
+        return Err(bad("must be a single non-empty path component"));
+    }
+    Ok(())
+}
+
 /// Returns the directory under which all task configuration lives:
 /// `<config_dir>/cargo-for-each/tasks/`.
 ///
@@ -51,8 +91,10 @@ pub fn dir_path(environment: &crate::Environment) -> Result<PathBuf, Error> {
 ///
 /// # Errors
 ///
-/// Returns an error if the tasks directory path cannot be determined.
+/// Returns an error if `name` fails [`validate_task_name`] or if the tasks
+/// directory path cannot be determined.
 pub fn named_dir_path(name: &str, environment: &crate::Environment) -> Result<PathBuf, Error> {
+    validate_task_name(name)?;
     Ok(dir_path(environment)?.join(name))
 }
 
@@ -64,8 +106,10 @@ pub fn named_dir_path(name: &str, environment: &crate::Environment) -> Result<Pa
 ///
 /// # Errors
 ///
-/// Returns an error if the state directory path cannot be determined.
+/// Returns an error if `name` fails [`validate_task_name`] or if the state
+/// directory path cannot be determined.
 pub fn state_dir_for_task(name: &str, environment: &crate::Environment) -> Result<PathBuf, Error> {
+    validate_task_name(name)?;
     Ok(environment
         .state_dir
         .join("cargo-for-each")
@@ -3535,8 +3579,12 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
-    use super::{NextOutcome, find_next_statement, is_crate_stmt_completed, is_run_completed};
+    use super::{
+        NextOutcome, find_next_statement, is_crate_stmt_completed, is_run_completed,
+        validate_task_name,
+    };
     use crate::Environment;
+    use crate::error::Error;
     use crate::program::ast::common::{RunStep, WaitForContinueNode};
     use crate::program::ast::crate_ctx::CrateStatement;
     use crate::program::ast::crate_ctx::ForCrateBlock;
@@ -3954,5 +4002,78 @@ mod tests {
                 .with(CursorSegment::Statement(1))
         );
         Ok(())
+    }
+
+    // ── validate_task_name ────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_task_name_accepts_plain_names() {
+        for ok_name in &[
+            "foo", "task_1", "my-task", "abc123", "résumé", // unicode
+            "a",      // single char
+        ] {
+            assert!(
+                validate_task_name(ok_name).is_ok(),
+                "expected {ok_name:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_task_name_rejects_empty() {
+        assert!(matches!(
+            validate_task_name(""),
+            Err(Error::InvalidTaskName(_, _))
+        ));
+    }
+
+    #[test]
+    fn validate_task_name_rejects_whitespace_padding() {
+        for bad in &[" foo", "foo ", " foo ", "\tfoo", "foo\n"] {
+            assert!(
+                matches!(validate_task_name(bad), Err(Error::InvalidTaskName(_, _))),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_task_name_rejects_path_separators() {
+        for bad in &["foo/bar", "foo\\bar", "/foo", "foo/", "\\foo"] {
+            assert!(
+                matches!(validate_task_name(bad), Err(Error::InvalidTaskName(_, _))),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    /// Regression test for KNOWN_ISSUES.md §9: `cargo-for-each task create
+    /// --name ../../tmp/escape` previously wrote files outside the tasks
+    /// directory. The validator must reject every form of parent-traversal,
+    /// current-dir reference, and absolute path.
+    #[test]
+    fn validate_task_name_rejects_traversal_and_special_components() {
+        for bad in &[
+            "..",
+            ".",
+            "../foo",
+            "./foo",
+            "/",
+            "/etc",
+            "../../tmp/escape",
+        ] {
+            assert!(
+                matches!(validate_task_name(bad), Err(Error::InvalidTaskName(_, _))),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_task_name_rejects_nul_byte() {
+        assert!(matches!(
+            validate_task_name("foo\0bar"),
+            Err(Error::InvalidTaskName(_, _))
+        ));
     }
 }

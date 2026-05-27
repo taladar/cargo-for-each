@@ -66,6 +66,9 @@ pub enum Error {
     /// the specified task was not found
     #[error("the specified task {0} was not found")]
     TaskNotFound(String),
+    /// the supplied task name does not satisfy the validation rules
+    #[error("invalid task name {0:?}: {1}")]
+    InvalidTaskName(String, &'static str),
     /// could not create task directory
     #[error("could not create task directory {0}: {1}")]
     CouldNotCreateTaskDir(std::path::PathBuf, #[source] std::io::Error),
