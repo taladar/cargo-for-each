@@ -232,6 +232,22 @@ pub async fn add_command(
         crate::error::Error::CouldNotDetermineCanonicalManifestPath(manifest_path, err)
     })?;
 
+    // Reject canonical paths whose file name is not `Cargo.toml`. Without
+    // this, a symlink pointing at an unrelated file or a typo like
+    // `target add --manifest-path /some/dir` (a directory, not a file) can
+    // register an arbitrary directory in the config because cargo metadata
+    // is tolerant of nearby manifests.
+    let file_name = manifest_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if file_name != "Cargo.toml" {
+        return Err(crate::error::Error::ManifestPathIsNotCargoToml(
+            manifest_path,
+            file_name,
+        ));
+    }
+
     // first call to metadata to find the workspace root
     let initial_metadata = cargo_metadata::MetadataCommand::new()
         .manifest_path(&manifest_path)

@@ -104,6 +104,13 @@ pub enum Error {
     /// the given manifest path has no parent directory
     #[error("the given manifest path {0} has no parent directory")]
     ManifestPathHasNoParentDir(std::path::PathBuf),
+    /// the canonical form of a manifest path passed to `target add` does
+    /// not have `Cargo.toml` as its file name; this catches accidentally
+    /// passing a non-manifest file or a symlink that resolves elsewhere
+    #[error(
+        "manifest path {0} does not name a `Cargo.toml` file (canonicalised file name was {1:?})"
+    )]
+    ManifestPathIsNotCargoToml(std::path::PathBuf, String),
     /// the task of the given name already exists
     #[error("{0} already exists")]
     AlreadyExists(String),

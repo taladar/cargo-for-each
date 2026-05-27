@@ -1216,4 +1216,50 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_add_rejects_non_cargo_toml_manifest_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+        let temp_path = temp_dir.path();
+
+        // Plant a file that looks like a manifest but has the wrong name.
+        let bogus_dir = temp_path.join("ws");
+        fs_err::create_dir_all(&bogus_dir)?;
+        let bogus = bogus_dir.join("not-cargo.toml");
+        fs_err::write(
+            &bogus,
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )?;
+
+        let result = run_app(
+            Options {
+                command: Command::Target(TargetParameters {
+                    sub_command: TargetSubCommand::Add(AddParameters {
+                        manifest_path: bogus.clone(),
+                    }),
+                }),
+            },
+            environment.clone(),
+        )
+        .await;
+
+        match result {
+            Err(crate::error::Error::ManifestPathIsNotCargoToml(path, name)) => {
+                assert_eq!(path, fs_err::canonicalize(&bogus)?);
+                assert_eq!(name, "not-cargo.toml");
+            }
+            other => panic!("expected ManifestPathIsNotCargoToml, got {other:?}"),
+        }
+
+        // Config must not have been mutated by the rejected add.
+        let config = Config::load(&environment)?;
+        assert!(
+            config.workspaces.is_empty() && config.crates.is_empty(),
+            "config should be empty after rejected add"
+        );
+        Ok(())
+    }
 }
