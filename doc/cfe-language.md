@@ -490,6 +490,21 @@ Not available in `select` filter clauses.
 | `working_directory_clean` | `git status --porcelain` produces no output in the target directory. |
 | `git_config "key" == "value"` | The Git configuration key equals the given value in the target's repository. |
 
+#### `file_exists` and symlinks
+
+The containment check on `file_exists` is performed *lexically* on the
+joined path components — `.` and `..` are collapsed, but the filesystem
+is not consulted to resolve symlinks. A symlink that lives inside the
+workspace and points outside it (for example `workspace/escape -> /etc`)
+satisfies the containment check, and a probe like
+`file_exists "escape/passwd"` will then report whether `/etc/passwd`
+exists on disk. This matches how shells and most tools treat
+intra-workspace paths and is not considered a problem — `.cfe` programs
+are authored by the workspace owner, so the presence of such a symlink
+is itself an intentional authoring decision — but it does mean
+`file_exists` is not a hermetic "this file lives inside the workspace
+tree" assertion.
+
 #### Examples
 
 ```text
