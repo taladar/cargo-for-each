@@ -357,7 +357,12 @@ for crate in workspace {
   working directory.
 - Member crates that depend on other members in the same workspace are executed
   after their dependencies.
-- Dev-dependencies do not affect execution order.
+- Dev-dependencies contribute to execution order when they do not form a cycle
+  (soft ordering). When two or more member crates form a cycle that exists
+  only via dev-dependencies, the cycle-closing dev-dep edges are dropped so
+  the run can proceed; the members involved have no relative ordering
+  constraint to each other. A cycle that survives even with all dev-dep edges
+  removed is reported at run time as a circular dependency.
 
 #### Example
 
@@ -678,11 +683,27 @@ has a member crate that depends on a crate in workspace B, then workspace B is
 fully completed before workspace A begins.
 
 Within a workspace, the `for crate in workspace` block iterates over member
-crates in intra-workspace **dependency order**. Dev-dependencies are not
-considered for ordering purposes.
+crates in intra-workspace **dependency order**.
 
 Standalone crates (from `for crate { ... }`) are similarly executed in
 dependency order.
+
+#### Dev-dependencies and soft ordering
+
+Dev-dependencies contribute to dependency ordering — this matters for
+release-flow tasks where a dev-dep should be published before its
+consumer. Cycles introduced solely by dev-dep edges, however, are broken
+automatically: the resolver computes strongly-connected components on the
+full (normal + dev) dependency graph, and any dev-dep edge whose two
+endpoints lie in the same SCC is dropped. The targets in that SCC then
+have no relative ordering constraint and can run in any order.
+
+Cycles that survive even with all dev-dep edges removed (i.e. normal- or
+build-dependency cycles) are reported at run time as
+`CircularDependency` errors. A workspace-to-workspace edge is considered
+a dev-dep only when *every* underlying member-to-member edge between the
+two workspaces is a dev-dep; a single normal or build edge keeps the
+aggregated workspace edge as non-dev.
 
 ### State and re-entrancy
 

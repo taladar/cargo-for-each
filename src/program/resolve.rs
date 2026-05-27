@@ -18,6 +18,179 @@ use crate::targets::{CrateType, TargetKind};
 
 pub use snapshot::{ResolvedCrateExecution, ResolvedProgram, ResolvedWorkspaceExecution};
 
+// ── Soft dev-dep ordering ──────────────────────────────────────────────────────
+//
+// Cargo dev-dependencies are included as normal edges when they don't form a
+// cycle, and dropped only on the cycle-closing edges. This lets a release-flow
+// task publish a dev-dep before its consumer (the common case) while still
+// running when two crates only-but-mutually dev-depend on each other (e.g. for
+// test helpers).
+
+/// Iterative DFS frame for [`tarjan_scc`]; each frame remembers which
+/// successor index it has visited last so the next iteration can pick up
+/// where it left off.
+struct TarjanFrame {
+    /// Graph node this frame is currently visiting.
+    node: usize,
+    /// Index of the next successor of `node` to visit on resume.
+    succ_idx: usize,
+}
+
+/// Computes strongly-connected components of a directed graph using Tarjan's
+/// algorithm. Returns a vector of length `successors.len()` mapping each node
+/// to its SCC id. Singleton nodes with no self-loop each get their own SCC id.
+///
+/// `successors` must already contain only valid in-range node indices
+/// (`< successors.len()`); callers in this module always satisfy this because
+/// they build `successors` from `(0..n).map(...)` themselves.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "all indices come from `0..n` or from `successors[v]` which is built only from in-range values"
+)]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "counters increment at most `n` times where `n = successors.len()`; overflow would require usize::MAX nodes"
+)]
+fn tarjan_scc(successors: &[Vec<usize>]) -> Vec<usize> {
+    let n = successors.len();
+    let mut index_of: Vec<Option<usize>> = vec![None; n];
+    let mut lowlink: Vec<usize> = vec![0; n];
+    let mut on_stack: Vec<bool> = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut scc_of: Vec<usize> = vec![0; n];
+    let mut call_stack: Vec<TarjanFrame> = Vec::new();
+    let mut counter: usize = 0;
+    let mut next_scc: usize = 0;
+
+    for root in 0..n {
+        if index_of[root].is_some() {
+            continue;
+        }
+        // Enter `root`.
+        index_of[root] = Some(counter);
+        lowlink[root] = counter;
+        counter += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        call_stack.push(TarjanFrame {
+            node: root,
+            succ_idx: 0,
+        });
+
+        while let Some(frame) = call_stack.last_mut() {
+            let v = frame.node;
+            let succs = &successors[v];
+            if frame.succ_idx < succs.len() {
+                let w = succs[frame.succ_idx];
+                frame.succ_idx += 1;
+                match index_of[w] {
+                    None => {
+                        // Descend into w.
+                        index_of[w] = Some(counter);
+                        lowlink[w] = counter;
+                        counter += 1;
+                        stack.push(w);
+                        on_stack[w] = true;
+                        call_stack.push(TarjanFrame {
+                            node: w,
+                            succ_idx: 0,
+                        });
+                    }
+                    Some(w_idx) if on_stack[w] => {
+                        let lv = lowlink[v];
+                        if w_idx < lv {
+                            lowlink[v] = w_idx;
+                        }
+                    }
+                    Some(_) => {
+                        // w is in an already-finished SCC; ignore.
+                    }
+                }
+            } else {
+                // All successors of v explored — pop the frame and propagate
+                // lowlink upward.
+                call_stack.pop();
+                let v_idx = index_of[v].unwrap_or(0);
+                if lowlink[v] == v_idx {
+                    // v is an SCC root; pop until we get v.
+                    while let Some(w) = stack.pop() {
+                        on_stack[w] = false;
+                        scc_of[w] = next_scc;
+                        if w == v {
+                            break;
+                        }
+                    }
+                    next_scc += 1;
+                }
+                if let Some(parent) = call_stack.last() {
+                    let lp = lowlink[parent.node];
+                    let lv = lowlink[v];
+                    if lv < lp {
+                        lowlink[parent.node] = lv;
+                    }
+                }
+            }
+        }
+    }
+
+    scc_of
+}
+
+/// Applies the soft-ordering policy for dev-dependencies.
+///
+/// For each entry `(node, deps)`, `deps` lists `(dep_node, kind)` pairs. The
+/// function returns the same shape with `Vec<dep_node>` per entry, but with
+/// dev-dependency edges removed when both endpoints lie in the same
+/// strongly-connected component of the full (normal + dev) graph. Normal- and
+/// build-dependency edges, plus edges between different SCCs, are always
+/// preserved.
+///
+/// Edges whose destination is not in `nodes_with_deps` are kept verbatim
+/// (they cannot participate in a cycle inside this graph).
+fn apply_soft_dev_dep_ordering(
+    nodes_with_deps: Vec<(PathBuf, Vec<(PathBuf, DependencyKind)>)>,
+) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    let idx_of: HashMap<PathBuf, usize> = nodes_with_deps
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (id.clone(), i))
+        .collect();
+    let n = nodes_with_deps.len();
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (src_idx, (_, deps)) in nodes_with_deps.iter().enumerate() {
+        let Some(succ_list) = successors.get_mut(src_idx) else {
+            continue;
+        };
+        for (dep_id, _) in deps {
+            if let Some(&dst_idx) = idx_of.get(dep_id) {
+                succ_list.push(dst_idx);
+            }
+        }
+    }
+    let scc = tarjan_scc(&successors);
+
+    nodes_with_deps
+        .into_iter()
+        .enumerate()
+        .map(|(src_idx, (node, deps))| {
+            let filtered: Vec<PathBuf> = deps
+                .into_iter()
+                .filter(|(dep_id, kind)| {
+                    if *kind != DependencyKind::Development {
+                        return true;
+                    }
+                    // Drop only if both endpoints are in the same SCC.
+                    idx_of.get(dep_id).is_none_or(|&dst_idx| {
+                        scc.get(src_idx).copied() != scc.get(dst_idx).copied()
+                    })
+                })
+                .map(|(dep_id, _)| dep_id)
+                .collect();
+            (node, filtered)
+        })
+        .collect()
+}
+
 /// Resolves a parsed program against the current configuration.
 ///
 /// Processes all `select workspaces` and `select crates` statements, filters
@@ -204,8 +377,6 @@ fn resolve_workspaces_from_canonical_dirs(
         return Ok(Vec::new());
     }
 
-    let selected_set: HashSet<&PathBuf> = canonical_selected.iter().collect();
-
     // For each selected workspace, load cargo metadata to get member crates.
     // We also collect all package info to compute inter-workspace deps.
     let mut workspace_packages: HashMap<PathBuf, Vec<WorkspaceMemberInfo>> = HashMap::new();
@@ -237,8 +408,18 @@ fn resolve_workspaces_from_canonical_dirs(
         workspace_packages.insert(canonical_ws_dir.clone(), members);
     }
 
+    // Inter-workspace deps are computed for every workspace in a single pass
+    // so the SCC view inside `apply_soft_dev_dep_ordering` covers the whole
+    // graph.
+    let inter_ws_deps = compute_inter_workspace_deps(
+        &canonical_selected,
+        &workspace_packages,
+        &all_packages,
+        &package_name_to_id,
+    )?;
+
     // For each selected workspace, resolve member crates (with intra-workspace deps)
-    // and determine inter-workspace dependencies.
+    // and look up its inter-workspace dependencies.
     let mut executions: Vec<ResolvedWorkspaceExecution> = Vec::new();
 
     for canonical_ws_dir in &canonical_selected {
@@ -249,16 +430,10 @@ fn resolve_workspaces_from_canonical_dirs(
             &package_name_to_id,
         )?;
 
-        // Inter-workspace deps: does any member of this workspace depend on a
-        // crate that belongs to a *different* selected workspace?
-        let workspace_deps = compute_inter_workspace_deps(
-            canonical_ws_dir,
-            &workspace_packages,
-            &all_packages,
-            &package_name_to_id,
-            &selected_set,
-            &canonical_selected,
-        )?;
+        let workspace_deps = inter_ws_deps
+            .get(canonical_ws_dir)
+            .cloned()
+            .unwrap_or_default();
 
         executions.push(ResolvedWorkspaceExecution {
             manifest_dir: canonical_ws_dir.clone(),
@@ -380,6 +555,10 @@ struct WorkspaceMemberInfo {
 
 /// Resolves the member crates of a single workspace with their intra-workspace
 /// dependencies.
+///
+/// Dev-dependencies participate in the dep graph, but `apply_soft_dev_dep_ordering`
+/// drops dev-dep edges that close a cycle so dev-dep-only cycles do not
+/// produce a runtime `CircularDependency` error.
 fn resolve_workspace_member_crates(
     workspace_dir: &Path,
     workspace_packages: &HashMap<PathBuf, Vec<WorkspaceMemberInfo>>,
@@ -392,19 +571,15 @@ fn resolve_workspace_member_crates(
 
     let member_dirs: HashSet<&PathBuf> = members.iter().map(|m| &m.manifest_dir).collect();
 
-    let mut crates: Vec<ResolvedCrateExecution> = Vec::new();
+    let mut raw: Vec<(PathBuf, Vec<(PathBuf, DependencyKind)>)> = Vec::new();
 
     for member in members {
         let package = all_packages.get(&member.package_id).ok_or_else(|| {
             Error::FoundNoPackageInCargoMetadataWithGivenManifestPath(member.manifest_dir.clone())
         })?;
 
-        let mut dependencies: Vec<PathBuf> = Vec::new();
+        let mut dependencies: Vec<(PathBuf, DependencyKind)> = Vec::new();
         for dep in &package.dependencies {
-            // Skip dev-dependencies: they do not affect publish/execution order.
-            if dep.kind == DependencyKind::Development {
-                continue;
-            }
             if let Some(dep_id) = package_name_to_id.get(&dep.name)
                 && let Some(dep_pkg) = all_packages.get(dep_id)
             {
@@ -418,34 +593,40 @@ fn resolve_workspace_member_crates(
                 })?;
                 // Only record intra-workspace deps (i.e., the dep is also a member).
                 if member_dirs.contains(&canonical_dep_dir) {
-                    dependencies.push(canonical_dep_dir);
+                    dependencies.push((canonical_dep_dir, dep.kind));
                 }
             }
         }
 
-        crates.push(ResolvedCrateExecution {
-            manifest_dir: member.manifest_dir.clone(),
-            dependencies,
-        });
+        raw.push((member.manifest_dir.clone(), dependencies));
     }
 
-    Ok(crates)
+    Ok(apply_soft_dev_dep_ordering(raw)
+        .into_iter()
+        .map(|(manifest_dir, dependencies)| ResolvedCrateExecution {
+            manifest_dir,
+            dependencies,
+        })
+        .collect())
 }
 
-/// Computes which other selected workspaces the given workspace depends on
-/// (i.e., any member of this workspace depends on a crate in another selected
-/// workspace).
+/// Computes inter-workspace dependencies for all selected workspaces in one
+/// pass, returning a map from workspace_dir to the list of other selected
+/// workspace_dirs it depends on.
+///
+/// Member-level dev/normal/build kinds are aggregated up to the workspace
+/// level: if any member-to-other-workspace edge is non-dev, the resulting
+/// workspace-to-workspace edge is treated as non-dev. Only when every
+/// underlying member edge is a dev-dep does the aggregated edge count as a
+/// dev-dep — and hence become eligible for cycle-breaking under
+/// [`apply_soft_dev_dep_ordering`].
 fn compute_inter_workspace_deps(
-    workspace_dir: &Path,
+    canonical_selected: &[PathBuf],
     workspace_packages: &HashMap<PathBuf, Vec<WorkspaceMemberInfo>>,
     all_packages: &HashMap<PackageId, cargo_metadata::Package>,
     package_name_to_id: &HashMap<String, PackageId>,
-    selected_set: &HashSet<&PathBuf>,
-    canonical_selected: &[PathBuf],
-) -> Result<Vec<PathBuf>, Error> {
-    let Some(members) = workspace_packages.get(workspace_dir) else {
-        return Ok(Vec::new());
-    };
+) -> Result<HashMap<PathBuf, Vec<PathBuf>>, Error> {
+    let selected_set: HashSet<&PathBuf> = canonical_selected.iter().collect();
 
     // Build a map from member manifest_dir → workspace manifest_dir for all
     // members of all selected workspaces.
@@ -458,42 +639,69 @@ fn compute_inter_workspace_deps(
         }
     }
 
-    let mut dep_workspaces: HashSet<PathBuf> = HashSet::new();
+    let mut raw: Vec<(PathBuf, Vec<(PathBuf, DependencyKind)>)> = Vec::new();
 
-    for member in members {
-        let Some(package) = all_packages.get(&member.package_id) else {
-            continue;
-        };
+    for workspace_dir in canonical_selected {
+        let mut per_target_kind: HashMap<PathBuf, DependencyKind> = HashMap::new();
 
-        for dep in &package.dependencies {
-            let Some(dep_id) = package_name_to_id.get(&dep.name) else {
-                continue;
-            };
-            let Some(dep_pkg) = all_packages.get(dep_id) else {
-                continue;
-            };
-            // Match the hard-fail behaviour of the sibling resolvers
-            // (`resolve_workspace_member_crates`, `crate_executions_from_dirs`):
-            // a canonicalize failure here used to be silently swallowed via
-            // `.ok().ok_or(())`, which dropped the dep edge entirely and
-            // broke runtime dependency-readiness gating downstream.
-            let dep_dir = dep_pkg.manifest_path.parent().ok_or_else(|| {
-                Error::ManifestPathHasNoParentDir(dep_pkg.manifest_path.clone().into_std_path_buf())
-            })?;
-            let dep_dir_canonical = dep_dir.canonicalize().map_err(|e| {
-                Error::CouldNotDetermineCanonicalManifestPath(dep_dir.to_path_buf().into(), e)
-            })?;
+        if let Some(members) = workspace_packages.get(workspace_dir) {
+            for member in members {
+                let Some(package) = all_packages.get(&member.package_id) else {
+                    continue;
+                };
 
-            if let Some(&dep_ws) = crate_to_workspace.get(&dep_dir_canonical) {
-                // The dep lives in another selected workspace.
-                if dep_ws != workspace_dir && selected_set.contains(dep_ws) {
-                    dep_workspaces.insert(dep_ws.clone());
+                for dep in &package.dependencies {
+                    let Some(dep_id) = package_name_to_id.get(&dep.name) else {
+                        continue;
+                    };
+                    let Some(dep_pkg) = all_packages.get(dep_id) else {
+                        continue;
+                    };
+                    // Match the hard-fail behaviour of the sibling resolvers
+                    // (`resolve_workspace_member_crates`,
+                    // `crate_executions_from_dirs`): a canonicalize failure
+                    // here used to be silently swallowed via
+                    // `.ok().ok_or(())`, which dropped the dep edge entirely
+                    // and broke runtime dependency-readiness gating
+                    // downstream.
+                    let dep_dir = dep_pkg.manifest_path.parent().ok_or_else(|| {
+                        Error::ManifestPathHasNoParentDir(
+                            dep_pkg.manifest_path.clone().into_std_path_buf(),
+                        )
+                    })?;
+                    let dep_dir_canonical = dep_dir.canonicalize().map_err(|e| {
+                        Error::CouldNotDetermineCanonicalManifestPath(
+                            dep_dir.to_path_buf().into(),
+                            e,
+                        )
+                    })?;
+
+                    if let Some(&dep_ws) = crate_to_workspace.get(&dep_dir_canonical)
+                        && dep_ws != workspace_dir
+                        && selected_set.contains(dep_ws)
+                    {
+                        // Aggregate: non-Development trumps Development;
+                        // beyond that we just keep the first kind seen.
+                        per_target_kind
+                            .entry(dep_ws.clone())
+                            .and_modify(|existing| {
+                                if *existing == DependencyKind::Development
+                                    && dep.kind != DependencyKind::Development
+                                {
+                                    *existing = dep.kind;
+                                }
+                            })
+                            .or_insert(dep.kind);
+                    }
                 }
             }
         }
+
+        let deps: Vec<(PathBuf, DependencyKind)> = per_target_kind.into_iter().collect();
+        raw.push((workspace_dir.clone(), deps));
     }
 
-    Ok(dep_workspaces.into_iter().collect())
+    Ok(apply_soft_dev_dep_ordering(raw).into_iter().collect())
 }
 
 /// Selects and resolves standalone crates that match any of the given filters.
@@ -579,13 +787,18 @@ fn resolve_standalone_crates(
 
 /// Builds [`ResolvedCrateExecution`] entries for the given canonical manifest
 /// directories, resolving intra-set dependencies via `cargo metadata` data.
+///
+/// Dev-dependencies participate in the dep graph, but
+/// `apply_soft_dev_dep_ordering` drops dev-dep edges that close a cycle so
+/// dev-dep-only cycles among standalone crates do not produce a runtime
+/// `CircularDependency` error.
 fn crate_executions_from_dirs(
     canonical_dirs: &[PathBuf],
     target_set: &HashSet<&PathBuf>,
     all_packages: &HashMap<PackageId, cargo_metadata::Package>,
     package_name_to_id: &HashMap<String, PackageId>,
 ) -> Result<Vec<ResolvedCrateExecution>, Error> {
-    let mut results: Vec<ResolvedCrateExecution> = Vec::new();
+    let mut raw: Vec<(PathBuf, Vec<(PathBuf, DependencyKind)>)> = Vec::new();
 
     for canonical_dir in canonical_dirs {
         // Find which package corresponds to this manifest directory.
@@ -609,12 +822,8 @@ fn crate_executions_from_dirs(
             Error::FoundNoPackageInCargoMetadataWithGivenManifestPath(canonical_dir.clone())
         })?;
 
-        let mut dependencies: Vec<PathBuf> = Vec::new();
+        let mut dependencies: Vec<(PathBuf, DependencyKind)> = Vec::new();
         for dep in &package.dependencies {
-            // Skip dev-dependencies: they do not affect publish/execution order.
-            if dep.kind == DependencyKind::Development {
-                continue;
-            }
             let Some(dep_id) = package_name_to_id.get(&dep.name) else {
                 continue;
             };
@@ -628,17 +837,20 @@ fn crate_executions_from_dirs(
                 Error::CouldNotDetermineCanonicalManifestPath(dep_dir.to_path_buf().into(), e)
             })?;
             if target_set.contains(&canonical_dep_dir) {
-                dependencies.push(canonical_dep_dir);
+                dependencies.push((canonical_dep_dir, dep.kind));
             }
         }
 
-        results.push(ResolvedCrateExecution {
-            manifest_dir: canonical_dir.clone(),
-            dependencies,
-        });
+        raw.push((canonical_dir.clone(), dependencies));
     }
 
-    Ok(results)
+    Ok(apply_soft_dev_dep_ordering(raw)
+        .into_iter()
+        .map(|(manifest_dir, dependencies)| ResolvedCrateExecution {
+            manifest_dir,
+            dependencies,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -652,7 +864,7 @@ mod tests {
         reason = "test code indexes known positions in resolved structures"
     )]
 
-    use pretty_assertions::assert_eq;
+    use pretty_assertions::{assert_eq, assert_ne};
 
     use super::*;
     use crate::program::parser::parse;
@@ -830,5 +1042,148 @@ mod tests {
             assert_eq!(member.manifest_dir, canonical);
         }
         Ok(())
+    }
+
+    // ── tarjan_scc / apply_soft_dev_dep_ordering ──────────────────────────────
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// Returns the set of SCC ids touched by the given node indices, useful
+    /// when checking that a group of nodes was placed in the same SCC.
+    fn sccs_of(scc: &[usize], nodes: &[usize]) -> Vec<usize> {
+        let mut s: Vec<usize> = nodes.iter().map(|&i| scc[i]).collect();
+        s.sort_unstable();
+        s.dedup();
+        s
+    }
+
+    #[test]
+    fn tarjan_scc_singletons() {
+        // 0 → 1 → 2 (no cycles): three SCCs of size 1.
+        let succ = vec![vec![1], vec![2], vec![]];
+        let scc = tarjan_scc(&succ);
+        assert_eq!(sccs_of(&scc, &[0]).len(), 1);
+        assert_eq!(sccs_of(&scc, &[1]).len(), 1);
+        assert_eq!(sccs_of(&scc, &[2]).len(), 1);
+        assert_eq!(sccs_of(&scc, &[0, 1, 2]).len(), 3);
+    }
+
+    #[test]
+    fn tarjan_scc_two_cycle() {
+        // 0 ↔ 1: one SCC of size 2.
+        let succ = vec![vec![1], vec![0]];
+        let scc = tarjan_scc(&succ);
+        assert_eq!(scc[0], scc[1]);
+    }
+
+    #[test]
+    fn tarjan_scc_three_cycle_with_attached_tail() {
+        // 0 → 1 → 2 → 0 (3-cycle), 2 → 3 (tail).
+        let succ = vec![vec![1], vec![2], vec![0, 3], vec![]];
+        let scc = tarjan_scc(&succ);
+        assert_eq!(scc[0], scc[1]);
+        assert_eq!(scc[1], scc[2]);
+        assert_ne!(scc[0], scc[3]);
+    }
+
+    #[test]
+    fn tarjan_scc_self_loop_is_own_scc() {
+        // 0 → 0; SCC is size 1 but the node IS in a cycle.
+        let succ = vec![vec![0]];
+        let scc = tarjan_scc(&succ);
+        // Self-loop semantics: scc[0] == scc[0] (trivially), so an edge from
+        // 0 to 0 would be detected as "same SCC" by the filter.
+        assert_eq!(scc[0], scc[0]);
+    }
+
+    /// Two crates that only dev-depend on each other (A ↔ B, both Dev) should
+    /// have both edges dropped by the soft-ordering filter.
+    #[test]
+    fn soft_ordering_breaks_dev_only_cycle() {
+        let nodes = vec![
+            (p("/a"), vec![(p("/b"), DependencyKind::Development)]),
+            (p("/b"), vec![(p("/a"), DependencyKind::Development)]),
+        ];
+        let out = apply_soft_dev_dep_ordering(nodes);
+        assert_eq!(out.len(), 2);
+        for (_, deps) in &out {
+            assert!(
+                deps.is_empty(),
+                "expected empty deps after cycle-break, got {deps:?}"
+            );
+        }
+    }
+
+    /// A normal-dep cycle must NOT be broken — the runtime should report it
+    /// as a circular dependency.
+    #[test]
+    fn soft_ordering_preserves_normal_cycle() {
+        let nodes = vec![
+            (p("/a"), vec![(p("/b"), DependencyKind::Normal)]),
+            (p("/b"), vec![(p("/a"), DependencyKind::Normal)]),
+        ];
+        let out = apply_soft_dev_dep_ordering(nodes);
+        // Both edges still present.
+        let by_node: HashMap<&PathBuf, &Vec<PathBuf>> = out.iter().map(|(n, d)| (n, d)).collect();
+        assert_eq!(by_node[&p("/a")], &vec![p("/b")]);
+        assert_eq!(by_node[&p("/b")], &vec![p("/a")]);
+    }
+
+    /// A mixed cycle (one Normal edge, one Dev edge) must NOT be fully broken:
+    /// only the Dev edge is dropped; the Normal edge stays so the runtime
+    /// still reports the underlying issue as appropriate.
+    #[test]
+    fn soft_ordering_drops_dev_edge_in_mixed_cycle() {
+        // a -Normal-> b, b -Dev-> a. SCC is {a, b}. Drop only the Dev edge.
+        let nodes = vec![
+            (p("/a"), vec![(p("/b"), DependencyKind::Normal)]),
+            (p("/b"), vec![(p("/a"), DependencyKind::Development)]),
+        ];
+        let out = apply_soft_dev_dep_ordering(nodes);
+        let by_node: HashMap<&PathBuf, &Vec<PathBuf>> = out.iter().map(|(n, d)| (n, d)).collect();
+        assert_eq!(by_node[&p("/a")], &vec![p("/b")]);
+        assert!(
+            by_node[&p("/b")].is_empty(),
+            "dev edge in cycle should be dropped"
+        );
+    }
+
+    /// A dev-dep edge that does NOT close a cycle (the endpoint is downstream)
+    /// must be preserved so it contributes to ordering.
+    #[test]
+    fn soft_ordering_keeps_dev_dep_outside_cycle() {
+        // a -Dev-> b, no reverse edge. SCC singletons; edge preserved.
+        let nodes = vec![
+            (p("/a"), vec![(p("/b"), DependencyKind::Development)]),
+            (p("/b"), vec![]),
+        ];
+        let out = apply_soft_dev_dep_ordering(nodes);
+        let by_node: HashMap<&PathBuf, &Vec<PathBuf>> = out.iter().map(|(n, d)| (n, d)).collect();
+        assert_eq!(by_node[&p("/a")], &vec![p("/b")]);
+    }
+
+    /// Build-dependencies are treated like Normal: they contribute to ordering
+    /// AND they are never dropped even when they close a cycle.
+    #[test]
+    fn soft_ordering_treats_build_like_normal() {
+        let nodes = vec![
+            (p("/a"), vec![(p("/b"), DependencyKind::Build)]),
+            (p("/b"), vec![(p("/a"), DependencyKind::Build)]),
+        ];
+        let out = apply_soft_dev_dep_ordering(nodes);
+        let by_node: HashMap<&PathBuf, &Vec<PathBuf>> = out.iter().map(|(n, d)| (n, d)).collect();
+        assert_eq!(by_node[&p("/a")], &vec![p("/b")]);
+        assert_eq!(by_node[&p("/b")], &vec![p("/a")]);
+    }
+
+    /// An edge whose destination is outside the node set must be left alone
+    /// (it cannot participate in an in-set cycle).
+    #[test]
+    fn soft_ordering_keeps_edge_to_unknown_dest() {
+        let nodes = vec![(p("/a"), vec![(p("/external"), DependencyKind::Development)])];
+        let out = apply_soft_dev_dep_ordering(nodes);
+        assert_eq!(out[0].1, vec![p("/external")]);
     }
 }
