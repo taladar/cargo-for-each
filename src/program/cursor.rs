@@ -68,17 +68,35 @@ impl fmt::Display for CursorSegment {
     }
 }
 
-/// Error returned when a cursor segment cannot be parsed.
+/// Error returned when a cursor path string cannot be parsed.
+///
+/// Covers both per-segment failures (`InvalidSegment`) and structural
+/// problems with the surrounding path (`LeadingSlash`, `ConsecutiveSlashes`,
+/// `EmptyPath`).
 #[expect(
     clippy::module_name_repetitions,
     reason = "name is intentional within the cursor module"
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CursorSegmentParseError(String);
+pub enum CursorSegmentParseError {
+    /// A `/`-separated segment did not match any known cursor segment shape.
+    InvalidSegment(String),
+    /// The input started with `/`, which would imply an empty leading segment.
+    LeadingSlash,
+    /// The input contained `//`, which would imply an empty interior segment.
+    ConsecutiveSlashes,
+    /// The input was non-empty but contained no real segments (e.g. `"/"`).
+    EmptyPath,
+}
 
 impl fmt::Display for CursorSegmentParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid cursor segment: {:?}", self.0)
+        match self {
+            Self::InvalidSegment(s) => write!(f, "invalid cursor segment: {s:?}"),
+            Self::LeadingSlash => f.write_str("cursor path must not start with `/`"),
+            Self::ConsecutiveSlashes => f.write_str("cursor path must not contain `//`"),
+            Self::EmptyPath => f.write_str("cursor path contains no segments"),
+        }
     }
 }
 
@@ -113,7 +131,7 @@ impl FromStr for CursorSegment {
         {
             let n = rest
                 .parse::<usize>()
-                .map_err(|_| CursorSegmentParseError(s.to_owned()))?;
+                .map_err(|_| CursorSegmentParseError::InvalidSegment(s.to_owned()))?;
             return Ok(Self::WorkspaceIteration(n));
         }
         if let Some(rest) = s.strip_prefix("c")
@@ -121,7 +139,7 @@ impl FromStr for CursorSegment {
         {
             let n = rest
                 .parse::<usize>()
-                .map_err(|_| CursorSegmentParseError(s.to_owned()))?;
+                .map_err(|_| CursorSegmentParseError::InvalidSegment(s.to_owned()))?;
             return Ok(Self::CrateIteration(n));
         }
         if let Some(rest) = s.strip_prefix("s")
@@ -129,7 +147,7 @@ impl FromStr for CursorSegment {
         {
             let n = rest
                 .parse::<usize>()
-                .map_err(|_| CursorSegmentParseError(s.to_owned()))?;
+                .map_err(|_| CursorSegmentParseError::InvalidSegment(s.to_owned()))?;
             return Ok(Self::Statement(n));
         }
         if let Some(rest) = s.strip_prefix("if")
@@ -137,10 +155,10 @@ impl FromStr for CursorSegment {
         {
             let n = rest
                 .parse::<usize>()
-                .map_err(|_| CursorSegmentParseError(s.to_owned()))?;
+                .map_err(|_| CursorSegmentParseError::InvalidSegment(s.to_owned()))?;
             return Ok(Self::IfBranch(n));
         }
-        Err(CursorSegmentParseError(s.to_owned()))
+        Err(CursorSegmentParseError::InvalidSegment(s.to_owned()))
     }
 }
 
@@ -223,13 +241,40 @@ impl ProgramCursor {
 
     /// Parses a cursor from a `/`-separated path string.
     ///
+    /// The empty string is accepted and yields the empty cursor (matching
+    /// `ProgramCursor::new().to_path_string()`).  Otherwise the input must
+    /// contain at least one non-empty segment, must not start with `/`, and
+    /// must not contain `//`.  A single trailing `/` is allowed so that
+    /// strings produced by [`to_path_string`](Self::to_path_string) round-trip
+    /// cleanly.
+    ///
     /// # Errors
     ///
-    /// Returns a [`CursorSegmentParseError`] if any segment cannot be parsed.
+    /// Returns [`CursorSegmentParseError::LeadingSlash`] if the input starts
+    /// with `/`, [`CursorSegmentParseError::ConsecutiveSlashes`] if it
+    /// contains `//`, [`CursorSegmentParseError::EmptyPath`] if it is
+    /// non-empty but yields no segments, and
+    /// [`CursorSegmentParseError::InvalidSegment`] if any segment is
+    /// individually unparsable.
     pub fn from_path_string(s: &str) -> Result<Self, CursorSegmentParseError> {
-        let segments = s
-            .split('/')
-            .filter(|part| !part.is_empty())
+        if s.is_empty() {
+            return Ok(Self::new());
+        }
+        if s.starts_with('/') {
+            return Err(CursorSegmentParseError::LeadingSlash);
+        }
+        if s.contains("//") {
+            return Err(CursorSegmentParseError::ConsecutiveSlashes);
+        }
+        // A single trailing `/` from `to_path_string` is the only legitimate
+        // source of an empty segment after `split('/')`; allow it but require
+        // at least one real segment before it.
+        let segments: Vec<&str> = s.split('/').filter(|part| !part.is_empty()).collect();
+        if segments.is_empty() {
+            return Err(CursorSegmentParseError::EmptyPath);
+        }
+        let segments = segments
+            .into_iter()
             .map(CursorSegment::from_str)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { segments })
@@ -410,6 +455,39 @@ mod tests {
     fn cursor_from_path_string_empty() {
         let cursor = ProgramCursor::from_path_string("").unwrap_or_else(|e| panic!("{e}"));
         assert!(cursor.is_empty());
+    }
+
+    fn expect_err(s: &str) -> CursorSegmentParseError {
+        match ProgramCursor::from_path_string(s) {
+            Ok(_) => panic!("expected parse error for {s:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn cursor_from_path_string_rejects_leading_slash() {
+        assert_eq!(expect_err("/"), CursorSegmentParseError::LeadingSlash);
+        assert_eq!(expect_err("/w0"), CursorSegmentParseError::LeadingSlash);
+    }
+
+    #[test]
+    fn cursor_from_path_string_rejects_consecutive_slashes() {
+        assert_eq!(
+            expect_err("w0//s0"),
+            CursorSegmentParseError::ConsecutiveSlashes,
+        );
+        // `//` alone trips the leading-slash check first, which is fine —
+        // both are reasons to reject, and "starts with /" is the more
+        // specific diagnostic.
+        assert_eq!(expect_err("//"), CursorSegmentParseError::LeadingSlash);
+    }
+
+    #[test]
+    fn cursor_from_path_string_accepts_trailing_slash() {
+        // `to_path_string` always emits a trailing `/`; round-tripping must
+        // still work.
+        let cursor = ProgramCursor::from_path_string("w0/s2/").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(cursor.segments().len(), 2);
     }
 
     #[test]
