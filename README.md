@@ -103,7 +103,17 @@ member crates are added automatically.
 
 #### `target remove`
 
-Remove a workspace and all its crates from the configuration.
+Remove a registered target from the configuration. The supplied
+`Cargo.toml` is matched against both workspace and crate entries:
+
+- If it is a workspace root, the workspace and every crate belonging
+  to it are removed.
+- If it is a single crate's manifest inside a still-registered
+  workspace, only that crate's entry is removed; the workspace and
+  its other members stay registered.
+- If it is a standalone crate (registered as its own one-member
+  workspace), both the workspace wrapper and the crate entry are
+  removed.
 
 | Flag | Description |
 |------|-------------|
