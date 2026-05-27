@@ -648,16 +648,39 @@ pub struct NextStatement<'a> {
     pub env_file_paths: Vec<String>,
 }
 
+/// Result of searching a scope for the next executable statement.
+///
+/// Distinguishes "no further executable statement because everything is done"
+/// from "no further executable statement because a `wait_for_continue` barrier
+/// is blocking progress". Callers must propagate `Suspended` upward so that
+/// statements following a barrier-blocked scope do not run prematurely.
+#[derive(Debug)]
+pub enum NextOutcome<'a> {
+    /// Every statement in the scope is complete.
+    Done,
+    /// At least one cursor in the scope is blocked at an unreleased
+    /// `wait_for_continue` barrier, and no executable statement is available
+    /// in the scope without first releasing it.
+    Suspended,
+    /// The next statement that should be executed.
+    Next(NextStatement<'a>),
+}
+
 /// Finds the first uncompleted crate statement in `stmts` starting at `prefix`.
 ///
-/// Returns `None` if all statements are completed.
+/// Returns [`NextOutcome::Done`] if every statement is complete,
+/// [`NextOutcome::Suspended`] if a `wait_for_continue` barrier in this scope
+/// (or in a nested scope) is in the *waiting* state with no executable
+/// statement available before it, or [`NextOutcome::Next`] with the next
+/// action.
 fn find_next_in_crate_stmts<'a>(
     stmts: &'a [CrateStatement],
     prefix: &ProgramCursor,
     manifest_dir: &'a Path,
     state_base: &Path,
     env_file_paths: &[String],
-) -> Option<NextStatement<'a>> {
+) -> NextOutcome<'a> {
+    let mut suspended = false;
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
         let state_dir = state_base.join(cursor.to_path());
@@ -665,7 +688,7 @@ fn find_next_in_crate_stmts<'a>(
         match stmt {
             CrateStatement::Run(step) => {
                 if !is_run_completed(&state_dir) {
-                    return Some(NextStatement {
+                    return NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::RunCommand(step),
@@ -675,7 +698,7 @@ fn find_next_in_crate_stmts<'a>(
             }
             CrateStatement::ManualStep(step) => {
                 if !is_manual_completed(&state_dir) {
-                    return Some(NextStatement {
+                    return NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::ManualStep(step),
@@ -685,7 +708,7 @@ fn find_next_in_crate_stmts<'a>(
             }
             CrateStatement::SnapshotMetadata(step) => {
                 if !is_snapshot_metadata_completed(&state_dir) {
-                    return Some(NextStatement {
+                    return NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::SnapshotMetadata(step),
@@ -696,7 +719,7 @@ fn find_next_in_crate_stmts<'a>(
             CrateStatement::If(block) => {
                 match fs_err::read_to_string(state_dir.join("chosen_branch")) {
                     Err(_) => {
-                        return Some(NextStatement {
+                        return NextOutcome::Next(NextStatement {
                             cursor,
                             manifest_dir,
                             action: StatementAction::EvaluateCrateIf(block),
@@ -705,7 +728,7 @@ fn find_next_in_crate_stmts<'a>(
                     }
                     Ok(chosen) => {
                         let nested = match chosen.trim() {
-                            "none" => None,
+                            "none" => NextOutcome::Done,
                             "else" => {
                                 let p = cursor.clone().with(CursorSegment::ElseBranch);
                                 find_next_in_crate_stmts(
@@ -716,8 +739,8 @@ fn find_next_in_crate_stmts<'a>(
                                     env_file_paths,
                                 )
                             }
-                            s => s.parse::<usize>().ok().and_then(|n| {
-                                block.branches.get(n).and_then(|branch| {
+                            s => s.parse::<usize>().ok().map_or(NextOutcome::Done, |n| {
+                                block.branches.get(n).map_or(NextOutcome::Done, |branch| {
                                     let p = cursor.clone().with(CursorSegment::IfBranch(n));
                                     find_next_in_crate_stmts(
                                         &branch.statements,
@@ -729,8 +752,10 @@ fn find_next_in_crate_stmts<'a>(
                                 })
                             }),
                         };
-                        if nested.is_some() {
-                            return nested;
+                        match nested {
+                            NextOutcome::Next(_) => return nested,
+                            NextOutcome::Suspended => suspended = true,
+                            NextOutcome::Done => {}
                         }
                     }
                 }
@@ -746,19 +771,21 @@ fn find_next_in_crate_stmts<'a>(
                     state_base,
                     &inner_env_files,
                 );
-                if nested.is_some() {
-                    return nested;
+                match nested {
+                    NextOutcome::Next(_) => return nested,
+                    NextOutcome::Suspended => suspended = true,
+                    NextOutcome::Done => {}
                 }
             }
             CrateStatement::WaitForContinue(node) => {
                 if is_wait_barrier_released(&state_dir) {
                     // Already released — fall through to the next statement.
                 } else if is_wait_barrier_waiting(&state_dir) {
-                    // Waiting for release — block this target.
-                    return None;
+                    // Waiting for release — this scope is suspended.
+                    return NextOutcome::Suspended;
                 } else {
                     // Pending — surface it as the next action.
-                    return Some(NextStatement {
+                    return NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::WaitForContinue(node),
@@ -768,12 +795,19 @@ fn find_next_in_crate_stmts<'a>(
             }
         }
     }
-    None
+    if suspended {
+        NextOutcome::Suspended
+    } else {
+        NextOutcome::Done
+    }
 }
 
 /// Finds the first uncompleted workspace statement in `stmts` starting at `prefix`.
 ///
-/// Returns `None` if all statements (including nested `for crate in workspace`) are done.
+/// Returns [`NextOutcome::Done`] when every statement (including nested
+/// `for crate in workspace`) is complete, [`NextOutcome::Suspended`] when a
+/// nested barrier is blocking progress, or [`NextOutcome::Next`] with the
+/// next action.
 fn find_next_in_workspace_stmts<'a>(
     stmts: &'a [WorkspaceStatement],
     prefix: &ProgramCursor,
@@ -781,7 +815,8 @@ fn find_next_in_workspace_stmts<'a>(
     member_crates: &'a [ResolvedCrateExecution],
     state_base: &Path,
     env_file_paths: &[String],
-) -> Option<NextStatement<'a>> {
+) -> NextOutcome<'a> {
+    let mut suspended = false;
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
         let state_dir = state_base.join(cursor.to_path());
@@ -789,7 +824,7 @@ fn find_next_in_workspace_stmts<'a>(
         match stmt {
             WorkspaceStatement::Run(step) => {
                 if !is_run_completed(&state_dir) {
-                    return Some(NextStatement {
+                    return NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::RunCommand(step),
@@ -799,7 +834,7 @@ fn find_next_in_workspace_stmts<'a>(
             }
             WorkspaceStatement::ManualStep(step) => {
                 if !is_manual_completed(&state_dir) {
-                    return Some(NextStatement {
+                    return NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::ManualStep(step),
@@ -809,7 +844,7 @@ fn find_next_in_workspace_stmts<'a>(
             }
             WorkspaceStatement::SnapshotMetadata(step) => {
                 if !is_snapshot_metadata_completed(&state_dir) {
-                    return Some(NextStatement {
+                    return NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::SnapshotMetadata(step),
@@ -820,7 +855,7 @@ fn find_next_in_workspace_stmts<'a>(
             WorkspaceStatement::If(block) => {
                 match fs_err::read_to_string(state_dir.join("chosen_branch")) {
                     Err(_) => {
-                        return Some(NextStatement {
+                        return NextOutcome::Next(NextStatement {
                             cursor,
                             manifest_dir,
                             action: StatementAction::EvaluateWorkspaceIf(block),
@@ -829,7 +864,7 @@ fn find_next_in_workspace_stmts<'a>(
                     }
                     Ok(chosen) => {
                         let nested = match chosen.trim() {
-                            "none" => None,
+                            "none" => NextOutcome::Done,
                             "else" => {
                                 let p = cursor.clone().with(CursorSegment::ElseBranch);
                                 find_next_in_workspace_stmts(
@@ -841,8 +876,8 @@ fn find_next_in_workspace_stmts<'a>(
                                     env_file_paths,
                                 )
                             }
-                            s => s.parse::<usize>().ok().and_then(|n| {
-                                block.branches.get(n).and_then(|branch| {
+                            s => s.parse::<usize>().ok().map_or(NextOutcome::Done, |n| {
+                                block.branches.get(n).map_or(NextOutcome::Done, |branch| {
                                     let p = cursor.clone().with(CursorSegment::IfBranch(n));
                                     find_next_in_workspace_stmts(
                                         &branch.statements,
@@ -855,8 +890,10 @@ fn find_next_in_workspace_stmts<'a>(
                                 })
                             }),
                         };
-                        if nested.is_some() {
-                            return nested;
+                        match nested {
+                            NextOutcome::Next(_) => return nested,
+                            NextOutcome::Suspended => suspended = true,
+                            NextOutcome::Done => {}
                         }
                     }
                 }
@@ -873,8 +910,10 @@ fn find_next_in_workspace_stmts<'a>(
                     state_base,
                     &inner_env_files,
                 );
-                if nested.is_some() {
-                    return nested;
+                match nested {
+                    NextOutcome::Next(_) => return nested,
+                    NextOutcome::Suspended => suspended = true,
+                    NextOutcome::Done => {}
                 }
             }
             WorkspaceStatement::ForCrateInWorkspace(block) => {
@@ -884,6 +923,7 @@ fn find_next_in_workspace_stmts<'a>(
                     .map(|(ci, c)| (c.manifest_dir.clone(), ci))
                     .collect();
 
+                let mut block_suspended = false;
                 for (c_idx, crate_exec) in member_crates.iter().enumerate() {
                     if !are_member_crate_deps_completed(
                         crate_exec,
@@ -892,6 +932,11 @@ fn find_next_in_workspace_stmts<'a>(
                         &block.statements,
                         state_base,
                     ) {
+                        // An intra-workspace dep is incomplete; the dep itself
+                        // either is suspended (caught below via the dep's own
+                        // iteration) or will surface its own Next action when
+                        // we reach it. Don't mark "Done" prematurely.
+                        block_suspended = true;
                         continue;
                     }
                     let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
@@ -902,21 +947,29 @@ fn find_next_in_workspace_stmts<'a>(
                         state_base,
                         env_file_paths,
                     );
-                    if nested.is_some() {
-                        return nested;
+                    match nested {
+                        NextOutcome::Next(_) => return nested,
+                        NextOutcome::Suspended => block_suspended = true,
+                        NextOutcome::Done => {}
                     }
                 }
-                // All member crates done — continue to next workspace statement.
+                if block_suspended {
+                    // Don't walk past a `for crate in workspace` block that
+                    // still has suspended (or dep-blocked-by-suspended)
+                    // members — downstream workspace statements may depend
+                    // on the work those members will do after the barrier.
+                    return NextOutcome::Suspended;
+                }
             }
             WorkspaceStatement::WaitForContinue(node) => {
                 if is_wait_barrier_released(&state_dir) {
                     // Already released — fall through to the next statement.
                 } else if is_wait_barrier_waiting(&state_dir) {
-                    // Waiting for release — block this target.
-                    return None;
+                    // Waiting for release — this scope is suspended.
+                    return NextOutcome::Suspended;
                 } else {
                     // Pending — surface it as the next action.
-                    return Some(NextStatement {
+                    return NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
                         action: StatementAction::WaitForContinue(node),
@@ -926,19 +979,28 @@ fn find_next_in_workspace_stmts<'a>(
             }
         }
     }
-    None
+    if suspended {
+        NextOutcome::Suspended
+    } else {
+        NextOutcome::Done
+    }
 }
 
 /// Finds the next uncompleted statement across all workspaces and standalone crates,
 /// respecting inter-target dependency ordering.
 ///
-/// Returns `None` when every statement in every target has been completed.
+/// Returns [`NextOutcome::Done`] when every statement in every target has
+/// completed, [`NextOutcome::Suspended`] when no statement is currently
+/// executable because at least one target is blocked at a `wait_for_continue`
+/// barrier (or transitively blocked by one), or [`NextOutcome::Next`] with
+/// the next action.
 #[must_use]
 pub fn find_next_statement<'a>(
     program: &'a Program,
     resolved: &'a ResolvedProgram,
     state_base: &Path,
-) -> Option<NextStatement<'a>> {
+) -> NextOutcome<'a> {
+    let mut suspended = false;
     let ws_stmts = first_workspace_stmts(program);
     let ws_map: HashMap<PathBuf, usize> = resolved
         .workspace_executions
@@ -949,6 +1011,9 @@ pub fn find_next_statement<'a>(
 
     for (ws_idx, ws_exec) in resolved.workspace_executions.iter().enumerate() {
         if !are_workspace_deps_completed(ws_exec, &ws_map, ws_stmts, resolved, state_base) {
+            // Upstream dep not yet complete; the dep itself will surface its
+            // own outcome on its iteration.
+            suspended = true;
             continue;
         }
         let prefix = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
@@ -960,8 +1025,10 @@ pub fn find_next_statement<'a>(
             state_base,
             &[],
         );
-        if next.is_some() {
-            return next;
+        match next {
+            NextOutcome::Next(_) => return next,
+            NextOutcome::Suspended => suspended = true,
+            NextOutcome::Done => {}
         }
     }
 
@@ -975,6 +1042,7 @@ pub fn find_next_statement<'a>(
 
     for (c_idx, crate_exec) in resolved.crate_executions.iter().enumerate() {
         if !are_standalone_crate_deps_completed(crate_exec, &crate_map, crate_stmts, state_base) {
+            suspended = true;
             continue;
         }
         let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
@@ -985,12 +1053,18 @@ pub fn find_next_statement<'a>(
             state_base,
             &[],
         );
-        if next.is_some() {
-            return next;
+        match next {
+            NextOutcome::Next(_) => return next,
+            NextOutcome::Suspended => suspended = true,
+            NextOutcome::Done => {}
         }
     }
 
-    None
+    if suspended {
+        NextOutcome::Suspended
+    } else {
+        NextOutcome::Done
+    }
 }
 
 // ── Statement execution ────────────────────────────────────────────────────────
@@ -1459,10 +1533,29 @@ fn evaluate_crate_if_block(
     Ok(())
 }
 
+/// Result of running a scope of statements to completion.
+///
+/// `Suspended` is propagated up through every enclosing scope so the parallel
+/// runner and CLI can distinguish a workspace/crate that genuinely finished
+/// from one that stopped mid-execution at a `wait_for_continue` barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// All statements in the scope ran to completion successfully.
+    Done,
+    /// Execution stopped because a `wait_for_continue` barrier in this scope
+    /// is currently in the *waiting* state. Statements before the barrier
+    /// (in execution order) completed normally; statements after it did not
+    /// run and will resume after `task continue` is issued.
+    Suspended,
+}
+
 /// Runs all crate statements to completion, skipping already-completed ones.
 ///
 /// Handles `if` blocks by evaluating conditions if not yet done, then running
 /// the chosen branch's statements recursively.
+///
+/// Returns [`StepOutcome::Suspended`] if execution stopped at a
+/// `wait_for_continue` barrier; callers must propagate that upward.
 ///
 /// # Errors
 ///
@@ -1481,7 +1574,7 @@ async fn run_crate_stmts_to_completion(
     config: &Config,
     extra_env: &[(String, String)],
     task_name: &str,
-) -> Result<(), Error> {
+) -> Result<StepOutcome, Error> {
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
         let state_dir = state_base.join(cursor.to_path());
@@ -1534,8 +1627,8 @@ async fn run_crate_stmts_to_completion(
                 let chosen = fs_err::read_to_string(&chosen_branch_path)
                     .map_err(|e| Error::CouldNotReadStateFile(chosen_branch_path.clone(), e))?;
                 let trimmed = chosen.trim();
-                match trimmed {
-                    "none" => {}
+                let inner = match trimmed {
+                    "none" => StepOutcome::Done,
                     "else" => {
                         let p = cursor.clone().with(CursorSegment::ElseBranch);
                         Box::pin(run_crate_stmts_to_completion(
@@ -1548,7 +1641,7 @@ async fn run_crate_stmts_to_completion(
                             extra_env,
                             task_name,
                         ))
-                        .await?;
+                        .await?
                     }
                     s => {
                         let n: usize = s
@@ -1569,8 +1662,11 @@ async fn run_crate_stmts_to_completion(
                             extra_env,
                             task_name,
                         ))
-                        .await?;
+                        .await?
                     }
+                };
+                if matches!(inner, StepOutcome::Suspended) {
+                    return Ok(StepOutcome::Suspended);
                 }
             }
             CrateStatement::WithEnvFile(block) => {
@@ -1578,7 +1674,7 @@ async fn run_crate_stmts_to_completion(
                 let mut combined = extra_env.to_vec();
                 combined.extend(file_vars);
                 let inner_prefix = cursor.clone().with(CursorSegment::WithEnvFile);
-                Box::pin(run_crate_stmts_to_completion(
+                let inner = Box::pin(run_crate_stmts_to_completion(
                     &block.statements,
                     &inner_prefix,
                     manifest_dir,
@@ -1589,6 +1685,9 @@ async fn run_crate_stmts_to_completion(
                     task_name,
                 ))
                 .await?;
+                if matches!(inner, StepOutcome::Suspended) {
+                    return Ok(StepOutcome::Suspended);
+                }
             }
             CrateStatement::WaitForContinue(node) => {
                 if is_wait_barrier_released(&state_dir) {
@@ -1606,12 +1705,12 @@ async fn run_crate_stmts_to_completion(
                         task_name,
                         cursor.to_path_string()
                     );
-                    return Ok(());
+                    return Ok(StepOutcome::Suspended);
                 }
             }
         }
     }
-    Ok(())
+    Ok(StepOutcome::Done)
 }
 
 /// Runs all workspace statements to completion, including nested `for crate in workspace`.
@@ -1636,7 +1735,7 @@ async fn run_workspace_stmts_to_completion(
     config: &Config,
     extra_env: &[(String, String)],
     task_name: &str,
-) -> Result<(), Error> {
+) -> Result<StepOutcome, Error> {
     for (i, stmt) in stmts.iter().enumerate() {
         let cursor = prefix.clone().with(CursorSegment::Statement(i));
         let state_dir = state_base.join(cursor.to_path());
@@ -1689,8 +1788,8 @@ async fn run_workspace_stmts_to_completion(
                 let chosen = fs_err::read_to_string(&chosen_branch_path)
                     .map_err(|e| Error::CouldNotReadStateFile(chosen_branch_path.clone(), e))?;
                 let trimmed = chosen.trim();
-                match trimmed {
-                    "none" => {}
+                let inner = match trimmed {
+                    "none" => StepOutcome::Done,
                     "else" => {
                         let p = cursor.clone().with(CursorSegment::ElseBranch);
                         Box::pin(run_workspace_stmts_to_completion(
@@ -1704,7 +1803,7 @@ async fn run_workspace_stmts_to_completion(
                             extra_env,
                             task_name,
                         ))
-                        .await?;
+                        .await?
                     }
                     s => {
                         let n: usize = s
@@ -1726,8 +1825,11 @@ async fn run_workspace_stmts_to_completion(
                             extra_env,
                             task_name,
                         ))
-                        .await?;
+                        .await?
                     }
+                };
+                if matches!(inner, StepOutcome::Suspended) {
+                    return Ok(StepOutcome::Suspended);
                 }
             }
             WorkspaceStatement::WithEnvFile(block) => {
@@ -1735,7 +1837,7 @@ async fn run_workspace_stmts_to_completion(
                 let mut combined = extra_env.to_vec();
                 combined.extend(file_vars);
                 let inner_prefix = cursor.clone().with(CursorSegment::WithEnvFile);
-                Box::pin(run_workspace_stmts_to_completion(
+                let inner = Box::pin(run_workspace_stmts_to_completion(
                     &block.statements,
                     &inner_prefix,
                     manifest_dir,
@@ -1747,12 +1849,19 @@ async fn run_workspace_stmts_to_completion(
                     task_name,
                 ))
                 .await?;
+                if matches!(inner, StepOutcome::Suspended) {
+                    return Ok(StepOutcome::Suspended);
+                }
             }
             WorkspaceStatement::ForCrateInWorkspace(block) => {
                 // Member crates are already in intra-workspace dependency order.
+                // If any member suspends at a barrier, halt before moving on
+                // to later members or later workspace statements — those may
+                // depend on the work the suspended member would do after the
+                // barrier is released.
                 for (c_idx, crate_exec) in member_crates.iter().enumerate() {
                     let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
-                    run_crate_stmts_to_completion(
+                    let inner = run_crate_stmts_to_completion(
                         &block.statements,
                         &c_prefix,
                         &crate_exec.manifest_dir,
@@ -1763,6 +1872,9 @@ async fn run_workspace_stmts_to_completion(
                         task_name,
                     )
                     .await?;
+                    if matches!(inner, StepOutcome::Suspended) {
+                        return Ok(StepOutcome::Suspended);
+                    }
                 }
             }
             WorkspaceStatement::WaitForContinue(node) => {
@@ -1781,12 +1893,12 @@ async fn run_workspace_stmts_to_completion(
                         task_name,
                         cursor.to_path_string()
                     );
-                    return Ok(());
+                    return Ok(StepOutcome::Suspended);
                 }
             }
         }
     }
-    Ok(())
+    Ok(StepOutcome::Done)
 }
 
 // ── Load helpers ───────────────────────────────────────────────────────────────
@@ -2060,77 +2172,107 @@ pub async fn run_single_step_command(
     let config = Config::load(&environment)?;
     let state_base = state_dir_for_task(&params.name, &environment)?;
 
-    if let Some(next) = find_next_statement(&program, &resolved, &state_base) {
-        println!(
-            "Running statement at {} for {}",
-            next.cursor,
-            next.manifest_dir.display()
-        );
-        let extra_env = load_env_vars_from_files(&next.env_file_paths, next.manifest_dir)?;
-        match next.action {
-            StatementAction::RunCommand(step) => {
-                execute_run_step(
-                    step,
-                    &next.cursor,
-                    next.manifest_dir,
-                    &state_base,
-                    &environment,
-                    &extra_env,
-                )
-                .await?;
-            }
-            StatementAction::ManualStep(step) => {
-                execute_manual_step(
-                    step,
-                    &next.cursor,
-                    next.manifest_dir,
-                    &state_base,
-                    &environment,
-                    &extra_env,
-                )
-                .await?;
-            }
-            StatementAction::EvaluateWorkspaceIf(block) => {
-                evaluate_workspace_if_block(
-                    block,
-                    &next.cursor,
-                    next.manifest_dir,
-                    &state_base,
-                    &environment,
-                    &config,
-                    &extra_env,
-                )?;
-            }
-            StatementAction::EvaluateCrateIf(block) => {
-                evaluate_crate_if_block(
-                    block,
-                    &next.cursor,
-                    next.manifest_dir,
-                    &state_base,
-                    &environment,
-                    &config,
-                    &extra_env,
-                )?;
-            }
-            StatementAction::SnapshotMetadata(step) => {
-                execute_snapshot_metadata_step(step, &next.cursor, next.manifest_dir, &state_base)
+    match find_next_statement(&program, &resolved, &state_base) {
+        NextOutcome::Next(next) => {
+            println!(
+                "Running statement at {} for {}",
+                next.cursor,
+                next.manifest_dir.display()
+            );
+            let extra_env = load_env_vars_from_files(&next.env_file_paths, next.manifest_dir)?;
+            match next.action {
+                StatementAction::RunCommand(step) => {
+                    execute_run_step(
+                        step,
+                        &next.cursor,
+                        next.manifest_dir,
+                        &state_base,
+                        &environment,
+                        &extra_env,
+                    )
                     .await?;
-            }
-            StatementAction::WaitForContinue(node) => {
-                let state_dir = state_base.join(next.cursor.to_path());
-                crate::utils::create_user_dir_all(&state_dir)
-                    .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
-                println!(
-                    "Wait barrier reached at {}: \"{}\". Release with `cargo-for-each task continue --name {} --cursor {}`.",
-                    next.cursor.to_path_string(),
-                    node.description,
-                    params.name,
-                    next.cursor.to_path_string()
-                );
+                }
+                StatementAction::ManualStep(step) => {
+                    execute_manual_step(
+                        step,
+                        &next.cursor,
+                        next.manifest_dir,
+                        &state_base,
+                        &environment,
+                        &extra_env,
+                    )
+                    .await?;
+                }
+                StatementAction::EvaluateWorkspaceIf(block) => {
+                    evaluate_workspace_if_block(
+                        block,
+                        &next.cursor,
+                        next.manifest_dir,
+                        &state_base,
+                        &environment,
+                        &config,
+                        &extra_env,
+                    )?;
+                }
+                StatementAction::EvaluateCrateIf(block) => {
+                    evaluate_crate_if_block(
+                        block,
+                        &next.cursor,
+                        next.manifest_dir,
+                        &state_base,
+                        &environment,
+                        &config,
+                        &extra_env,
+                    )?;
+                }
+                StatementAction::SnapshotMetadata(step) => {
+                    execute_snapshot_metadata_step(
+                        step,
+                        &next.cursor,
+                        next.manifest_dir,
+                        &state_base,
+                    )
+                    .await?;
+                }
+                StatementAction::WaitForContinue(node) => {
+                    let state_dir = state_base.join(next.cursor.to_path());
+                    crate::utils::create_user_dir_all(&state_dir)
+                        .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+                    println!(
+                        "Wait barrier reached at {}: \"{}\". Release with `cargo-for-each task continue --name {} --cursor {}`.",
+                        next.cursor.to_path_string(),
+                        node.description,
+                        params.name,
+                        next.cursor.to_path_string()
+                    );
+                }
             }
         }
-    } else {
-        println!("All statements for all targets completed successfully.");
+        NextOutcome::Suspended => {
+            let barriers = find_waiting_barriers(&program, &resolved, &state_base);
+            if barriers.is_empty() {
+                // No barrier surfaced on disk, but find_next reported the
+                // tree as blocked — fall back to a generic message.
+                println!(
+                    "No statement is currently executable; execution is suspended at one or more `wait_for_continue` barriers."
+                );
+            } else {
+                println!(
+                    "Execution is suspended at {} `wait_for_continue` barrier(s):",
+                    barriers.len()
+                );
+                for (cursor, description) in &barriers {
+                    let cursor_str = cursor.to_path_string();
+                    println!(
+                        "  {cursor_str}: \"{description}\" — release with `cargo-for-each task continue --name {} --cursor {cursor_str}`",
+                        params.name
+                    );
+                }
+            }
+        }
+        NextOutcome::Done => {
+            println!("All statements for all targets completed successfully.");
+        }
     }
     Ok(())
 }
@@ -2170,7 +2312,10 @@ pub async fn run_single_target_command(
             ws_exec.manifest_dir.display()
         );
         let prefix = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
-        run_workspace_stmts_to_completion(
+        // A `StepOutcome::Suspended` return is not an error here — the inner
+        // function has already printed the barrier message to stdout — so we
+        // just drop the outcome and return.
+        let _outcome = run_workspace_stmts_to_completion(
             ws_stmts,
             &prefix,
             &ws_exec.manifest_dir,
@@ -2205,7 +2350,7 @@ pub async fn run_single_target_command(
             crate_exec.manifest_dir.display()
         );
         let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
-        run_crate_stmts_to_completion(
+        let _outcome = run_crate_stmts_to_completion(
             crate_stmts,
             &prefix,
             &crate_exec.manifest_dir,
@@ -2348,6 +2493,11 @@ pub async fn run_all_targets_command(
         let n = resolved.workspace_executions.len();
         let mut completed = vec![false; n];
         let mut failed = vec![false; n];
+        // `suspended[idx]` marks a workspace that returned
+        // `StepOutcome::Suspended`: its work isn't done, but it can't progress
+        // until the user releases a barrier with `task continue`. Dependents
+        // must therefore NOT see it as completed.
+        let mut suspended = vec![false; n];
         let mut has_errors = false;
 
         loop {
@@ -2365,6 +2515,7 @@ pub async fn run_all_targets_command(
                 .filter(|(idx, ws_exec)| {
                     !completed.get(*idx).copied().unwrap_or(false)
                         && !failed.get(*idx).copied().unwrap_or(false)
+                        && !suspended.get(*idx).copied().unwrap_or(false)
                         && ws_exec.dependencies.iter().all(|dep| {
                             ws_map.get(dep).is_none_or(|&dep_idx| {
                                 completed.get(dep_idx).copied().unwrap_or(false)
@@ -2384,7 +2535,7 @@ pub async fn run_all_targets_command(
                 break;
             }
 
-            let results: Vec<(usize, Result<(), Error>)> = stream::iter(ready)
+            let results: Vec<(usize, Result<StepOutcome, Error>)> = stream::iter(ready)
                 .map(|(ws_idx, manifest_dir, member_crates)| {
                     let ws_stmts = Arc::clone(&ws_stmts);
                     let config = Arc::clone(&config);
@@ -2415,8 +2566,13 @@ pub async fn run_all_targets_command(
 
             for (idx, result) in results {
                 match result {
-                    Ok(()) => {
+                    Ok(StepOutcome::Done) => {
                         if let Some(slot) = completed.get_mut(idx) {
+                            *slot = true;
+                        }
+                    }
+                    Ok(StepOutcome::Suspended) => {
+                        if let Some(slot) = suspended.get_mut(idx) {
                             *slot = true;
                         }
                     }
@@ -2438,7 +2594,10 @@ pub async fn run_all_targets_command(
         if has_errors {
             return Err(Error::SomeStepsFailed);
         }
-        if !completed.iter().all(|&c| c) {
+        // When some targets are suspended (or transitively blocked by a
+        // suspended/failed upstream), it is not a circular dependency; the
+        // user can release barriers with `task continue` and re-run.
+        if !suspended.iter().any(|&s| s) && !completed.iter().all(|&c| c) {
             return Err(Error::CircularDependency);
         }
     }
@@ -2448,6 +2607,7 @@ pub async fn run_all_targets_command(
         let n = resolved.crate_executions.len();
         let mut completed = vec![false; n];
         let mut failed = vec![false; n];
+        let mut suspended = vec![false; n];
         let mut has_errors = false;
 
         loop {
@@ -2465,6 +2625,7 @@ pub async fn run_all_targets_command(
                 .filter(|(idx, crate_exec)| {
                     !completed.get(*idx).copied().unwrap_or(false)
                         && !failed.get(*idx).copied().unwrap_or(false)
+                        && !suspended.get(*idx).copied().unwrap_or(false)
                         && crate_exec.dependencies.iter().all(|dep| {
                             crate_map.get(dep).is_none_or(|&dep_idx| {
                                 completed.get(dep_idx).copied().unwrap_or(false)
@@ -2478,7 +2639,7 @@ pub async fn run_all_targets_command(
                 break;
             }
 
-            let results: Vec<(usize, Result<(), Error>)> = stream::iter(ready)
+            let results: Vec<(usize, Result<StepOutcome, Error>)> = stream::iter(ready)
                 .map(|(c_idx, manifest_dir)| {
                     let crate_stmts = Arc::clone(&crate_stmts);
                     let config = Arc::clone(&config);
@@ -2508,8 +2669,13 @@ pub async fn run_all_targets_command(
 
             for (idx, result) in results {
                 match result {
-                    Ok(()) => {
+                    Ok(StepOutcome::Done) => {
                         if let Some(slot) = completed.get_mut(idx) {
+                            *slot = true;
+                        }
+                    }
+                    Ok(StepOutcome::Suspended) => {
+                        if let Some(slot) = suspended.get_mut(idx) {
                             *slot = true;
                         }
                     }
@@ -2531,7 +2697,7 @@ pub async fn run_all_targets_command(
         if has_errors {
             return Err(Error::SomeStepsFailed);
         }
-        if !completed.iter().all(|&c| c) {
+        if !suspended.iter().any(|&s| s) && !completed.iter().all(|&c| c) {
             return Err(Error::CircularDependency);
         }
     }
@@ -3139,6 +3305,111 @@ pub async fn task_command(
     Ok(())
 }
 
+/// Walks the program and collects every `wait_for_continue` cursor whose
+/// barrier is currently in the *waiting* state on disk (state_dir exists but
+/// `barrier_released` does not).
+///
+/// Returned tuples are `(cursor, description)` in document order, for use in
+/// user-facing "execution suspended" messages.
+fn find_waiting_barriers(
+    program: &Program,
+    resolved: &ResolvedProgram,
+    state_base: &Path,
+) -> Vec<(ProgramCursor, String)> {
+    fn walk_crate(
+        stmts: &[CrateStatement],
+        prefix: &ProgramCursor,
+        state_base: &Path,
+        out: &mut Vec<(ProgramCursor, String)>,
+    ) {
+        for (i, stmt) in stmts.iter().enumerate() {
+            let cursor = prefix.clone().with(CursorSegment::Statement(i));
+            match stmt {
+                CrateStatement::WaitForContinue(node) => {
+                    let state_dir = state_base.join(cursor.to_path());
+                    if is_wait_barrier_waiting(&state_dir) {
+                        out.push((cursor, node.description.clone()));
+                    }
+                }
+                CrateStatement::If(block) => {
+                    for (b_idx, branch) in block.branches.iter().enumerate() {
+                        let p = cursor.clone().with(CursorSegment::IfBranch(b_idx));
+                        walk_crate(&branch.statements, &p, state_base, out);
+                    }
+                    let p = cursor.clone().with(CursorSegment::ElseBranch);
+                    walk_crate(&block.else_statements, &p, state_base, out);
+                }
+                CrateStatement::WithEnvFile(block) => {
+                    let p = cursor.clone().with(CursorSegment::WithEnvFile);
+                    walk_crate(&block.statements, &p, state_base, out);
+                }
+                CrateStatement::Run(_)
+                | CrateStatement::ManualStep(_)
+                | CrateStatement::SnapshotMetadata(_) => {}
+            }
+        }
+    }
+    fn walk_workspace(
+        stmts: &[WorkspaceStatement],
+        prefix: &ProgramCursor,
+        member_crates: &[ResolvedCrateExecution],
+        state_base: &Path,
+        out: &mut Vec<(ProgramCursor, String)>,
+    ) {
+        for (i, stmt) in stmts.iter().enumerate() {
+            let cursor = prefix.clone().with(CursorSegment::Statement(i));
+            match stmt {
+                WorkspaceStatement::WaitForContinue(node) => {
+                    let state_dir = state_base.join(cursor.to_path());
+                    if is_wait_barrier_waiting(&state_dir) {
+                        out.push((cursor, node.description.clone()));
+                    }
+                }
+                WorkspaceStatement::If(block) => {
+                    for (b_idx, branch) in block.branches.iter().enumerate() {
+                        let p = cursor.clone().with(CursorSegment::IfBranch(b_idx));
+                        walk_workspace(&branch.statements, &p, member_crates, state_base, out);
+                    }
+                    let p = cursor.clone().with(CursorSegment::ElseBranch);
+                    walk_workspace(&block.else_statements, &p, member_crates, state_base, out);
+                }
+                WorkspaceStatement::WithEnvFile(block) => {
+                    let p = cursor.clone().with(CursorSegment::WithEnvFile);
+                    walk_workspace(&block.statements, &p, member_crates, state_base, out);
+                }
+                WorkspaceStatement::ForCrateInWorkspace(block) => {
+                    for (c_idx, _) in member_crates.iter().enumerate() {
+                        let p = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
+                        walk_crate(&block.statements, &p, state_base, out);
+                    }
+                }
+                WorkspaceStatement::Run(_)
+                | WorkspaceStatement::ManualStep(_)
+                | WorkspaceStatement::SnapshotMetadata(_) => {}
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let ws_stmts = first_workspace_stmts(program);
+    for (ws_idx, ws_exec) in resolved.workspace_executions.iter().enumerate() {
+        let prefix = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
+        walk_workspace(
+            ws_stmts,
+            &prefix,
+            &ws_exec.member_crates,
+            state_base,
+            &mut out,
+        );
+    }
+    let crate_stmts = first_crate_stmts(program);
+    for (c_idx, _crate_exec) in resolved.crate_executions.iter().enumerate() {
+        let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
+        walk_crate(crate_stmts, &prefix, state_base, &mut out);
+    }
+    out
+}
+
 /// Walks `cursor` through `program` and returns whether the statement it
 /// addresses is a `wait_for_continue` (in either workspace or crate context).
 ///
@@ -3264,13 +3535,14 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
-    use super::{find_next_statement, is_crate_stmt_completed, is_run_completed};
+    use super::{NextOutcome, find_next_statement, is_crate_stmt_completed, is_run_completed};
     use crate::Environment;
-    use crate::program::ast::common::RunStep;
+    use crate::program::ast::common::{RunStep, WaitForContinueNode};
     use crate::program::ast::crate_ctx::CrateStatement;
     use crate::program::ast::crate_ctx::ForCrateBlock;
-    use crate::program::ast::workspace_ctx::ForWorkspaceBlock;
-    use crate::program::ast::workspace_ctx::WorkspaceStatement;
+    use crate::program::ast::workspace_ctx::{
+        ForCrateInWorkspaceBlock, ForWorkspaceBlock, WorkspaceStatement,
+    };
     use crate::program::cursor::{CursorSegment, ProgramCursor};
     use crate::program::resolve::{
         ResolvedCrateExecution, ResolvedProgram, ResolvedWorkspaceExecution,
@@ -3443,7 +3715,10 @@ mod tests {
             args: vec![],
         })]);
         let resolved = resolved_with_one_crate(dir);
-        assert!(find_next_statement(&program, &resolved, &state_base).is_none());
+        assert!(matches!(
+            find_next_statement(&program, &resolved, &state_base),
+            NextOutcome::Done
+        ));
         Ok(())
     }
 
@@ -3459,9 +3734,9 @@ mod tests {
             args: vec![],
         })]);
         let resolved = resolved_with_one_crate(dir);
-        let next = find_next_statement(&program, &resolved, &state_base);
-        assert!(next.is_some());
-        let next = next.ok_or("expected Some")?;
+        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base) else {
+            return Err("expected NextOutcome::Next".into());
+        };
         assert_eq!(
             next.cursor,
             ProgramCursor::new()
@@ -3496,9 +3771,9 @@ mod tests {
             }),
         ]);
         let resolved = resolved_with_one_crate(dir);
-        let next = find_next_statement(&program, &resolved, &state_base);
-        assert!(next.is_some());
-        let next = next.ok_or("expected Some")?;
+        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base) else {
+            return Err("expected NextOutcome::Next".into());
+        };
         assert_eq!(
             next.cursor,
             ProgramCursor::new()
@@ -3526,9 +3801,9 @@ mod tests {
             args: vec![],
         })]);
         let resolved = resolved_with_one_crate(dir);
-        let next = find_next_statement(&program, &resolved, &state_base);
+        let outcome = find_next_statement(&program, &resolved, &state_base);
         assert!(
-            next.is_some(),
+            matches!(outcome, NextOutcome::Next(_)),
             "Failed statement should be returned for retry"
         );
         Ok(())
@@ -3546,14 +3821,137 @@ mod tests {
             args: vec!["build".to_owned()],
         })]);
         let resolved = resolved_with_one_workspace(dir);
-        let next = find_next_statement(&program, &resolved, &state_base);
-        assert!(next.is_some());
-        let next = next.ok_or("expected Some")?;
+        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base) else {
+            return Err("expected NextOutcome::Next".into());
+        };
         assert_eq!(
             next.cursor,
             ProgramCursor::new()
                 .with(CursorSegment::WorkspaceIteration(0))
                 .with(CursorSegment::Statement(0))
+        );
+        Ok(())
+    }
+
+    /// Regression test for KNOWN_ISSUES.md §1a: when every member crate of a
+    /// `for crate in workspace` block is suspended at a `wait_for_continue`
+    /// barrier, `find_next_statement` must report `Suspended` and not walk
+    /// past the for-crate block to a later workspace-level statement.
+    #[test]
+    fn find_next_reports_suspended_when_for_crate_member_at_barrier() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let state_base = env.state_dir.join("cargo-for-each").join("tasks").join("t");
+        let ws_dir = PathBuf::from("/tmp/ws");
+        let crate_dir = PathBuf::from("/tmp/ws/member");
+
+        // for workspace { for crate in workspace { wait_for_continue ... } ;
+        //                 run echo "after" }
+        let program = Program {
+            statements: vec![GlobalStatement::ForWorkspace(ForWorkspaceBlock {
+                statements: vec![
+                    WorkspaceStatement::ForCrateInWorkspace(ForCrateInWorkspaceBlock {
+                        statements: vec![CrateStatement::WaitForContinue(WaitForContinueNode {
+                            description: "pause".to_owned(),
+                        })],
+                    }),
+                    WorkspaceStatement::Run(RunStep {
+                        command: "echo".to_owned(),
+                        args: vec!["after".to_owned()],
+                    }),
+                ],
+            })],
+        };
+        let resolved = ResolvedProgram {
+            workspace_executions: vec![ResolvedWorkspaceExecution {
+                manifest_dir: ws_dir,
+                dependencies: vec![],
+                member_crates: vec![ResolvedCrateExecution {
+                    manifest_dir: crate_dir,
+                    dependencies: vec![],
+                }],
+            }],
+            crate_executions: vec![],
+        };
+
+        // Put the barrier into the "waiting" state by creating its state_dir
+        // without the barrier_released marker.
+        let barrier_cursor = ProgramCursor::new()
+            .with(CursorSegment::WorkspaceIteration(0))
+            .with(CursorSegment::Statement(0)) // ForCrateInWorkspace
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0)); // WaitForContinue
+        let _state_dir = make_cursor_state_dir(&state_base, &barrier_cursor)?;
+
+        let outcome = find_next_statement(&program, &resolved, &state_base);
+        assert!(
+            matches!(outcome, NextOutcome::Suspended),
+            "expected Suspended, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// Regression test for KNOWN_ISSUES.md §1: when the barrier has not yet
+    /// been reached (no state_dir for it), the barrier should be surfaced as
+    /// the next action, not a Suspended outcome.
+    #[test]
+    fn find_next_returns_barrier_action_when_not_yet_reached() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let state_base = env.state_dir.join("cargo-for-each").join("tasks").join("t");
+        let dir = PathBuf::from("/tmp/c");
+
+        let program = crate_program(vec![CrateStatement::WaitForContinue(WaitForContinueNode {
+            description: "pause".to_owned(),
+        })]);
+        let resolved = resolved_with_one_crate(dir);
+        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base) else {
+            return Err("expected NextOutcome::Next for pending barrier".into());
+        };
+        assert_eq!(
+            next.cursor,
+            ProgramCursor::new()
+                .with(CursorSegment::CrateIteration(0))
+                .with(CursorSegment::Statement(0))
+        );
+        Ok(())
+    }
+
+    /// Regression test for KNOWN_ISSUES.md §1: a barrier in the *released*
+    /// state should be transparent — `find_next` should look past it to the
+    /// next statement.
+    #[test]
+    fn find_next_walks_past_released_barrier() -> TestResult {
+        let temp = tempdir()?;
+        let env = make_environment(&temp);
+        let state_base = env.state_dir.join("cargo-for-each").join("tasks").join("t");
+        let dir = PathBuf::from("/tmp/c");
+
+        // Mark barrier released.
+        let barrier_cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        let barrier_dir = make_cursor_state_dir(&state_base, &barrier_cursor)?;
+        crate::utils::write_user_file(barrier_dir.join("barrier_released"), "")?;
+
+        let program = crate_program(vec![
+            CrateStatement::WaitForContinue(WaitForContinueNode {
+                description: "pause".to_owned(),
+            }),
+            CrateStatement::Run(RunStep {
+                command: "echo".to_owned(),
+                args: vec!["after".to_owned()],
+            }),
+        ]);
+        let resolved = resolved_with_one_crate(dir);
+        let NextOutcome::Next(next) = find_next_statement(&program, &resolved, &state_base) else {
+            return Err("expected NextOutcome::Next past released barrier".into());
+        };
+        assert_eq!(
+            next.cursor,
+            ProgramCursor::new()
+                .with(CursorSegment::CrateIteration(0))
+                .with(CursorSegment::Statement(1))
         );
         Ok(())
     }
