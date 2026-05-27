@@ -456,14 +456,33 @@ pub async fn refresh_command(environment: crate::Environment) -> Result<(), crat
     }
     config.crates = retained_crates;
 
-    // 3. For all existing workspaces, discover and add new member crates.
-    //    We don't need to update existing crates found here, as the next step will do it.
-    //    A failure in one workspace's cargo-metadata must not abort refresh
-    //    entirely (the deletions from steps 1-2 still need to be saved);
-    //    log and skip that workspace instead.
-    let workspaces_to_scan = config.workspaces.clone();
-    for workspace in &workspaces_to_scan {
-        let manifest_path = workspace.manifest_dir.join("Cargo.toml");
+    // 3. For all existing workspaces, discover and add new member crates,
+    //    and refresh `is_standalone` to reflect the current Cargo.toml state.
+    //    This handles transitions like "the user converted a standalone crate
+    //    into a multi-crate workspace by editing its Cargo.toml" — both new
+    //    sibling members are picked up and the workspace's `is_standalone`
+    //    flag is flipped so `select workspaces where !standalone` (and
+    //    similar filters) reflect reality.
+    //
+    //    We don't need to update existing crates found here, as the next step
+    //    will do it. A failure in one workspace's cargo-metadata must not
+    //    abort refresh entirely (the deletions from steps 1-2 still need to
+    //    be saved); log and skip that workspace instead.
+    let workspace_dirs: Vec<PathBuf> = config
+        .workspaces
+        .iter()
+        .map(|w| w.manifest_dir.clone())
+        .collect();
+    // For each workspace we successfully scan, remember its current member
+    // set so we can detect orphans in step 3.5. Workspaces whose
+    // cargo-metadata call failed are absent from this map (we can't tell
+    // what's orphaned vs not for them and leave their crates alone).
+    let mut scanned_members: std::collections::HashMap<
+        PathBuf,
+        std::collections::HashSet<PathBuf>,
+    > = std::collections::HashMap::new();
+    for ws_dir in &workspace_dirs {
+        let manifest_path = ws_dir.join("Cargo.toml");
         let cargo_metadata = match cargo_metadata::MetadataCommand::new()
             .manifest_path(&manifest_path)
             .exec()
@@ -478,6 +497,10 @@ pub async fn refresh_command(environment: crate::Environment) -> Result<(), crat
             }
         };
 
+        // Collect the workspace's current member dirs so we can both add
+        // any new ones to config.crates AND determine the right value of
+        // is_standalone afterwards.
+        let mut current_member_dirs: Vec<PathBuf> = Vec::new();
         for package_id in &cargo_metadata.workspace_members {
             let package = cargo_metadata.get_package_by_id(package_id)?;
             let pkg_manifest_path = package.manifest_path.to_owned().into_std_path_buf();
@@ -496,6 +519,7 @@ pub async fn refresh_command(environment: crate::Environment) -> Result<(), crat
                     continue;
                 }
             };
+            current_member_dirs.push(manifest_dir.clone());
 
             // Only add if it doesn't exist. `add_crate` also de-dupes.
             if !config.crates.iter().any(|c| c.manifest_dir == manifest_dir) {
@@ -503,12 +527,77 @@ pub async fn refresh_command(environment: crate::Environment) -> Result<(), crat
                 let target_kinds = TargetKind::from_package(package);
                 config.add_crate(Crate {
                     manifest_dir,
-                    workspace_manifest_dir: workspace.manifest_dir.clone(),
+                    workspace_manifest_dir: ws_dir.clone(),
                     crate_types,
                     target_kinds,
                 });
             }
         }
+
+        // Re-derive is_standalone using the same rule as `add_command`:
+        // standalone iff exactly one member and that member lives at the
+        // workspace root.
+        let new_is_standalone = matches!(current_member_dirs.as_slice(), [only] if only == ws_dir);
+        if let Some(ws_entry) = config
+            .workspaces
+            .iter_mut()
+            .find(|w| w.manifest_dir == *ws_dir)
+            && ws_entry.is_standalone != new_is_standalone
+        {
+            tracing::debug!(
+                "Updating is_standalone for workspace {} from {} to {}",
+                ws_dir.display(),
+                ws_entry.is_standalone,
+                new_is_standalone,
+            );
+            ws_entry.is_standalone = new_is_standalone;
+        }
+
+        scanned_members.insert(ws_dir.clone(), current_member_dirs.into_iter().collect());
+    }
+
+    // 3.5. Handle crates that were orphaned by their workspace shrinking
+    //      (member removed from `[workspace] members` but the crate
+    //      directory still on disk). If the orphan's Cargo.toml still
+    //      exists, re-register it as its own standalone workspace so the
+    //      user doesn't lose it from filters; otherwise drop it. We only
+    //      act on crates whose workspace was *successfully scanned* — for a
+    //      workspace whose cargo-metadata call failed, we can't tell which
+    //      members are current and leave its crates as-is.
+    let mut newly_standalone_workspaces: Vec<Workspace> = Vec::new();
+    config.crates.retain_mut(|krate| {
+        let Some(members) = scanned_members.get(&krate.workspace_manifest_dir) else {
+            return true;
+        };
+        if members.contains(&krate.manifest_dir) {
+            return true;
+        }
+        // Orphan: no longer claimed by its workspace.
+        if cargo_toml_present(&krate.manifest_dir) {
+            tracing::debug!(
+                "Crate {} was orphaned by workspace {}; re-registering as a standalone workspace because its Cargo.toml still exists.",
+                krate.manifest_dir.display(),
+                krate.workspace_manifest_dir.display(),
+            );
+            newly_standalone_workspaces.push(Workspace {
+                manifest_dir: krate.manifest_dir.clone(),
+                is_standalone: true,
+            });
+            krate.workspace_manifest_dir = krate.manifest_dir.clone();
+            true
+        } else {
+            tracing::debug!(
+                "Crate {} was orphaned by workspace {} and its Cargo.toml is gone; removing.",
+                krate.manifest_dir.display(),
+                krate.workspace_manifest_dir.display(),
+            );
+            false
+        }
+    });
+    for ws in newly_standalone_workspaces {
+        // `add_workspace` de-dupes by manifest_dir, so a crate that was
+        // already its own standalone workspace doesn't duplicate.
+        config.add_workspace(ws);
     }
 
     // 4. Update crate_types/target_kinds for all existing crates.

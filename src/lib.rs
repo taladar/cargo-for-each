@@ -355,6 +355,8 @@ mod tests {
         reason = "test helpers panic on unexpected match arms; clearer than assert with message"
     )]
 
+    use pretty_assertions::assert_eq;
+
     use super::*;
     use crate::{
         targets::{
@@ -867,6 +869,262 @@ mod tests {
         assert!(
             lock_path.exists(),
             "ConfigLock::acquire should have created the lock file"
+        );
+        Ok(())
+    }
+
+    /// Regression test for KNOWN_ISSUES.md §13: when a standalone crate is
+    /// edited to become a multi-crate workspace, `target refresh` must both
+    /// (a) pick up the new sibling members and (b) flip the workspace's
+    /// `is_standalone` flag from `true` to `false` so filters like
+    /// `select workspaces where !standalone` see the change.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_refresh_picks_up_standalone_to_workspace_transition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+        let temp_path = temp_dir.path();
+
+        // 1. Create a standalone crate.
+        let ws_dir = temp_path.join("ws");
+        fs_err::create_dir_all(&ws_dir)?;
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(&ws_dir)
+            .args(["init", "--name", "ws", "--lib"]);
+        execute_command(&mut cmd, &environment, &ws_dir)?;
+
+        // 2. Register it via `target add`.
+        let add_options = Options {
+            command: Command::Target(TargetParameters {
+                sub_command: TargetSubCommand::Add(AddParameters {
+                    manifest_path: ws_dir.join("Cargo.toml"),
+                }),
+            }),
+        };
+        run_app(add_options, environment.clone()).await?;
+
+        let config_before = Config::load(&environment)?;
+        let canonical_ws_dir = fs_err::canonicalize(&ws_dir)?;
+        let ws_before = config_before
+            .workspaces
+            .iter()
+            .find(|w| w.manifest_dir == canonical_ws_dir)
+            .ok_or("workspace should be registered after target add")?;
+        assert!(
+            ws_before.is_standalone,
+            "precondition: workspace should be registered as standalone"
+        );
+
+        // 3. Convert the standalone crate into a multi-crate workspace by
+        //    rewriting Cargo.toml and creating sibling member crates.
+        fs_err::write(
+            ws_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"sub_a\", \"sub_b\"]\nresolver = \"2\"\n",
+        )?;
+        for name in &["sub_a", "sub_b"] {
+            let mut cmd = std::process::Command::new("cargo");
+            cmd.current_dir(&ws_dir).args(["new", "--lib", name]);
+            execute_command(&mut cmd, &environment, &ws_dir)?;
+        }
+
+        // 4. Run refresh.
+        let refresh_options = Options {
+            command: Command::Target(TargetParameters {
+                sub_command: TargetSubCommand::Refresh,
+            }),
+        };
+        run_app(refresh_options, environment.clone()).await?;
+
+        // 5. Verify both transitions happened.
+        let config_after = Config::load(&environment)?;
+        let ws_entry = config_after
+            .workspaces
+            .iter()
+            .find(|w| w.manifest_dir == canonical_ws_dir)
+            .ok_or("workspace entry should still exist after refresh")?;
+        assert!(
+            !ws_entry.is_standalone,
+            "is_standalone should have flipped to false after the transition"
+        );
+
+        let sub_a_dir = fs_err::canonicalize(ws_dir.join("sub_a"))?;
+        let sub_b_dir = fs_err::canonicalize(ws_dir.join("sub_b"))?;
+        assert!(
+            config_after
+                .crates
+                .iter()
+                .any(|c| c.manifest_dir == sub_a_dir),
+            "sub_a should have been added to config.crates"
+        );
+        assert!(
+            config_after
+                .crates
+                .iter()
+                .any(|c| c.manifest_dir == sub_b_dir),
+            "sub_b should have been added to config.crates"
+        );
+        Ok(())
+    }
+
+    /// Regression test for KNOWN_ISSUES.md §13 (opposite direction): when a
+    /// multi-crate workspace is edited to drop a member (but the member's
+    /// directory and Cargo.toml remain on disk), `target refresh` should
+    /// re-register the orphan as its own standalone workspace so users
+    /// don't silently lose it from filters. Symmetric to the
+    /// standalone → workspace transition test above.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_refresh_re_registers_orphan_member_as_standalone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+        let temp_path = temp_dir.path();
+
+        // 1. Create a multi-crate workspace with two members.
+        let ws_dir = temp_path.join("multi");
+        fs_err::create_dir_all(&ws_dir)?;
+        fs_err::write(
+            ws_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"keep\", \"drop_me\"]\nresolver = \"2\"\n",
+        )?;
+        for name in &["keep", "drop_me"] {
+            let mut cmd = std::process::Command::new("cargo");
+            cmd.current_dir(&ws_dir).args(["new", "--lib", name]);
+            execute_command(&mut cmd, &environment, &ws_dir)?;
+        }
+
+        // 2. Register the workspace.
+        let add_options = Options {
+            command: Command::Target(TargetParameters {
+                sub_command: TargetSubCommand::Add(AddParameters {
+                    manifest_path: ws_dir.join("Cargo.toml"),
+                }),
+            }),
+        };
+        run_app(add_options, environment.clone()).await?;
+
+        let canonical_ws_dir = fs_err::canonicalize(&ws_dir)?;
+        let canonical_drop_me_dir = fs_err::canonicalize(ws_dir.join("drop_me"))?;
+        let canonical_keep_dir = fs_err::canonicalize(ws_dir.join("keep"))?;
+
+        // 3. Edit Cargo.toml to remove `drop_me` from members, but leave the
+        //    drop_me directory (and its Cargo.toml) on disk — that's the
+        //    case the orphan handling is meant for.
+        fs_err::write(
+            ws_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"keep\"]\nresolver = \"2\"\n",
+        )?;
+
+        // 4. Run refresh.
+        let refresh_options = Options {
+            command: Command::Target(TargetParameters {
+                sub_command: TargetSubCommand::Refresh,
+            }),
+        };
+        run_app(refresh_options, environment.clone()).await?;
+
+        // 5. Verify outcomes:
+        //    - The kept member is still attached to its workspace.
+        //    - The dropped member was re-registered as its own standalone
+        //      workspace; its config.crates entry's workspace_manifest_dir
+        //      now points at itself.
+        let config_after = Config::load(&environment)?;
+
+        let keep_entry = config_after
+            .crates
+            .iter()
+            .find(|c| c.manifest_dir == canonical_keep_dir)
+            .ok_or("keep should still be in config.crates")?;
+        assert_eq!(
+            keep_entry.workspace_manifest_dir, canonical_ws_dir,
+            "keep should still belong to the multi workspace"
+        );
+
+        let orphan_entry = config_after
+            .crates
+            .iter()
+            .find(|c| c.manifest_dir == canonical_drop_me_dir)
+            .ok_or("drop_me should still be in config.crates (re-registered as standalone)")?;
+        assert_eq!(
+            orphan_entry.workspace_manifest_dir, canonical_drop_me_dir,
+            "orphan's workspace_manifest_dir should point at itself after re-registration"
+        );
+
+        let orphan_ws = config_after
+            .workspaces
+            .iter()
+            .find(|w| w.manifest_dir == canonical_drop_me_dir)
+            .ok_or("a standalone workspace entry should exist for the orphan")?;
+        assert!(
+            orphan_ws.is_standalone,
+            "newly created workspace entry for orphan should be is_standalone=true"
+        );
+        Ok(())
+    }
+
+    /// Companion to the above: if the orphan's directory was *also* removed
+    /// from disk, refresh should drop the stale config.crates entry rather
+    /// than try to re-register it.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_refresh_drops_orphan_when_its_cargo_toml_is_gone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+        let temp_path = temp_dir.path();
+
+        let ws_dir = temp_path.join("multi");
+        fs_err::create_dir_all(&ws_dir)?;
+        fs_err::write(
+            ws_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"keep\", \"deleted\"]\nresolver = \"2\"\n",
+        )?;
+        for name in &["keep", "deleted"] {
+            let mut cmd = std::process::Command::new("cargo");
+            cmd.current_dir(&ws_dir).args(["new", "--lib", name]);
+            execute_command(&mut cmd, &environment, &ws_dir)?;
+        }
+
+        let add_options = Options {
+            command: Command::Target(TargetParameters {
+                sub_command: TargetSubCommand::Add(AddParameters {
+                    manifest_path: ws_dir.join("Cargo.toml"),
+                }),
+            }),
+        };
+        run_app(add_options, environment.clone()).await?;
+
+        let canonical_deleted_dir = fs_err::canonicalize(ws_dir.join("deleted"))?;
+
+        // Remove `deleted` from the workspace AND wipe its directory.
+        fs_err::write(
+            ws_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"keep\"]\nresolver = \"2\"\n",
+        )?;
+        fs_err::remove_dir_all(ws_dir.join("deleted"))?;
+
+        let refresh_options = Options {
+            command: Command::Target(TargetParameters {
+                sub_command: TargetSubCommand::Refresh,
+            }),
+        };
+        run_app(refresh_options, environment.clone()).await?;
+
+        let config_after = Config::load(&environment)?;
+        assert!(
+            !config_after
+                .crates
+                .iter()
+                .any(|c| c.manifest_dir == canonical_deleted_dir),
+            "the deleted-on-disk orphan should have been removed"
+        );
+        assert!(
+            !config_after
+                .workspaces
+                .iter()
+                .any(|w| w.manifest_dir == canonical_deleted_dir),
+            "no new workspace entry should have been added for a directory that no longer exists"
         );
         Ok(())
     }
