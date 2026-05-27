@@ -722,6 +722,14 @@ fn are_workspace_deps_completed(
 }
 
 /// Returns `Ok(true)` if all dependencies of a standalone crate have completed.
+///
+/// `crate_map` indexes only the standalone crates in this program's
+/// `for crate { … }` set; a `dep_path` that isn't in the map points
+/// outside that set (typically a workspace member, or a crate that the
+/// program's `select crates` filter excluded). Such out-of-set deps are
+/// deliberately skipped here — the workspace-level dep gate in the
+/// outer iteration owns enforcement for them. See [`are_member_crate_deps_completed`]
+/// for the symmetric reasoning on the `for crate in workspace` side.
 fn are_standalone_crate_deps_completed(
     crate_exec: &ResolvedCrateExecution,
     crate_map: &HashMap<PathBuf, usize>,
@@ -729,6 +737,7 @@ fn are_standalone_crate_deps_completed(
     state_base: &Path,
 ) -> Result<bool, Error> {
     for dep_path in &crate_exec.dependencies {
+        // Intentional silent skip — see function doc-comment above.
         let Some(&dep_idx) = crate_map.get(dep_path) else {
             continue;
         };
@@ -741,6 +750,16 @@ fn are_standalone_crate_deps_completed(
 
 /// Returns `Ok(true)` if all intra-workspace dependencies of a member crate
 /// are completed for the given `for crate in workspace` block.
+///
+/// `crate_map` indexes only the *current workspace's* member crates. A
+/// member whose `dependencies` list points at a crate in a different
+/// workspace (or at a standalone crate outside the workspace) is
+/// deliberately skipped here: the workspace-level dep gate already
+/// blocks this workspace from starting until every workspace it depends
+/// on has completed, so by the time we walk member-level deps every
+/// cross-workspace dep is guaranteed to be done. Checking it again at
+/// crate granularity would be redundant and would require threading the
+/// full program-wide crate index into this helper.
 fn are_member_crate_deps_completed(
     crate_exec: &ResolvedCrateExecution,
     crate_map: &HashMap<PathBuf, usize>,
@@ -749,6 +768,7 @@ fn are_member_crate_deps_completed(
     state_base: &Path,
 ) -> Result<bool, Error> {
     for dep_path in &crate_exec.dependencies {
+        // Intentional silent skip — see function doc-comment above.
         let Some(&dep_idx) = crate_map.get(dep_path) else {
             continue;
         };
