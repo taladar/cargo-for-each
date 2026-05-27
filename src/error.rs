@@ -114,12 +114,13 @@ pub enum Error {
     /// the task of the given name already exists
     #[error("{0} already exists")]
     AlreadyExists(String),
-    /// we called cargo metadata on a directory with a Cargo.toml
-    /// but the output did not contain a package with the manifest_path
-    /// pointing to that Cargo.toml
-    #[error(
-        "found no package with manifest_path matching local Cargo.toml in cargo metadata output: {0}"
-    )]
+    /// `CargoMetadataExt::get_package_by_manifest_path` was called with a
+    /// `manifest_path` that did not match the `manifest_path` of any
+    /// package in the supplied [`cargo_metadata::Metadata`].  The path may
+    /// be the user's local Cargo.toml, a workspace member's manifest, or
+    /// any other path the caller passed in — nothing about this variant is
+    /// specific to "local" lookups despite the historical name.
+    #[error("found no package with manifest_path {0} in cargo metadata output")]
     FoundNoPackageInCargoMetadataWithCurrentManifestPath(std::path::PathBuf),
     /// we called cargo metadata for a given manifest_path
     /// but the output did not contain a package with the manifest_path
