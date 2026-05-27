@@ -282,16 +282,19 @@ pub async fn add_command(
         member_canonical_paths.push((package_id.clone(), canonical));
     }
 
-    let is_standalone = match member_canonical_paths.as_slice() {
-        [(_, only_manifest)] => *only_manifest == workspace_manifest_path,
-        _ => false,
-    };
-
-    if is_standalone {
-        tracing::debug!("Identified Cargo.toml as standalone crate");
-        let [(package_id, _)] = member_canonical_paths.as_slice() else {
-            unreachable!("is_standalone implies exactly one workspace member");
+    // Bind the single member up front so we don't need a separate
+    // `is_standalone` boolean + re-destructure (which would force an
+    // `unreachable!` for the can't-happen mismatch, conflicting with the
+    // project's `panic = "deny"` lint).  `Some(_)` here *is* the standalone
+    // case; `None` means a real multi-crate workspace.
+    let standalone_member: Option<&(cargo_metadata::PackageId, PathBuf)> =
+        match member_canonical_paths.as_slice() {
+            [pair] if pair.1 == workspace_manifest_path => Some(pair),
+            _ => None,
         };
+
+    if let Some((package_id, _)) = standalone_member {
+        tracing::debug!("Identified Cargo.toml as standalone crate");
         let package = workspace_metadata.get_package_by_id(package_id)?;
         let crate_types = CrateType::from_package(package);
         let target_kinds = TargetKind::from_package(package);
