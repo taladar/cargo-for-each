@@ -18,9 +18,10 @@ across every registered target in the correct dependency order.
 ### Registered Targets
 
 `cargo-for-each` keeps a configuration file (stored in the XDG config
-directory, typically `~/.config/cargo-for-each/config.toml`) that lists every
-workspace and crate you want to manage. You add entries with `target add` and
-remove them with `target remove`. The configuration records:
+directory, typically `~/.config/cargo-for-each/cargo-for-each.toml`) that
+lists every workspace and crate you want to manage. You add entries with
+`target add` and remove them with `target remove`. The configuration
+records:
 
 - **Workspaces** — each identified by its directory containing `Cargo.toml`;
   may be standalone (single-crate) or multi-crate.
