@@ -3533,58 +3533,90 @@ fn find_waiting_barriers(
     out
 }
 
-/// Walks `cursor` through `program` and returns whether the statement it
-/// addresses is a `wait_for_continue` (in either workspace or crate context).
+/// Outcome of resolving a [`ProgramCursor`] against a [`Program`]'s
+/// statement tree.
 ///
-/// Returns `false` when the cursor structure does not match the program (the
-/// terminal statement is not reachable) or when the terminal statement is a
-/// different kind.
-fn cursor_targets_wait_for_continue(program: &Program, cursor: &ProgramCursor) -> bool {
-    fn walk_crate(stmts: &[CrateStatement], segs: &[CursorSegment]) -> bool {
+/// Used by `task continue` to distinguish "the cursor doesn't address any
+/// statement at all" (likely a typo or a stale path that pre-dates a
+/// program edit) from "the cursor addresses a real statement, but that
+/// statement isn't a `wait_for_continue` barrier" — these surface different
+/// error messages to the user.
+#[derive(Debug, PartialEq, Eq)]
+enum CursorTarget {
+    /// Cursor resolves to a `wait_for_continue` statement.
+    WaitForContinue,
+    /// Cursor resolves to a real statement, but it isn't `wait_for_continue`.
+    OtherStatement,
+    /// Cursor structure does not match the program: a segment indexes past
+    /// the end of its scope, or its segment kind doesn't fit at that
+    /// position (e.g. a `CrateIteration` at a top-level `for workspace`).
+    NotInProgram,
+}
+
+/// Walks `cursor` through `program` and classifies what statement, if any,
+/// it addresses.
+///
+/// This is `task continue`'s sole way of telling apart the two reasons a
+/// continue request can fail without an explicit parse error — see
+/// [`CursorTarget`] for the distinction.
+fn cursor_targets_wait_for_continue(program: &Program, cursor: &ProgramCursor) -> CursorTarget {
+    fn walk_crate(stmts: &[CrateStatement], segs: &[CursorSegment]) -> CursorTarget {
         let Some((first, rest)) = segs.split_first() else {
-            return false;
+            return CursorTarget::NotInProgram;
         };
         let CursorSegment::Statement(n) = *first else {
-            return false;
+            return CursorTarget::NotInProgram;
         };
         let Some(stmt) = stmts.get(n) else {
-            return false;
+            return CursorTarget::NotInProgram;
         };
         if rest.is_empty() {
-            return matches!(stmt, CrateStatement::WaitForContinue(_));
+            return if matches!(stmt, CrateStatement::WaitForContinue(_)) {
+                CursorTarget::WaitForContinue
+            } else {
+                CursorTarget::OtherStatement
+            };
         }
         match (stmt, rest.split_first()) {
             (CrateStatement::If(block), Some((CursorSegment::IfBranch(b), rest))) => block
                 .branches
                 .get(*b)
-                .is_some_and(|branch| walk_crate(&branch.statements, rest)),
+                .map_or(CursorTarget::NotInProgram, |branch| {
+                    walk_crate(&branch.statements, rest)
+                }),
             (CrateStatement::If(block), Some((CursorSegment::ElseBranch, rest))) => {
                 walk_crate(&block.else_statements, rest)
             }
             (CrateStatement::WithEnvFile(block), Some((CursorSegment::WithEnvFile, rest))) => {
                 walk_crate(&block.statements, rest)
             }
-            _ => false,
+            _ => CursorTarget::NotInProgram,
         }
     }
-    fn walk_workspace(stmts: &[WorkspaceStatement], segs: &[CursorSegment]) -> bool {
+    fn walk_workspace(stmts: &[WorkspaceStatement], segs: &[CursorSegment]) -> CursorTarget {
         let Some((first, rest)) = segs.split_first() else {
-            return false;
+            return CursorTarget::NotInProgram;
         };
         let CursorSegment::Statement(n) = *first else {
-            return false;
+            return CursorTarget::NotInProgram;
         };
         let Some(stmt) = stmts.get(n) else {
-            return false;
+            return CursorTarget::NotInProgram;
         };
         if rest.is_empty() {
-            return matches!(stmt, WorkspaceStatement::WaitForContinue(_));
+            return if matches!(stmt, WorkspaceStatement::WaitForContinue(_)) {
+                CursorTarget::WaitForContinue
+            } else {
+                CursorTarget::OtherStatement
+            };
         }
         match (stmt, rest.split_first()) {
             (WorkspaceStatement::If(block), Some((CursorSegment::IfBranch(b), rest))) => block
                 .branches
                 .get(*b)
-                .is_some_and(|branch| walk_workspace(&branch.statements, rest)),
+                .map_or(CursorTarget::NotInProgram, |branch| {
+                    walk_workspace(&branch.statements, rest)
+                }),
             (WorkspaceStatement::If(block), Some((CursorSegment::ElseBranch, rest))) => {
                 walk_workspace(&block.else_statements, rest)
             }
@@ -3595,23 +3627,35 @@ fn cursor_targets_wait_for_continue(program: &Program, cursor: &ProgramCursor) -
                 WorkspaceStatement::ForCrateInWorkspace(block),
                 Some((CursorSegment::CrateIteration(_), rest)),
             ) => walk_crate(&block.statements, rest),
-            _ => false,
+            _ => CursorTarget::NotInProgram,
         }
     }
 
     let Some((first, rest)) = cursor.segments().split_first() else {
-        return false;
+        return CursorTarget::NotInProgram;
     };
+    // Parser already enforces at most one top-level `for workspace` / `for
+    // crate` block (see `validate_unique_top_level_blocks`), so `find` is
+    // sufficient — but if no matching block exists at all, the cursor
+    // doesn't address anything.
     match first {
-        CursorSegment::WorkspaceIteration(_) => program.statements.iter().any(|s| match s {
-            GlobalStatement::ForWorkspace(b) => walk_workspace(&b.statements, rest),
-            _ => false,
-        }),
-        CursorSegment::CrateIteration(_) => program.statements.iter().any(|s| match s {
-            GlobalStatement::ForCrate(b) => walk_crate(&b.statements, rest),
-            _ => false,
-        }),
-        _ => false,
+        CursorSegment::WorkspaceIteration(_) => program
+            .statements
+            .iter()
+            .find_map(|s| match s {
+                GlobalStatement::ForWorkspace(b) => Some(walk_workspace(&b.statements, rest)),
+                _ => None,
+            })
+            .unwrap_or(CursorTarget::NotInProgram),
+        CursorSegment::CrateIteration(_) => program
+            .statements
+            .iter()
+            .find_map(|s| match s {
+                GlobalStatement::ForCrate(b) => Some(walk_crate(&b.statements, rest)),
+                _ => None,
+            })
+            .unwrap_or(CursorTarget::NotInProgram),
+        _ => CursorTarget::NotInProgram,
     }
 }
 
@@ -3632,8 +3676,14 @@ pub async fn release_wait_barrier_command(
         .map_err(|e| Error::InvalidCursorString(params.cursor.clone(), e.to_string()))?;
     // Loading the program also verifies the task exists (TaskNotFound).
     let (program, _resolved) = load_task_data(&params.name, &environment)?;
-    if !cursor_targets_wait_for_continue(&program, &cursor) {
-        return Err(Error::CursorNotAtBarrier(cursor.to_path_string()));
+    match cursor_targets_wait_for_continue(&program, &cursor) {
+        CursorTarget::WaitForContinue => {}
+        CursorTarget::OtherStatement => {
+            return Err(Error::CursorNotAtBarrier(cursor.to_path_string()));
+        }
+        CursorTarget::NotInProgram => {
+            return Err(Error::CursorNotInProgram(cursor.to_path_string()));
+        }
     }
     let state_base = state_dir_for_task(&params.name, &environment)?;
     let state_dir = state_base.join(cursor.to_path());
@@ -3659,8 +3709,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        NextOutcome, find_next_statement, is_crate_stmt_completed, is_run_completed,
-        validate_task_name,
+        CursorTarget, NextOutcome, cursor_targets_wait_for_continue, find_next_statement,
+        is_crate_stmt_completed, is_run_completed, validate_task_name,
     };
     use crate::Environment;
     use crate::error::Error;
@@ -4200,5 +4250,86 @@ mod tests {
             validate_task_name("foo\0bar"),
             Err(Error::InvalidTaskName(_, _))
         ));
+    }
+
+    /// Build a `for workspace` program with two statements: a `run` step,
+    /// then a `wait_for_continue`. Used by the cursor-classifier tests.
+    fn program_with_run_then_barrier() -> Program {
+        Program {
+            statements: vec![GlobalStatement::ForWorkspace(ForWorkspaceBlock {
+                statements: vec![
+                    WorkspaceStatement::Run(RunStep {
+                        command: "true".to_owned(),
+                        args: vec![],
+                    }),
+                    WorkspaceStatement::WaitForContinue(WaitForContinueNode {
+                        description: "ready".to_owned(),
+                    }),
+                ],
+            })],
+        }
+    }
+
+    #[test]
+    fn cursor_classifier_finds_wait_for_continue() {
+        let program = program_with_run_then_barrier();
+        // w0/s1 → the WaitForContinue.
+        let cursor = ProgramCursor::new()
+            .with(CursorSegment::WorkspaceIteration(0))
+            .with(CursorSegment::Statement(1));
+        assert_eq!(
+            cursor_targets_wait_for_continue(&program, &cursor),
+            CursorTarget::WaitForContinue,
+        );
+    }
+
+    #[test]
+    fn cursor_classifier_reports_other_statement_for_non_barrier() {
+        let program = program_with_run_then_barrier();
+        // w0/s0 → the Run step, a real statement but not a barrier.
+        let cursor = ProgramCursor::new()
+            .with(CursorSegment::WorkspaceIteration(0))
+            .with(CursorSegment::Statement(0));
+        assert_eq!(
+            cursor_targets_wait_for_continue(&program, &cursor),
+            CursorTarget::OtherStatement,
+        );
+    }
+
+    #[test]
+    fn cursor_classifier_reports_not_in_program_for_out_of_range_statement() {
+        let program = program_with_run_then_barrier();
+        // w0/s99 → statement index past the end.
+        let cursor = ProgramCursor::new()
+            .with(CursorSegment::WorkspaceIteration(0))
+            .with(CursorSegment::Statement(99));
+        assert_eq!(
+            cursor_targets_wait_for_continue(&program, &cursor),
+            CursorTarget::NotInProgram,
+        );
+    }
+
+    #[test]
+    fn cursor_classifier_reports_not_in_program_for_missing_top_level_block() {
+        let program = program_with_run_then_barrier();
+        // The program has no `for crate` block, so a c-rooted cursor cannot
+        // resolve.
+        let cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        assert_eq!(
+            cursor_targets_wait_for_continue(&program, &cursor),
+            CursorTarget::NotInProgram,
+        );
+    }
+
+    #[test]
+    fn cursor_classifier_reports_not_in_program_for_empty_cursor() {
+        let program = program_with_run_then_barrier();
+        let cursor = ProgramCursor::new();
+        assert_eq!(
+            cursor_targets_wait_for_continue(&program, &cursor),
+            CursorTarget::NotInProgram,
+        );
     }
 }

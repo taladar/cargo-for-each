@@ -257,10 +257,16 @@ pub enum Error {
         "`file_exists {0:?}` resolves outside the enclosing workspace; only paths within the workspace manifest directory are allowed"
     )]
     FileExistsPathOutsideWorkspace(String),
-    /// `task continue` was given a cursor that does not point at a
-    /// `wait_for_continue` statement in the task's program
-    #[error("cursor {0:?} does not target a wait_for_continue statement in this task's program")]
+    /// `task continue` was given a cursor that addresses a real statement
+    /// in the task's program, but that statement is not a
+    /// `wait_for_continue` barrier.
+    #[error("cursor {0:?} addresses a statement, but it is not a wait_for_continue barrier")]
     CursorNotAtBarrier(String),
+    /// `task continue` was given a cursor whose path does not match the
+    /// task's program structure (e.g. statement index past the end, or a
+    /// segment kind that does not fit at that position).
+    #[error("cursor {0:?} does not address any statement in this task's program")]
+    CursorNotInProgram(String),
     /// the user requested parallel execution (`-j > 1`) of a program that
     /// contains interactive steps (`manual_step` or an `ask_user` condition)
     #[error(
