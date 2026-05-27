@@ -158,8 +158,12 @@ for workspace {
 }
 ```
 
-Workspaces are executed in inter-workspace dependency order (a workspace that
-depends on another is executed after it). The body is a sequence of
+Workspaces become eligible to run in inter-workspace dependency order: a
+workspace that depends on another is held back until that dependency
+completes. The eligibility check is enforced at runtime, not by iteration
+order — under `--jobs 1` this is indistinguishable from "executed in
+dependency order"; under `--jobs > 1` the actual start order may interleave
+independent workspaces. The body is a sequence of
 [workspace statements](#4-workspace-statements).
 
 ### 3.4 `for crate`
@@ -172,8 +176,12 @@ for crate {
 }
 ```
 
-Crates are executed in dependency order. The body is a sequence of
-[crate statements](#5-crate-statements).
+Crates become eligible to run in inter-crate dependency order; a crate
+that depends on another is held back until that dependency completes. As
+with `for workspace`, the eligibility check runs at runtime, not via
+iteration order — under `--jobs 1` execution is in dependency order;
+under `--jobs > 1` independent crates may start in parallel. The body is
+a sequence of [crate statements](#5-crate-statements).
 
 ---
 
@@ -349,8 +357,10 @@ if standalone {
 
 ### 4.7 `for crate in workspace`
 
-Iterates over the member crates of the current workspace in intra-workspace
-dependency order, executing the enclosed crate statements for each member.
+Iterates over the member crates of the current workspace, executing the
+enclosed crate statements for each member. Members become eligible to
+run in intra-workspace dependency order; a member that depends on
+another is held back until that dependency completes.
 
 ```text
 for crate in workspace {
@@ -360,8 +370,11 @@ for crate in workspace {
 
 - Each member crate is processed with the crate's manifest directory as the
   working directory.
-- Member crates that depend on other members in the same workspace are executed
-  after their dependencies.
+- Member crates that depend on other members in the same workspace become
+  eligible only after those dependencies complete. The eligibility check
+  runs at runtime, not via iteration order — under `--jobs 1` this is
+  equivalent to "executed in dependency order"; under `--jobs > 1`
+  independent members may start in parallel.
 - Dev-dependencies contribute to execution order when they do not form a cycle
   (soft ordering). When two or more member crates form a cycle that exists
   only via dev-dependencies, the cycle-closing dev-dep edges are dropped so
@@ -707,15 +720,24 @@ manual_step
 
 ### Target ordering
 
-Workspaces are executed in inter-workspace **dependency order**: if workspace A
-has a member crate that depends on a crate in workspace B, then workspace B is
-fully completed before workspace A begins.
+Workspaces, standalone crates, and the members of `for crate in workspace`
+are all gated on the **dependency-readiness** rule: a target becomes
+eligible to run only once every target it depends on has completed.
+This is enforced at runtime by a readiness check, *not* by the order in
+which targets appear in the resolved program (which currently mirrors
+cargo's iteration order).
 
-Within a workspace, the `for crate in workspace` block iterates over member
-crates in intra-workspace **dependency order**.
+- Under `--jobs 1` this is equivalent to "executed in dependency order":
+  no two targets ever run concurrently, and each one runs as soon as its
+  dependencies are done.
+- Under `--jobs > 1` two targets with no dependency relationship may
+  start in either order — including in parallel — but a dependent target
+  never starts before its dependency completes.
 
-Standalone crates (from `for crate { ... }`) are similarly executed in
-dependency order.
+A workspace-level dependency means: if workspace A has a member crate
+that depends on a crate in workspace B, then workspace B fully completes
+before workspace A begins. The same readiness rule applies to standalone
+crates (from `for crate`) and to member crates within `for crate in workspace`.
 
 #### Dev-dependencies and soft ordering
 
