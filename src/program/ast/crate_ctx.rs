@@ -1,7 +1,7 @@
 //! AST node types for the crate execution context.
 
 use super::common::{
-    Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
+    AtLeastTwo, Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
     WaitForContinueNode, WithEnvFileBlock,
 };
 
@@ -121,9 +121,11 @@ pub enum CrateCondition {
     /// True if the inner condition evaluates to false.
     Not(Box<Self>),
     /// True if all inner conditions evaluate to true (short-circuits on first false).
-    And(Vec<Self>),
+    /// `&&` always has at least two operands (enforced by [`AtLeastTwo`]).
+    And(AtLeastTwo<Self>),
     /// True if at least one inner condition evaluates to true (short-circuits on first true).
-    Or(Vec<Self>),
+    /// `||` always has at least two operands (enforced by [`AtLeastTwo`]).
+    Or(AtLeastTwo<Self>),
 }
 
 /// A condition allowed inside `select crates where ...` filters.
@@ -142,9 +144,11 @@ pub enum CrateSelectCondition {
     /// True if the inner condition evaluates to false.
     Not(Box<Self>),
     /// True if all inner conditions evaluate to true (short-circuits on first false).
-    And(Vec<Self>),
+    /// `&&` always has at least two operands (enforced by [`AtLeastTwo`]).
+    And(AtLeastTwo<Self>),
     /// True if at least one inner condition evaluates to true (short-circuits on first true).
-    Or(Vec<Self>),
+    /// `||` always has at least two operands (enforced by [`AtLeastTwo`]).
+    Or(AtLeastTwo<Self>),
 }
 
 impl std::fmt::Display for CrateCondition {

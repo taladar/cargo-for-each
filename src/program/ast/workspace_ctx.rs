@@ -1,7 +1,7 @@
 //! AST node types for the workspace execution context.
 
 use super::common::{
-    Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
+    AtLeastTwo, Branch, CommonCondition, IfBlock, ManualStepNode, RunStep, SnapshotMetadataNode,
     WaitForContinueNode, WithEnvFileBlock,
 };
 use super::crate_ctx::CrateStatement;
@@ -55,9 +55,12 @@ pub enum WorkspaceCondition {
     /// True if the inner condition evaluates to false.
     Not(Box<Self>),
     /// True if all inner conditions evaluate to true (short-circuits on first false).
-    And(Vec<Self>),
+    /// The [`AtLeastTwo`] wrapper enforces that `&&` always has at least two
+    /// operands.
+    And(AtLeastTwo<Self>),
     /// True if at least one inner condition evaluates to true (short-circuits on first true).
-    Or(Vec<Self>),
+    /// Same `>= 2` invariant as [`Self::And`].
+    Or(AtLeastTwo<Self>),
 }
 
 impl std::fmt::Display for WorkspaceCondition {
@@ -106,9 +109,11 @@ pub enum WorkspaceSelectCondition {
     /// True if the inner condition evaluates to false.
     Not(Box<Self>),
     /// True if all inner conditions evaluate to true (short-circuits on first false).
-    And(Vec<Self>),
+    /// `&&` always has at least two operands (enforced by [`AtLeastTwo`]).
+    And(AtLeastTwo<Self>),
     /// True if at least one inner condition evaluates to true (short-circuits on first true).
-    Or(Vec<Self>),
+    /// `||` always has at least two operands (enforced by [`AtLeastTwo`]).
+    Or(AtLeastTwo<Self>),
 }
 
 /// A filter applied to the set of workspaces selected by a `select workspaces` statement.

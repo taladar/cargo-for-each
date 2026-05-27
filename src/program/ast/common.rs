@@ -110,6 +110,87 @@ impl<'a, C, S> IntoIterator for &'a NonEmptyBranches<C, S> {
     }
 }
 
+/// A list of at least two items.  Used by the `And` and `Or` variants of
+/// every condition enum: an `And` or `Or` with fewer than two operands
+/// would either degenerate to its single operand or to a trivial constant
+/// (`true` for empty `And`, `false` for empty `Or`), neither of which has
+/// a use case in a hand-authored `.cfe` program.
+///
+/// Construct via [`Self::try_new`] (returns `Err` for < 2 items) or
+/// [`Self::from_pair`] (always succeeds).  The wrapped `Vec` is private
+/// so the only way to *shrink* below the invariant is to drop the value
+/// entirely.  [`Self::push`] adds further items in place — always safe,
+/// because adding never violates the lower bound.  Read access is via
+/// `Deref<Target = [T]>`, so existing call sites that use `.iter()`,
+/// `.len()`, indexing, etc. keep working unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtLeastTwo<T>(Vec<T>);
+
+/// Error returned by [`AtLeastTwo::try_new`] when the supplied `Vec` has
+/// fewer than two items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooFewItemsError {
+    /// The actual number of items that were supplied.
+    pub got: usize,
+}
+
+impl std::fmt::Display for TooFewItemsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "an `&&` or `||` expression must have at least two operands; got {}",
+            self.got,
+        )
+    }
+}
+
+impl std::error::Error for TooFewItemsError {}
+
+impl<T> AtLeastTwo<T> {
+    /// Construct from a `Vec`, returning an error if it has fewer than
+    /// two items.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TooFewItemsError`] when `items.len() < 2`.
+    pub fn try_new(items: Vec<T>) -> Result<Self, TooFewItemsError> {
+        if items.len() < 2 {
+            Err(TooFewItemsError { got: items.len() })
+        } else {
+            Ok(Self(items))
+        }
+    }
+
+    /// Construct from exactly two items.  Always succeeds; used at parser
+    /// sites where the combinator already guarantees a pair.
+    pub fn from_pair(first: T, second: T) -> Self {
+        Self(vec![first, second])
+    }
+
+    /// Append another item.  The invariant is preserved trivially — we
+    /// only ever grow the inner `Vec`, never shrink it.
+    pub fn push(&mut self, item: T) {
+        self.0.push(item);
+    }
+}
+
+impl<T> std::ops::Deref for AtLeastTwo<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a, T> IntoIterator for &'a AtLeastTwo<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 /// A step that captures the current workspace's cargo metadata under a user-specified name.
 ///
 /// The captured metadata can be referenced in later steps using `${name.field}` syntax
@@ -214,9 +295,13 @@ pub enum CommonCondition {
     /// True if the inner condition evaluates to false.
     Not(Box<Self>),
     /// True if all inner conditions evaluate to true (short-circuits on first false).
-    And(Vec<Self>),
+    /// The [`AtLeastTwo`] wrapper enforces that `&&` always has at least two
+    /// operands; a one-operand or empty conjunction has no use case in a
+    /// hand-authored program.
+    And(AtLeastTwo<Self>),
     /// True if at least one inner condition evaluates to true (short-circuits on first true).
-    Or(Vec<Self>),
+    /// Same `>= 2` invariant as [`Self::And`].
+    Or(AtLeastTwo<Self>),
     /// True if the specified Git configuration key equals the specified value in the target's repository.
     GitConfigEquals {
         /// The Git configuration key to check (e.g. `user.name`, `init.defaultbranch`).
@@ -279,5 +364,42 @@ mod tests {
         let nb = NonEmptyBranches::from_first_and_rest(branch(), vec![branch()]);
         let count = nb.iter().count();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn at_least_two_try_new_rejects_under_two() {
+        for items in [vec![], vec![1_i32]] {
+            let n = items.len();
+            assert_eq!(
+                super::AtLeastTwo::try_new(items),
+                Err(super::TooFewItemsError { got: n }),
+            );
+        }
+    }
+
+    #[test]
+    fn at_least_two_try_new_accepts_two_or_more() {
+        let two = match super::AtLeastTwo::try_new(vec![1_i32, 2]) {
+            Ok(v) => v,
+            Err(e) => panic!("expected Ok, got {e}"),
+        };
+        let three = match super::AtLeastTwo::try_new(vec![1_i32, 2, 3]) {
+            Ok(v) => v,
+            Err(e) => panic!("expected Ok, got {e}"),
+        };
+        assert_eq!(two.len(), 2);
+        assert_eq!(three.len(), 3);
+    }
+
+    #[test]
+    fn at_least_two_from_pair_and_push_grow_correctly() {
+        let mut v = super::AtLeastTwo::from_pair(1_i32, 2);
+        assert_eq!(v.len(), 2);
+        v.push(3);
+        v.push(4);
+        assert_eq!(v.len(), 4);
+        // Deref to slice for iteration.
+        let collected: Vec<_> = v.iter().copied().collect();
+        assert_eq!(collected, vec![1, 2, 3, 4]);
     }
 }

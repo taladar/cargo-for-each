@@ -6,7 +6,7 @@
 use chumsky::prelude::*;
 
 use super::ast::common::{
-    Branch, CommonCondition, IfBlock, ManualStepNode, NonEmptyBranches, RunStep,
+    AtLeastTwo, Branch, CommonCondition, IfBlock, ManualStepNode, NonEmptyBranches, RunStep,
     SnapshotMetadataNode, WaitForContinueNode, WithEnvFileBlock,
 };
 use super::ast::crate_ctx::{
@@ -262,7 +262,7 @@ fn workspace_condition_parser<'src>()
                     cs.push(rhs);
                     WorkspaceCondition::And(cs)
                 }
-                other => WorkspaceCondition::And(vec![other, rhs]),
+                other => WorkspaceCondition::And(AtLeastTwo::from_pair(other, rhs)),
             },
         );
 
@@ -274,7 +274,7 @@ fn workspace_condition_parser<'src>()
                     cs.push(rhs);
                     WorkspaceCondition::Or(cs)
                 }
-                other => WorkspaceCondition::Or(vec![other, rhs]),
+                other => WorkspaceCondition::Or(AtLeastTwo::from_pair(other, rhs)),
             },
         )
     })
@@ -381,7 +381,7 @@ fn crate_condition_parser<'src>()
                     cs.push(rhs);
                     CrateCondition::And(cs)
                 }
-                other => CrateCondition::And(vec![other, rhs]),
+                other => CrateCondition::And(AtLeastTwo::from_pair(other, rhs)),
             },
         );
 
@@ -393,7 +393,7 @@ fn crate_condition_parser<'src>()
                     cs.push(rhs);
                     CrateCondition::Or(cs)
                 }
-                other => CrateCondition::Or(vec![other, rhs]),
+                other => CrateCondition::Or(AtLeastTwo::from_pair(other, rhs)),
             },
         )
     })
@@ -421,7 +421,7 @@ fn workspace_select_condition_parser<'src>()
                     cs.push(rhs);
                     WorkspaceSelectCondition::And(cs)
                 }
-                other => WorkspaceSelectCondition::And(vec![other, rhs]),
+                other => WorkspaceSelectCondition::And(AtLeastTwo::from_pair(other, rhs)),
             },
         );
 
@@ -432,7 +432,7 @@ fn workspace_select_condition_parser<'src>()
                     cs.push(rhs);
                     WorkspaceSelectCondition::Or(cs)
                 }
-                other => WorkspaceSelectCondition::Or(vec![other, rhs]),
+                other => WorkspaceSelectCondition::Or(AtLeastTwo::from_pair(other, rhs)),
             },
         )
     })
@@ -478,7 +478,7 @@ fn crate_select_condition_parser<'src>()
                     cs.push(rhs);
                     CrateSelectCondition::And(cs)
                 }
-                other => CrateSelectCondition::And(vec![other, rhs]),
+                other => CrateSelectCondition::And(AtLeastTwo::from_pair(other, rhs)),
             },
         );
 
@@ -489,7 +489,7 @@ fn crate_select_condition_parser<'src>()
                     cs.push(rhs);
                     CrateSelectCondition::Or(cs)
                 }
-                other => CrateSelectCondition::Or(vec![other, rhs]),
+                other => CrateSelectCondition::Or(AtLeastTwo::from_pair(other, rhs)),
             },
         )
     })

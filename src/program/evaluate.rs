@@ -427,6 +427,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::program::ast::common::AtLeastTwo;
     use crate::{Crate, Workspace};
 
     fn mock_env(temp: &tempfile::TempDir) -> crate::Environment {
@@ -579,10 +580,10 @@ mod tests {
         let env = mock_env(&temp);
         let config = config_with_bin_crate(temp.path());
         let result = evaluate_common_condition(
-            &CommonCondition::And(vec![
+            &CommonCondition::And(AtLeastTwo::from_pair(
                 CommonCondition::FileExists("missing".to_owned()),
                 CommonCondition::FileExists("also_missing".to_owned()),
-            ]),
+            )),
             temp.path(),
             &env,
             &config,
@@ -599,10 +600,10 @@ mod tests {
         let env = mock_env(&temp);
         let config = config_with_bin_crate(dir);
         let result = evaluate_common_condition(
-            &CommonCondition::Or(vec![
+            &CommonCondition::Or(AtLeastTwo::from_pair(
                 CommonCondition::FileExists("exists.txt".to_owned()),
                 CommonCondition::FileExists("missing.txt".to_owned()),
-            ]),
+            )),
             dir,
             &env,
             &config,
