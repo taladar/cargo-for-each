@@ -394,36 +394,86 @@ fn first_crate_stmts(program: &Program) -> &[CrateStatement] {
 
 // ── Statement completion checks ────────────────────────────────────────────────
 
-/// Returns `true` if the `run` statement recorded at `state_dir` succeeded.
-fn is_run_completed(state_dir: &Path) -> bool {
-    if !state_dir.exists() {
-        return false;
-    }
-    fs_err::read_to_string(state_dir.join("exit_status"))
-        .ok()
-        .as_deref()
-        .map(str::trim)
-        == Some("0")
+/// Sentinel written to `exit_status` by [`execute_run_step`] when the
+/// asciinema wrapper itself failed to launch (binary missing, fork
+/// failure, etc.).  The wrapper script never gets a chance to write its
+/// own exit code, so this explicit marker distinguishes "failed before
+/// running" from a real non-zero exit.
+const EXEC_FAILED_MARKER: &str = "exec failed";
+
+/// Classification of a `run` step's `exit_status` file contents.
+#[derive(Debug, PartialEq, Eq)]
+enum RunOutcome {
+    /// No `state_dir` on disk, or no `exit_status` file inside it.
+    NotStarted,
+    /// `exit_status` trimmed equals `"0"`.
+    Zero,
+    /// `exit_status` trimmed parses as a non-zero integer.
+    NonZero(i32),
+    /// `exit_status` trimmed equals [`EXEC_FAILED_MARKER`].
+    ExecFailed,
 }
 
-/// Returns `true` if the `run` step at `state_dir` has any recorded non-success
-/// status — i.e. the `exit_status` file exists and its trimmed contents are
-/// anything other than `"0"`, including the empty string written on
-/// launch-failure paths.
+/// Read and classify the `exit_status` file at `state_dir`.
 ///
-/// Distinct from `is_run_completed`: a step that has not been started at all returns `false`.
-fn is_run_failed(state_dir: &Path) -> bool {
+/// # Errors
+///
+/// Returns [`Error::CouldNotReadStateFile`] if the file exists but cannot be
+/// read (permission errors, etc.) and [`Error::InvalidRecordedExitStatus`]
+/// if the trimmed contents are neither `"0"`, a valid `i32`, nor
+/// [`EXEC_FAILED_MARKER`].  A missing `state_dir` or a missing
+/// `exit_status` file inside an existing `state_dir` is **not** an error
+/// — those cases return `Ok(RunOutcome::NotStarted)`.
+fn read_run_outcome(state_dir: &Path) -> Result<RunOutcome, Error> {
     if !state_dir.exists() {
-        return false;
+        return Ok(RunOutcome::NotStarted);
     }
-    match fs_err::read_to_string(state_dir.join("exit_status"))
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        None | Some("0") => false,
-        Some(_) => true,
+    let exit_status_path = state_dir.join("exit_status");
+    let raw = match fs_err::read_to_string(&exit_status_path) {
+        Ok(s) => s,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RunOutcome::NotStarted);
+        }
+        Err(err) => return Err(Error::CouldNotReadStateFile(exit_status_path, err)),
+    };
+    let trimmed = raw.trim();
+    if trimmed == "0" {
+        return Ok(RunOutcome::Zero);
     }
+    if trimmed == EXEC_FAILED_MARKER {
+        return Ok(RunOutcome::ExecFailed);
+    }
+    match trimmed.parse::<i32>() {
+        Ok(code) => Ok(RunOutcome::NonZero(code)),
+        Err(_) => Err(Error::InvalidRecordedExitStatus(raw)),
+    }
+}
+
+/// Returns `Ok(true)` if the `run` statement recorded at `state_dir`
+/// succeeded (its `exit_status` file contains `"0"`).
+///
+/// Returns `Ok(false)` for every other "clean" classification — step not
+/// started, step ran but exited non-zero, step's wrapper failed to
+/// launch.  Returns `Err` only when the `exit_status` file exists but
+/// its contents are unparsable (see [`read_run_outcome`]).
+fn is_run_completed(state_dir: &Path) -> Result<bool, Error> {
+    Ok(matches!(read_run_outcome(state_dir)?, RunOutcome::Zero))
+}
+
+/// Returns `Ok(true)` if the `run` step at `state_dir` has a recorded
+/// failure: either a non-zero parsed integer or the
+/// [`EXEC_FAILED_MARKER`] sentinel written when the wrapper itself
+/// could not launch.
+///
+/// Returns `Ok(false)` for "succeeded" (`"0"`) and for "never started"
+/// (missing state dir or missing `exit_status` file).  Returns `Err`
+/// only when the `exit_status` file exists but its contents are
+/// unparsable (see [`read_run_outcome`]).
+fn is_run_failed(state_dir: &Path) -> Result<bool, Error> {
+    Ok(matches!(
+        read_run_outcome(state_dir)?,
+        RunOutcome::NonZero(_) | RunOutcome::ExecFailed,
+    ))
 }
 
 /// Returns `true` if the `manual_step` at `state_dir` was confirmed by the user.
@@ -513,7 +563,7 @@ fn is_crate_stmt_completed(
 ) -> Result<bool, Error> {
     let state_dir = state_base.join(cursor.to_path());
     match stmt {
-        CrateStatement::Run(_) => Ok(is_run_completed(&state_dir)),
+        CrateStatement::Run(_) => is_run_completed(&state_dir),
         CrateStatement::ManualStep(_) => Ok(is_manual_completed(&state_dir)),
         CrateStatement::SnapshotMetadata(_) => Ok(is_snapshot_metadata_completed(&state_dir)),
         CrateStatement::If(block) => {
@@ -576,7 +626,7 @@ fn is_workspace_stmt_completed(
 ) -> Result<bool, Error> {
     let state_dir = state_base.join(cursor.to_path());
     match stmt {
-        WorkspaceStatement::Run(_) => Ok(is_run_completed(&state_dir)),
+        WorkspaceStatement::Run(_) => is_run_completed(&state_dir),
         WorkspaceStatement::ManualStep(_) => Ok(is_manual_completed(&state_dir)),
         WorkspaceStatement::SnapshotMetadata(_) => Ok(is_snapshot_metadata_completed(&state_dir)),
         WorkspaceStatement::If(block) => {
@@ -786,7 +836,7 @@ fn find_next_in_crate_stmts<'a>(
 
         match stmt {
             CrateStatement::Run(step) => {
-                if !is_run_completed(&state_dir) {
+                if !is_run_completed(&state_dir)? {
                     return Ok(NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
@@ -924,7 +974,7 @@ fn find_next_in_workspace_stmts<'a>(
 
         match stmt {
             WorkspaceStatement::Run(step) => {
-                if !is_run_completed(&state_dir) {
+                if !is_run_completed(&state_dir)? {
                     return Ok(NextOutcome::Next(NextStatement {
                         cursor,
                         manifest_dir,
@@ -1420,7 +1470,12 @@ async fn execute_run_step(
 
     match crate::utils::execute_command(&mut cmd, environment, manifest_dir) {
         Err(e) => {
-            crate::utils::write_user_file(&exit_status_path, "")
+            // Leave a self-describing marker so a later `task list` /
+            // `task describe` (or any re-read of state) can distinguish
+            // "wrapper exited non-zero" from "wrapper never ran". The
+            // error itself is propagated immediately below so the current
+            // invocation reports the launch failure directly.
+            crate::utils::write_user_file(&exit_status_path, EXEC_FAILED_MARKER)
                 .map_err(|we| Error::CouldNotWriteStateFile(exit_status_path, we))?;
             Err(e)
         }
@@ -1689,7 +1744,7 @@ async fn run_crate_stmts_to_completion(
 
         match stmt {
             CrateStatement::Run(step) => {
-                if !is_run_completed(&state_dir) {
+                if !is_run_completed(&state_dir)? {
                     execute_run_step(
                         step,
                         &cursor,
@@ -1850,7 +1905,7 @@ async fn run_workspace_stmts_to_completion(
 
         match stmt {
             WorkspaceStatement::Run(step) => {
-                if !is_run_completed(&state_dir) {
+                if !is_run_completed(&state_dir)? {
                     execute_run_step(
                         step,
                         &cursor,
@@ -3116,9 +3171,9 @@ fn print_crate_stmts_describe(
             }
             CrateStatement::Run(_) => {
                 let state_dir = state_base.join(cursor.to_path());
-                let icon = if is_run_completed(&state_dir) {
+                let icon = if is_run_completed(&state_dir)? {
                     "\u{2705}"
-                } else if is_run_failed(&state_dir) {
+                } else if is_run_failed(&state_dir)? {
                     "\u{274C}"
                 } else {
                     "\u{2B1C}"
@@ -3259,9 +3314,9 @@ fn print_workspace_stmts_describe(
             }
             WorkspaceStatement::Run(_) => {
                 let state_dir = state_base.join(cursor.to_path());
-                let icon = if is_run_completed(&state_dir) {
+                let icon = if is_run_completed(&state_dir)? {
                     "\u{2705}"
-                } else if is_run_failed(&state_dir) {
+                } else if is_run_failed(&state_dir)? {
                     "\u{274C}"
                 } else {
                     "\u{2B1C}"
@@ -3703,6 +3758,11 @@ pub async fn release_wait_barrier_command(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::panic,
+        reason = "test helpers panic on unexpected match arms; clearer than assert with message"
+    )]
+
     use std::path::{Path, PathBuf};
 
     use pretty_assertions::assert_eq;
@@ -3789,13 +3849,14 @@ mod tests {
         }
     }
 
-    // ── is_run_completed ──────────────────────────────────────────────────────
+    // ── is_run_completed / is_run_failed ──────────────────────────────────────
 
     #[test]
     fn run_completed_no_state_dir() -> TestResult {
         let temp = tempdir()?;
         let state_dir = temp.path().join("w0").join("s0");
-        assert!(!is_run_completed(&state_dir));
+        assert!(!is_run_completed(&state_dir)?);
+        assert!(!super::is_run_failed(&state_dir)?);
         Ok(())
     }
 
@@ -3804,7 +3865,8 @@ mod tests {
         let temp = tempdir()?;
         let state_dir = temp.path().join("w0").join("s0");
         crate::utils::create_user_dir_all(&state_dir)?;
-        assert!(!is_run_completed(&state_dir));
+        assert!(!is_run_completed(&state_dir)?);
+        assert!(!super::is_run_failed(&state_dir)?);
         Ok(())
     }
 
@@ -3814,7 +3876,8 @@ mod tests {
         let state_dir = temp.path().join("w0").join("s0");
         crate::utils::create_user_dir_all(&state_dir)?;
         crate::utils::write_user_file(state_dir.join("exit_status"), "0")?;
-        assert!(is_run_completed(&state_dir));
+        assert!(is_run_completed(&state_dir)?);
+        assert!(!super::is_run_failed(&state_dir)?);
         Ok(())
     }
 
@@ -3824,17 +3887,41 @@ mod tests {
         let state_dir = temp.path().join("w0").join("s0");
         crate::utils::create_user_dir_all(&state_dir)?;
         crate::utils::write_user_file(state_dir.join("exit_status"), "1")?;
-        assert!(!is_run_completed(&state_dir));
+        assert!(!is_run_completed(&state_dir)?);
+        assert!(super::is_run_failed(&state_dir)?);
         Ok(())
     }
 
     #[test]
-    fn run_completed_exit_status_empty_is_failed() -> TestResult {
+    fn run_completed_exit_status_exec_failed_marker() -> TestResult {
         let temp = tempdir()?;
         let state_dir = temp.path().join("w0").join("s0");
         crate::utils::create_user_dir_all(&state_dir)?;
-        crate::utils::write_user_file(state_dir.join("exit_status"), "")?;
-        assert!(!is_run_completed(&state_dir));
+        crate::utils::write_user_file(state_dir.join("exit_status"), "exec failed")?;
+        assert!(!is_run_completed(&state_dir)?);
+        assert!(super::is_run_failed(&state_dir)?);
+        Ok(())
+    }
+
+    #[test]
+    fn run_completed_exit_status_invalid_is_error() -> TestResult {
+        // Anything that isn't `"0"`, a valid `i32`, or the
+        // "exec failed" marker must surface as an explicit error
+        // instead of being silently classified as a failure.
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("w0").join("s0");
+        crate::utils::create_user_dir_all(&state_dir)?;
+        for bad in ["", "not-a-number", "0xff", "1.5", "exec_failed"] {
+            crate::utils::write_user_file(state_dir.join("exit_status"), bad)?;
+            match is_run_completed(&state_dir) {
+                Err(Error::InvalidRecordedExitStatus(s)) => assert_eq!(s, bad),
+                other => panic!("expected InvalidRecordedExitStatus({bad:?}), got {other:?}"),
+            }
+            match super::is_run_failed(&state_dir) {
+                Err(Error::InvalidRecordedExitStatus(s)) => assert_eq!(s, bad),
+                other => panic!("expected InvalidRecordedExitStatus({bad:?}), got {other:?}"),
+            }
+        }
         Ok(())
     }
 
