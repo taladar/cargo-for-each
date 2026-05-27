@@ -1831,6 +1831,13 @@ fn load_task_data(
 // ── Rewind helpers ─────────────────────────────────────────────────────────────
 
 /// Finds the cursor of the last completed crate statement (searched in reverse).
+///
+/// An `if` whose `chosen_branch` is `"none"` (conditions all false, no `else`)
+/// counts as a rewindable step even though no body executed. This is
+/// intentional: a rewind here forces `evaluate_crate_if_block` to re-run the
+/// conditions next time forward, which is the desired UX when the user is
+/// rewinding because they answered an `ask_user` wrong, or when a `run`/
+/// `file_exists` condition probes external state that may have changed.
 fn find_last_completed_crate_stmt(
     stmts: &[CrateStatement],
     prefix: &ProgramCursor,
@@ -1880,6 +1887,9 @@ fn find_last_completed_crate_stmt(
 }
 
 /// Finds the cursor of the last completed workspace statement (searched in reverse).
+///
+/// See [`find_last_completed_crate_stmt`] for why an `if` with
+/// `chosen_branch == "none"` is treated as a rewindable step.
 fn find_last_completed_workspace_stmt(
     stmts: &[WorkspaceStatement],
     prefix: &ProgramCursor,
