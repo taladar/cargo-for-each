@@ -91,7 +91,7 @@ pub fn dir_path(environment: &crate::Environment) -> Result<PathBuf, Error> {
 ///
 /// # Errors
 ///
-/// Returns an error if `name` fails [`validate_task_name`] or if the tasks
+/// Returns an error if `name` fails `validate_task_name` or if the tasks
 /// directory path cannot be determined.
 pub fn named_dir_path(name: &str, environment: &crate::Environment) -> Result<PathBuf, Error> {
     validate_task_name(name)?;
@@ -106,7 +106,7 @@ pub fn named_dir_path(name: &str, environment: &crate::Environment) -> Result<Pa
 ///
 /// # Errors
 ///
-/// Returns an error if `name` fails [`validate_task_name`] or if the state
+/// Returns an error if `name` fails `validate_task_name` or if the state
 /// directory path cannot be determined.
 pub fn state_dir_for_task(name: &str, environment: &crate::Environment) -> Result<PathBuf, Error> {
     validate_task_name(name)?;
