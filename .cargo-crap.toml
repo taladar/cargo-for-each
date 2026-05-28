@@ -1,0 +1,57 @@
+# cargo-crap configuration.
+#
+# `threshold` is the CRAP score — CC^2 * (1 - coverage)^3 + CC — above which a
+# function is flagged. A gate such as
+#
+#     cargo llvm-cov --lcov --output-path lcov.info
+#     cargo crap --lcov lcov.info --fail-above
+#
+# exits non-zero when any *non-allowed* function exceeds the threshold, so it
+# catches newly-added complexity while tolerating the known leftovers below.
+#
+# Every entry in `allow` is a function that cannot be brought under the
+# threshold by in-process unit tests: each is gated on the `cargo metadata`
+# pipeline or an interactive subprocess. Meaningful coverage for these needs
+# integration tests that build real cargo workspaces on disk (and, for the
+# manual step, a way to drive asciinema + stdin) — a heavier test tier than the
+# unit tests used to clear the rest of the codebase.
+#
+# Remove an entry as soon as its function is covered or decomposed below the
+# threshold: leaving a since-fixed function listed would silently mask a future
+# regression in it.
+
+threshold = 30
+
+allow = [
+  # Resolves the program against the live config via `resolve_program`, which
+  # runs `cargo metadata` on every registered workspace. Only exercisable with
+  # real on-disk cargo workspaces. (src/tasks.rs)
+  "task_create_command",
+
+  # Discovers a workspace's members by invoking `cargo metadata`; needs a real
+  # workspace on disk to drive. (src/targets.rs)
+  "add_command",
+
+  # Runs `cargo metadata` in each explicitly-listed crate directory to find its
+  # workspace root; needs real cargo crates on disk. (src/program/resolve.rs)
+  "resolve_explicit_crate_targets",
+
+  # Pure graph logic, but its inputs are `cargo_metadata::Package` maps and it
+  # canonicalizes member paths — only reachable through the metadata pipeline
+  # with a multi-workspace dependency graph, so it cannot be unit-tested in
+  # isolation without synthesizing cargo metadata. (src/program/resolve.rs)
+  "compute_inter_workspace_deps",
+
+  # Spawns `asciinema record` and then blocks on stdin for the y/N completion
+  # confirmation; cannot run without an interactive subprocess. (src/tasks.rs)
+  "execute_manual_step",
+
+  # Captures a cargo-metadata snapshot by running `cargo metadata` for the
+  # target; needs a real workspace on disk. (src/tasks.rs)
+  "execute_snapshot_metadata_step",
+
+  # Binary entry point: tracing / journald / log-file setup plus argv handling.
+  # Only exercised by running the compiled binary, not the library tests.
+  # (src/bin/cargo-for-each.rs)
+  "main",
+]
