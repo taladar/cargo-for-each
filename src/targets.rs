@@ -824,6 +824,21 @@ impl CrateType {
     }
 }
 
+impl From<crate::program::ast::crate_ctx::CrateTypeFilter> for CrateType {
+    fn from(filter: crate::program::ast::crate_ctx::CrateTypeFilter) -> Self {
+        use crate::program::ast::crate_ctx::CrateTypeFilter;
+        match filter {
+            CrateTypeFilter::Bin => Self::Bin,
+            CrateTypeFilter::Lib => Self::Lib,
+            CrateTypeFilter::ProcMacro => Self::ProcMacro,
+            CrateTypeFilter::CDyLib => Self::CDyLib,
+            CrateTypeFilter::DyLib => Self::DyLib,
+            CrateTypeFilter::RLib => Self::RLib,
+            CrateTypeFilter::StaticLib => Self::StaticLib,
+        }
+    }
+}
+
 /// An auxiliary cargo target kind attached to a package.
 ///
 /// These are the cargo target kinds that are **not** a compile-time crate
@@ -871,5 +886,17 @@ impl TargetKind {
             target_kinds.insert(Self::CustomBuild);
         }
         target_kinds
+    }
+}
+
+impl From<crate::program::ast::crate_ctx::TargetKindFilter> for TargetKind {
+    fn from(filter: crate::program::ast::crate_ctx::TargetKindFilter) -> Self {
+        use crate::program::ast::crate_ctx::TargetKindFilter;
+        match filter {
+            TargetKindFilter::Bench => Self::Bench,
+            TargetKindFilter::Test => Self::Test,
+            TargetKindFilter::Example => Self::Example,
+            TargetKindFilter::CustomBuild => Self::CustomBuild,
+        }
     }
 }

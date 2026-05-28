@@ -9,9 +9,7 @@ use std::path::{Path, PathBuf};
 use cargo_metadata::{DependencyKind, PackageId};
 
 use crate::error::Error;
-use crate::program::ast::crate_ctx::{
-    CrateFilter, CrateSelectCondition, CrateTypeFilter, TargetKindFilter,
-};
+use crate::program::ast::crate_ctx::{CrateFilter, CrateSelectCondition};
 use crate::program::ast::workspace_ctx::{WorkspaceFilter, WorkspaceSelectCondition};
 use crate::program::{GlobalStatement, Program};
 use crate::targets::{CrateType, TargetKind};
@@ -312,21 +310,12 @@ fn evaluate_crate_select_condition(
             .get(&krate.workspace_manifest_dir)
             .copied()
             .unwrap_or(false),
-        CrateSelectCondition::CrateType(filter) => match filter {
-            CrateTypeFilter::Bin => krate.crate_types.contains(&CrateType::Bin),
-            CrateTypeFilter::Lib => krate.crate_types.contains(&CrateType::Lib),
-            CrateTypeFilter::ProcMacro => krate.crate_types.contains(&CrateType::ProcMacro),
-            CrateTypeFilter::CDyLib => krate.crate_types.contains(&CrateType::CDyLib),
-            CrateTypeFilter::DyLib => krate.crate_types.contains(&CrateType::DyLib),
-            CrateTypeFilter::RLib => krate.crate_types.contains(&CrateType::RLib),
-            CrateTypeFilter::StaticLib => krate.crate_types.contains(&CrateType::StaticLib),
-        },
-        CrateSelectCondition::TargetKind(filter) => match filter {
-            TargetKindFilter::Bench => krate.target_kinds.contains(&TargetKind::Bench),
-            TargetKindFilter::Test => krate.target_kinds.contains(&TargetKind::Test),
-            TargetKindFilter::Example => krate.target_kinds.contains(&TargetKind::Example),
-            TargetKindFilter::CustomBuild => krate.target_kinds.contains(&TargetKind::CustomBuild),
-        },
+        CrateSelectCondition::CrateType(filter) => {
+            krate.crate_types.contains(&CrateType::from(*filter))
+        }
+        CrateSelectCondition::TargetKind(filter) => {
+            krate.target_kinds.contains(&TargetKind::from(*filter))
+        }
         CrateSelectCondition::Not(inner) => {
             !evaluate_crate_select_condition(inner, krate, workspace_standalone_map)
         }
@@ -1185,5 +1174,76 @@ mod tests {
         let nodes = vec![(p("/a"), vec![(p("/external"), DependencyKind::Development)])];
         let out = apply_soft_dev_dep_ordering(nodes);
         assert_eq!(out[0].1, vec![p("/external")]);
+    }
+
+    // ── evaluate_crate_select_condition ───────────────────────────────────────
+
+    use crate::program::ast::common::AtLeastTwo;
+    use crate::program::ast::crate_ctx::{CrateTypeFilter, TargetKindFilter};
+
+    fn select_krate(crate_types: &[CrateType], target_kinds: &[TargetKind]) -> crate::Crate {
+        crate::Crate {
+            manifest_dir: p("/c"),
+            workspace_manifest_dir: p("/ws"),
+            crate_types: crate_types.iter().cloned().collect(),
+            target_kinds: target_kinds.iter().cloned().collect(),
+        }
+    }
+
+    #[test]
+    fn crate_select_standalone_reads_workspace_map() {
+        let k = select_krate(&[CrateType::Bin], &[]);
+        let mut map: HashMap<PathBuf, bool> = HashMap::new();
+        // Enclosing workspace unknown -> treated as non-standalone.
+        assert!(!evaluate_crate_select_condition(
+            &CrateSelectCondition::Standalone,
+            &k,
+            &map,
+        ));
+        map.insert(p("/ws"), true);
+        assert!(evaluate_crate_select_condition(
+            &CrateSelectCondition::Standalone,
+            &k,
+            &map,
+        ));
+        map.insert(p("/ws"), false);
+        assert!(!evaluate_crate_select_condition(
+            &CrateSelectCondition::Standalone,
+            &k,
+            &map,
+        ));
+    }
+
+    #[test]
+    fn crate_select_type_kind_and_combinators() {
+        let k = select_krate(&[CrateType::Lib], &[TargetKind::Test]);
+        let map: HashMap<PathBuf, bool> = HashMap::new();
+        let eval = |c: &CrateSelectCondition| evaluate_crate_select_condition(c, &k, &map);
+
+        assert!(eval(&CrateSelectCondition::CrateType(CrateTypeFilter::Lib)));
+        assert!(!eval(&CrateSelectCondition::CrateType(
+            CrateTypeFilter::Bin
+        )));
+        assert!(eval(&CrateSelectCondition::TargetKind(
+            TargetKindFilter::Test
+        )));
+        assert!(!eval(&CrateSelectCondition::TargetKind(
+            TargetKindFilter::Bench
+        )));
+
+        // Not.
+        assert!(eval(&CrateSelectCondition::Not(Box::new(
+            CrateSelectCondition::CrateType(CrateTypeFilter::Bin),
+        ))));
+        // And: lib && bin -> false.
+        assert!(!eval(&CrateSelectCondition::And(AtLeastTwo::from_pair(
+            CrateSelectCondition::CrateType(CrateTypeFilter::Lib),
+            CrateSelectCondition::CrateType(CrateTypeFilter::Bin),
+        ))));
+        // Or: bin || lib -> true.
+        assert!(eval(&CrateSelectCondition::Or(AtLeastTwo::from_pair(
+            CrateSelectCondition::CrateType(CrateTypeFilter::Bin),
+            CrateSelectCondition::CrateType(CrateTypeFilter::Lib),
+        ))));
     }
 }
