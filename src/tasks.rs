@@ -2815,6 +2815,116 @@ fn program_has_interactive_steps(program: &Program) -> bool {
     })
 }
 
+/// Runs one phase of [`run_all_targets_command`]: a set of targets sharing a
+/// dependency graph, executed in dependency order with up to `jobs` running
+/// concurrently.
+///
+/// `manifest_dirs[i]` and `dependencies[i]` describe target `i`; a dependency
+/// is satisfied once the target whose `manifest_dir` it names has completed
+/// (dependencies pointing outside this phase are ignored). `run_target(i)`
+/// produces the future that runs target `i`.
+///
+/// # Errors
+///
+/// On a target error: returns it immediately unless `keep_going` is set, in
+/// which case the target is marked failed (logged with `error_label`) and the
+/// phase ends in [`Error::SomeStepsFailed`]. If no target can make progress yet
+/// none are suspended at a barrier, returns [`Error::CircularDependency`].
+async fn run_scheduler_phase<F, Fut>(
+    manifest_dirs: &[PathBuf],
+    dependencies: &[Vec<PathBuf>],
+    jobs: usize,
+    keep_going: bool,
+    error_label: &str,
+    run_target: F,
+) -> Result<(), Error>
+where
+    F: Fn(usize) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<StepOutcome, Error>> + Send,
+{
+    let n = manifest_dirs.len();
+    let mut completed = vec![false; n];
+    let mut failed = vec![false; n];
+    // `suspended[i]` marks a target that returned `StepOutcome::Suspended`: its
+    // work isn't done, but it can't progress until the user releases a barrier
+    // with `task continue`, so dependents must NOT see it as completed.
+    let mut suspended = vec![false; n];
+    let mut has_errors = false;
+
+    let dep_map: HashMap<PathBuf, usize> = manifest_dirs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.clone(), i))
+        .collect();
+
+    loop {
+        let ready: Vec<usize> = (0..n)
+            .filter(|&idx| {
+                !completed.get(idx).copied().unwrap_or(false)
+                    && !failed.get(idx).copied().unwrap_or(false)
+                    && !suspended.get(idx).copied().unwrap_or(false)
+                    && dependencies.get(idx).is_some_and(|deps| {
+                        deps.iter().all(|dep| {
+                            dep_map
+                                .get(dep)
+                                .is_none_or(|&di| completed.get(di).copied().unwrap_or(false))
+                        })
+                    })
+            })
+            .collect();
+
+        if ready.is_empty() {
+            break;
+        }
+
+        let results: Vec<(usize, Result<StepOutcome, Error>)> = stream::iter(ready)
+            .map(|idx| {
+                let fut = run_target(idx);
+                async move { (idx, fut.await) }
+            })
+            .buffer_unordered(jobs)
+            .collect()
+            .await;
+
+        for (idx, result) in results {
+            match result {
+                Ok(StepOutcome::Done) => {
+                    if let Some(slot) = completed.get_mut(idx) {
+                        *slot = true;
+                    }
+                }
+                Ok(StepOutcome::Suspended) => {
+                    if let Some(slot) = suspended.get_mut(idx) {
+                        *slot = true;
+                    }
+                }
+                Err(e) => {
+                    if keep_going {
+                        tracing::error!("{error_label}: {e}");
+                        if let Some(slot) = failed.get_mut(idx) {
+                            *slot = true;
+                        }
+                        has_errors = true;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    if has_errors {
+        return Err(Error::SomeStepsFailed);
+    }
+    // Some targets suspended (or transitively blocked by a suspended/failed
+    // upstream) is not a circular dependency; the user can release barriers
+    // with `task continue` and re-run.
+    if !suspended.iter().any(|&s| s) && !completed.iter().all(|&c| c) {
+        return Err(Error::CircularDependency);
+    }
+    Ok(())
+}
+
 /// Runs all targets in dependency order with optional parallelism.
 ///
 /// Workspaces are executed first (in dependency order), followed by standalone
@@ -2849,219 +2959,98 @@ pub async fn run_all_targets_command(
     let ws_stmts: Arc<Vec<WorkspaceStatement>> = Arc::new(first_workspace_stmts(&program).to_vec());
     let crate_stmts: Arc<Vec<CrateStatement>> = Arc::new(first_crate_stmts(&program).to_vec());
 
-    // Phase 1: workspaces
-    {
-        let n = resolved.workspace_executions.len();
-        let mut completed = vec![false; n];
-        let mut failed = vec![false; n];
-        // `suspended[idx]` marks a workspace that returned
-        // `StepOutcome::Suspended`: its work isn't done, but it can't progress
-        // until the user releases a barrier with `task continue`. Dependents
-        // must therefore NOT see it as completed.
-        let mut suspended = vec![false; n];
-        let mut has_errors = false;
-
-        loop {
-            let ws_map: HashMap<PathBuf, usize> = resolved
-                .workspace_executions
-                .iter()
-                .enumerate()
-                .map(|(i, w)| (w.manifest_dir.clone(), i))
-                .collect();
-
-            let ready: Vec<(usize, PathBuf, Vec<ResolvedCrateExecution>)> = resolved
-                .workspace_executions
-                .iter()
-                .enumerate()
-                .filter(|(idx, ws_exec)| {
-                    !completed.get(*idx).copied().unwrap_or(false)
-                        && !failed.get(*idx).copied().unwrap_or(false)
-                        && !suspended.get(*idx).copied().unwrap_or(false)
-                        && ws_exec.dependencies.iter().all(|dep| {
-                            ws_map.get(dep).is_none_or(|&dep_idx| {
-                                completed.get(dep_idx).copied().unwrap_or(false)
-                            })
-                        })
-                })
-                .map(|(idx, ws_exec)| {
-                    (
-                        idx,
-                        ws_exec.manifest_dir.clone(),
-                        ws_exec.member_crates.clone(),
-                    )
-                })
-                .collect();
-
-            if ready.is_empty() {
-                break;
+    // Phase 1: workspaces (in inter-workspace dependency order).
+    let ws_manifests: Vec<PathBuf> = resolved
+        .workspace_executions
+        .iter()
+        .map(|w| w.manifest_dir.clone())
+        .collect();
+    let ws_deps: Vec<Vec<PathBuf>> = resolved
+        .workspace_executions
+        .iter()
+        .map(|w| w.dependencies.clone())
+        .collect();
+    run_scheduler_phase(
+        &ws_manifests,
+        &ws_deps,
+        jobs,
+        keep_going,
+        "Workspace failed",
+        |idx| {
+            let ws_stmts = Arc::clone(&ws_stmts);
+            let config = Arc::clone(&config);
+            let state_base = Arc::clone(&state_base);
+            let resolved = Arc::clone(&resolved);
+            let environment = environment.clone();
+            let task_name = params.name.clone();
+            async move {
+                // `idx` always indexes `workspace_executions` (it came from
+                // `0..len`); the `None` arm is unreachable.
+                let Some(ws_exec) = resolved.workspace_executions.get(idx) else {
+                    return Ok(StepOutcome::Done);
+                };
+                let prefix = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(idx));
+                run_workspace_stmts_to_completion(
+                    &ws_stmts,
+                    &prefix,
+                    &ws_exec.manifest_dir,
+                    &ws_exec.member_crates,
+                    &state_base,
+                    &environment,
+                    &config,
+                    &[],
+                    &task_name,
+                )
+                .await
             }
+        },
+    )
+    .await?;
 
-            let results: Vec<(usize, Result<StepOutcome, Error>)> = stream::iter(ready)
-                .map(|(ws_idx, manifest_dir, member_crates)| {
-                    let ws_stmts = Arc::clone(&ws_stmts);
-                    let config = Arc::clone(&config);
-                    let state_base = Arc::clone(&state_base);
-                    let environment = environment.clone();
-                    let task_name = params.name.clone();
-                    async move {
-                        let prefix =
-                            ProgramCursor::new().with(CursorSegment::WorkspaceIteration(ws_idx));
-                        let result = run_workspace_stmts_to_completion(
-                            &ws_stmts,
-                            &prefix,
-                            &manifest_dir,
-                            &member_crates,
-                            &state_base,
-                            &environment,
-                            &config,
-                            &[],
-                            &task_name,
-                        )
-                        .await;
-                        (ws_idx, result)
-                    }
-                })
-                .buffer_unordered(jobs)
-                .collect()
-                .await;
-
-            for (idx, result) in results {
-                match result {
-                    Ok(StepOutcome::Done) => {
-                        if let Some(slot) = completed.get_mut(idx) {
-                            *slot = true;
-                        }
-                    }
-                    Ok(StepOutcome::Suspended) => {
-                        if let Some(slot) = suspended.get_mut(idx) {
-                            *slot = true;
-                        }
-                    }
-                    Err(e) => {
-                        if keep_going {
-                            tracing::error!("Workspace failed: {}", e);
-                            if let Some(slot) = failed.get_mut(idx) {
-                                *slot = true;
-                            }
-                            has_errors = true;
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                }
+    // Phase 2: standalone crates (in dependency order).
+    let crate_manifests: Vec<PathBuf> = resolved
+        .crate_executions
+        .iter()
+        .map(|c| c.manifest_dir.clone())
+        .collect();
+    let crate_deps: Vec<Vec<PathBuf>> = resolved
+        .crate_executions
+        .iter()
+        .map(|c| c.dependencies.clone())
+        .collect();
+    run_scheduler_phase(
+        &crate_manifests,
+        &crate_deps,
+        jobs,
+        keep_going,
+        "Crate execution failed",
+        |idx| {
+            let crate_stmts = Arc::clone(&crate_stmts);
+            let config = Arc::clone(&config);
+            let state_base = Arc::clone(&state_base);
+            let resolved = Arc::clone(&resolved);
+            let environment = environment.clone();
+            let task_name = params.name.clone();
+            async move {
+                let Some(crate_exec) = resolved.crate_executions.get(idx) else {
+                    return Ok(StepOutcome::Done);
+                };
+                let prefix = ProgramCursor::new().with(CursorSegment::CrateIteration(idx));
+                run_crate_stmts_to_completion(
+                    &crate_stmts,
+                    &prefix,
+                    &crate_exec.manifest_dir,
+                    &state_base,
+                    &environment,
+                    &config,
+                    &[],
+                    &task_name,
+                )
+                .await
             }
-        }
-
-        if has_errors {
-            return Err(Error::SomeStepsFailed);
-        }
-        // When some targets are suspended (or transitively blocked by a
-        // suspended/failed upstream), it is not a circular dependency; the
-        // user can release barriers with `task continue` and re-run.
-        if !suspended.iter().any(|&s| s) && !completed.iter().all(|&c| c) {
-            return Err(Error::CircularDependency);
-        }
-    }
-
-    // Phase 2: standalone crates
-    {
-        let n = resolved.crate_executions.len();
-        let mut completed = vec![false; n];
-        let mut failed = vec![false; n];
-        let mut suspended = vec![false; n];
-        let mut has_errors = false;
-
-        loop {
-            let crate_map: HashMap<PathBuf, usize> = resolved
-                .crate_executions
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (c.manifest_dir.clone(), i))
-                .collect();
-
-            let ready: Vec<(usize, PathBuf)> = resolved
-                .crate_executions
-                .iter()
-                .enumerate()
-                .filter(|(idx, crate_exec)| {
-                    !completed.get(*idx).copied().unwrap_or(false)
-                        && !failed.get(*idx).copied().unwrap_or(false)
-                        && !suspended.get(*idx).copied().unwrap_or(false)
-                        && crate_exec.dependencies.iter().all(|dep| {
-                            crate_map.get(dep).is_none_or(|&dep_idx| {
-                                completed.get(dep_idx).copied().unwrap_or(false)
-                            })
-                        })
-                })
-                .map(|(idx, crate_exec)| (idx, crate_exec.manifest_dir.clone()))
-                .collect();
-
-            if ready.is_empty() {
-                break;
-            }
-
-            let results: Vec<(usize, Result<StepOutcome, Error>)> = stream::iter(ready)
-                .map(|(c_idx, manifest_dir)| {
-                    let crate_stmts = Arc::clone(&crate_stmts);
-                    let config = Arc::clone(&config);
-                    let state_base = Arc::clone(&state_base);
-                    let environment = environment.clone();
-                    let task_name = params.name.clone();
-                    async move {
-                        let prefix =
-                            ProgramCursor::new().with(CursorSegment::CrateIteration(c_idx));
-                        let result = run_crate_stmts_to_completion(
-                            &crate_stmts,
-                            &prefix,
-                            &manifest_dir,
-                            &state_base,
-                            &environment,
-                            &config,
-                            &[],
-                            &task_name,
-                        )
-                        .await;
-                        (c_idx, result)
-                    }
-                })
-                .buffer_unordered(jobs)
-                .collect()
-                .await;
-
-            for (idx, result) in results {
-                match result {
-                    Ok(StepOutcome::Done) => {
-                        if let Some(slot) = completed.get_mut(idx) {
-                            *slot = true;
-                        }
-                    }
-                    Ok(StepOutcome::Suspended) => {
-                        if let Some(slot) = suspended.get_mut(idx) {
-                            *slot = true;
-                        }
-                    }
-                    Err(e) => {
-                        if keep_going {
-                            tracing::error!("Crate execution failed: {}", e);
-                            if let Some(slot) = failed.get_mut(idx) {
-                                *slot = true;
-                            }
-                            has_errors = true;
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                }
-            }
-        }
-
-        if has_errors {
-            return Err(Error::SomeStepsFailed);
-        }
-        if !suspended.iter().any(|&s| s) && !completed.iter().all(|&c| c) {
-            return Err(Error::CircularDependency);
-        }
-    }
+        },
+    )
+    .await?;
 
     Ok(())
 }
