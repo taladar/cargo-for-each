@@ -333,181 +333,210 @@ fn check_target_filesystem(config: &crate::Config) -> Vec<Finding> {
 /// Run `cargo metadata` once per registered workspace and report drift:
 /// `is_standalone` flag, member-set mismatches, stale `crate_types` /
 /// `target_kinds`, and metadata invocation failures.
-#[expect(
-    clippy::too_many_lines,
-    reason = "single cohesive walk over workspaces and their members; splitting would force exporting helpers"
-)]
 fn check_target_cargo_metadata(config: &crate::Config) -> Vec<Finding> {
     let mut findings = Vec::new();
-
     for ws in &config.workspaces {
         // If the Cargo.toml itself is missing we already reported it in
         // check_target_filesystem; skip the metadata call.
         if !cargo_toml_present(&ws.manifest_dir) {
             continue;
         }
-        let manifest_path = ws.manifest_dir.join("Cargo.toml");
-        let metadata = match cargo_metadata::MetadataCommand::new()
-            .manifest_path(&manifest_path)
-            .no_deps()
-            .exec()
-        {
-            Ok(m) => m,
+        findings.extend(check_one_workspace_metadata(ws, config));
+    }
+    findings
+}
+
+/// Validates one registered workspace against its live `cargo metadata`:
+/// reports `is_standalone` drift, member-set drift, and stale
+/// `crate_types`/`target_kinds` for its registered members.
+fn check_one_workspace_metadata(ws: &crate::Workspace, config: &crate::Config) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let manifest_path = ws.manifest_dir.join("Cargo.toml");
+    let metadata = match cargo_metadata::MetadataCommand::new()
+        .manifest_path(&manifest_path)
+        .no_deps()
+        .exec()
+    {
+        Ok(m) => m,
+        Err(err) => {
+            findings.push(Finding {
+                severity: Severity::Error,
+                category: Category::Targets,
+                entity: format!("workspace {}", ws.manifest_dir.display()),
+                message: format!("`cargo metadata` failed: {err}"),
+                hint: Some("inspect the workspace manifest manually".to_owned()),
+            });
+            return findings;
+        }
+    };
+
+    // Canonicalise the member manifest paths so we compare apples to apples
+    // with the stored canonical workspace_manifest_dir / manifest_dir.
+    let mut member_canonical: Vec<(cargo_metadata::PackageId, PathBuf)> = Vec::new();
+    let mut member_dirs: HashSet<PathBuf> = HashSet::new();
+    for package_id in &metadata.workspace_members {
+        let Ok(package) = metadata.get_package_by_id(package_id) else {
+            continue;
+        };
+        let raw = package.manifest_path.clone().into_std_path_buf();
+        let canonical = match fs_err::canonicalize(&raw) {
+            Ok(p) => p,
             Err(err) => {
                 findings.push(Finding {
                     severity: Severity::Error,
                     category: Category::Targets,
                     entity: format!("workspace {}", ws.manifest_dir.display()),
-                    message: format!("`cargo metadata` failed: {err}"),
-                    hint: Some("inspect the workspace manifest manually".to_owned()),
+                    message: format!("could not canonicalize member {}: {err}", raw.display()),
+                    hint: Some("inspect the workspace manually".to_owned()),
                 });
-                continue;
+                return findings;
             }
         };
-
-        // Canonicalise the member manifest paths so we compare apples to apples
-        // with the stored canonical workspace_manifest_dir / manifest_dir.
-        let mut member_canonical: Vec<(cargo_metadata::PackageId, PathBuf)> = Vec::new();
-        let mut member_dirs: HashSet<PathBuf> = HashSet::new();
-        let mut canonicalization_failed = false;
-        for package_id in &metadata.workspace_members {
-            let Ok(package) = metadata.get_package_by_id(package_id) else {
-                continue;
-            };
-            let raw = package.manifest_path.clone().into_std_path_buf();
-            let canonical = match fs_err::canonicalize(&raw) {
-                Ok(p) => p,
-                Err(err) => {
-                    findings.push(Finding {
-                        severity: Severity::Error,
-                        category: Category::Targets,
-                        entity: format!("workspace {}", ws.manifest_dir.display()),
-                        message: format!("could not canonicalize member {}: {err}", raw.display()),
-                        hint: Some("inspect the workspace manually".to_owned()),
-                    });
-                    canonicalization_failed = true;
-                    break;
-                }
-            };
-            if let Some(parent) = canonical.parent() {
-                member_dirs.insert(parent.to_path_buf());
-            }
-            member_canonical.push((package_id.clone(), canonical));
+        if let Some(parent) = canonical.parent() {
+            member_dirs.insert(parent.to_path_buf());
         }
-        if canonicalization_failed {
-            continue;
-        }
+        member_canonical.push((package_id.clone(), canonical));
+    }
 
-        let workspace_manifest_path = ws.manifest_dir.join("Cargo.toml");
-        let canonical_workspace_manifest = match fs_err::canonicalize(&workspace_manifest_path) {
-            Ok(p) => p,
-            Err(_) => workspace_manifest_path.clone(),
-        };
+    let workspace_manifest_path = ws.manifest_dir.join("Cargo.toml");
+    let canonical_workspace_manifest =
+        fs_err::canonicalize(&workspace_manifest_path).unwrap_or(workspace_manifest_path);
 
-        // (5) is_standalone drift.  Mirrors the rule in
-        // `src/targets.rs:285-288` / `:546`.
-        let new_is_standalone = match member_canonical.as_slice() {
-            [(_, only_manifest)] => *only_manifest == canonical_workspace_manifest,
-            _ => false,
-        };
-        if new_is_standalone != ws.is_standalone {
+    let member_manifests: Vec<PathBuf> = member_canonical.iter().map(|(_, p)| p.clone()).collect();
+    check_standalone_drift(
+        ws,
+        &member_manifests,
+        &canonical_workspace_manifest,
+        &mut findings,
+    );
+    check_member_set_drift(ws, config, &member_dirs, &mut findings);
+    check_member_type_drift(ws, config, &member_canonical, &metadata, &mut findings);
+    findings
+}
+
+/// (5) Reports if the stored `is_standalone` flag disagrees with the live
+/// member set. A workspace is standalone iff its sole member's manifest is the
+/// workspace manifest itself.
+fn check_standalone_drift(
+    ws: &crate::Workspace,
+    member_manifests: &[PathBuf],
+    canonical_workspace_manifest: &Path,
+    findings: &mut Vec<Finding>,
+) {
+    let new_is_standalone = match member_manifests {
+        [only_manifest] => only_manifest.as_path() == canonical_workspace_manifest,
+        _ => false,
+    };
+    if new_is_standalone != ws.is_standalone {
+        findings.push(Finding {
+            severity: Severity::Error,
+            category: Category::Targets,
+            entity: format!("workspace {}", ws.manifest_dir.display()),
+            message: format!(
+                "is_standalone flag is {stored} but current cargo metadata says {actual}",
+                stored = ws.is_standalone,
+                actual = new_is_standalone,
+            ),
+            hint: Some("run `cargo-for-each target refresh`".to_owned()),
+        });
+    }
+}
+
+/// (6)+(7) Reports registered members that are no longer in the workspace and
+/// live members that are not registered.
+fn check_member_set_drift(
+    ws: &crate::Workspace,
+    config: &crate::Config,
+    member_dirs: &HashSet<PathBuf>,
+    findings: &mut Vec<Finding>,
+) {
+    let registered_member_dirs: HashSet<&PathBuf> = config
+        .crates
+        .iter()
+        .filter(|c| c.workspace_manifest_dir == ws.manifest_dir)
+        .map(|c| &c.manifest_dir)
+        .collect();
+
+    for registered in &registered_member_dirs {
+        if !member_dirs.contains(*registered) {
             findings.push(Finding {
                 severity: Severity::Error,
                 category: Category::Targets,
-                entity: format!("workspace {}", ws.manifest_dir.display()),
+                entity: format!("crate {}", registered.display()),
                 message: format!(
-                    "is_standalone flag is {stored} but current cargo metadata says {actual}",
-                    stored = ws.is_standalone,
-                    actual = new_is_standalone,
+                    "no longer a member of workspace {}",
+                    ws.manifest_dir.display()
                 ),
                 hint: Some("run `cargo-for-each target refresh`".to_owned()),
             });
         }
-
-        // Registered crates that claim this workspace.
-        let registered_member_dirs: HashSet<&PathBuf> = config
-            .crates
-            .iter()
-            .filter(|c| c.workspace_manifest_dir == ws.manifest_dir)
-            .map(|c| &c.manifest_dir)
-            .collect();
-
-        // (6) Registered crate not in current member list.
-        for registered in &registered_member_dirs {
-            if !member_dirs.contains(*registered) {
-                findings.push(Finding {
-                    severity: Severity::Error,
-                    category: Category::Targets,
-                    entity: format!("crate {}", registered.display()),
-                    message: format!(
-                        "no longer a member of workspace {}",
-                        ws.manifest_dir.display()
-                    ),
-                    hint: Some("run `cargo-for-each target refresh`".to_owned()),
-                });
-            }
-        }
-
-        // (7) New unregistered member appeared on disk.
-        for member_dir in &member_dirs {
-            if !registered_member_dirs.contains(member_dir) {
-                findings.push(Finding {
-                    severity: Severity::Error,
-                    category: Category::Targets,
-                    entity: format!("workspace {}", ws.manifest_dir.display()),
-                    message: format!("member {} is not registered", member_dir.display()),
-                    hint: Some("run `cargo-for-each target refresh`".to_owned()),
-                });
-            }
-        }
-
-        // (8) Stale crate_types / target_kinds for registered members.
-        for (package_id, manifest_path) in &member_canonical {
-            let Some(parent) = manifest_path.parent() else {
-                continue;
-            };
-            let Some(registered_crate) = config
-                .crates
-                .iter()
-                .find(|c| c.manifest_dir == parent && c.workspace_manifest_dir == ws.manifest_dir)
-            else {
-                continue; // covered by (7).
-            };
-            let Ok(package) = metadata.get_package_by_id(package_id) else {
-                continue;
-            };
-            let current_crate_types = CrateType::from_package(package);
-            let current_target_kinds = TargetKind::from_package(package);
-            if current_crate_types != registered_crate.crate_types {
-                findings.push(Finding {
-                    severity: Severity::Warning,
-                    category: Category::Targets,
-                    entity: format!("crate {}", registered_crate.manifest_dir.display()),
-                    message: format!(
-                        "crate_types differ from current Cargo.toml ({stored:?} vs {actual:?})",
-                        stored = registered_crate.crate_types,
-                        actual = current_crate_types,
-                    ),
-                    hint: Some("run `cargo-for-each target refresh`".to_owned()),
-                });
-            }
-            if current_target_kinds != registered_crate.target_kinds {
-                findings.push(Finding {
-                    severity: Severity::Warning,
-                    category: Category::Targets,
-                    entity: format!("crate {}", registered_crate.manifest_dir.display()),
-                    message: format!(
-                        "target_kinds differ from current Cargo.toml ({stored:?} vs {actual:?})",
-                        stored = registered_crate.target_kinds,
-                        actual = current_target_kinds,
-                    ),
-                    hint: Some("run `cargo-for-each target refresh`".to_owned()),
-                });
-            }
-        }
     }
 
-    findings
+    for member_dir in member_dirs {
+        if !registered_member_dirs.contains(member_dir) {
+            findings.push(Finding {
+                severity: Severity::Error,
+                category: Category::Targets,
+                entity: format!("workspace {}", ws.manifest_dir.display()),
+                message: format!("member {} is not registered", member_dir.display()),
+                hint: Some("run `cargo-for-each target refresh`".to_owned()),
+            });
+        }
+    }
+}
+
+/// (8) Reports registered members whose stored `crate_types`/`target_kinds` no
+/// longer match what the live `cargo metadata` reports.
+fn check_member_type_drift(
+    ws: &crate::Workspace,
+    config: &crate::Config,
+    member_canonical: &[(cargo_metadata::PackageId, PathBuf)],
+    metadata: &cargo_metadata::Metadata,
+    findings: &mut Vec<Finding>,
+) {
+    for (package_id, manifest_path) in member_canonical {
+        let Some(parent) = manifest_path.parent() else {
+            continue;
+        };
+        let Some(registered_crate) = config
+            .crates
+            .iter()
+            .find(|c| c.manifest_dir == parent && c.workspace_manifest_dir == ws.manifest_dir)
+        else {
+            continue; // covered by (7).
+        };
+        let Ok(package) = metadata.get_package_by_id(package_id) else {
+            continue;
+        };
+        let current_crate_types = CrateType::from_package(package);
+        let current_target_kinds = TargetKind::from_package(package);
+        if current_crate_types != registered_crate.crate_types {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                category: Category::Targets,
+                entity: format!("crate {}", registered_crate.manifest_dir.display()),
+                message: format!(
+                    "crate_types differ from current Cargo.toml ({stored:?} vs {actual:?})",
+                    stored = registered_crate.crate_types,
+                    actual = current_crate_types,
+                ),
+                hint: Some("run `cargo-for-each target refresh`".to_owned()),
+            });
+        }
+        if current_target_kinds != registered_crate.target_kinds {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                category: Category::Targets,
+                entity: format!("crate {}", registered_crate.manifest_dir.display()),
+                message: format!(
+                    "target_kinds differ from current Cargo.toml ({stored:?} vs {actual:?})",
+                    stored = registered_crate.target_kinds,
+                    actual = current_target_kinds,
+                ),
+                hint: Some("run `cargo-for-each target refresh`".to_owned()),
+            });
+        }
+    }
 }
 
 // ── Task checks ──────────────────────────────────────────────────────────────
@@ -534,148 +563,186 @@ fn check_tasks(environment: &crate::Environment, config: &crate::Config) -> Vec<
         }
     };
     let task_state_root = environment.state_dir.join("cargo-for-each").join("tasks");
-
     let known_task_names = list_task_names(&task_def_root);
 
-    // (10) State dirs with no matching definition.
-    if task_state_root.is_dir()
-        && let Ok(entries) = fs_err::read_dir(&task_state_root)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if path.is_dir() && !known_task_names.iter().any(|n| n == name) {
-                findings.push(Finding {
-                    severity: Severity::Warning,
-                    category: Category::Tasks,
-                    entity: format!("task {name}"),
-                    message: format!(
-                        "state directory exists at {} but no task definition",
-                        path.display()
-                    ),
-                    hint: Some(format!("`rm -rf {}`", path.display())),
-                });
-            }
-        }
-    }
-
-    // Per-task checks (11-16).
+    check_orphan_state_dirs(&task_state_root, &known_task_names, &mut findings);
     for name in &known_task_names {
-        let task_dir = task_def_root.join(name);
-        let program_path = task_dir.join("program.cfe");
-        let resolved_path = task_dir.join("resolved-program.toml");
-
-        let program_present = program_path.is_file();
-        if !program_present {
-            findings.push(Finding {
-                severity: Severity::Error,
-                category: Category::Tasks,
-                entity: format!("task {name}"),
-                message: "program.cfe is missing".to_owned(),
-                hint: Some(format!("`cargo-for-each task remove --name {name}`")),
-            });
-        }
-        let resolved_present = resolved_path.is_file();
-        if !resolved_present {
-            findings.push(Finding {
-                severity: Severity::Error,
-                category: Category::Tasks,
-                entity: format!("task {name}"),
-                message: "resolved-program.toml is missing".to_owned(),
-                hint: Some(format!("`cargo-for-each task remove --name {name}`")),
-            });
-        }
-
-        // (13) program.cfe parses.
-        let parsed_program = if program_present {
-            match fs_err::read_to_string(&program_path) {
-                Ok(source) => match crate::program::parser::parse(&source, "program.cfe") {
-                    Ok(prog) => Some(prog),
-                    Err(errors) => {
-                        let msg = errors
-                            .iter()
-                            .take(3)
-                            .map(|e| e.as_str().to_owned())
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        findings.push(Finding {
-                            severity: Severity::Error,
-                            category: Category::Tasks,
-                            entity: format!("task {name}"),
-                            message: format!("program.cfe no longer parses: {msg}"),
-                            hint: Some(format!("edit {}", program_path.display())),
-                        });
-                        None
-                    }
-                },
-                Err(err) => {
-                    findings.push(Finding {
-                        severity: Severity::Error,
-                        category: Category::Tasks,
-                        entity: format!("task {name}"),
-                        message: format!("could not read program.cfe: {err}"),
-                        hint: None,
-                    });
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // (14) resolved-program parses and references registered targets.
-        let resolved = if resolved_present {
-            match fs_err::read_to_string(&resolved_path) {
-                Ok(src) => match toml::from_str::<ResolvedProgram>(&src) {
-                    Ok(r) => Some(r),
-                    Err(err) => {
-                        findings.push(Finding {
-                            severity: Severity::Error,
-                            category: Category::Tasks,
-                            entity: format!("task {name}"),
-                            message: format!("resolved-program.toml could not be parsed: {err}"),
-                            hint: Some(format!(
-                                "`cargo-for-each task remove --name {name}` and recreate"
-                            )),
-                        });
-                        None
-                    }
-                },
-                Err(err) => {
-                    findings.push(Finding {
-                        severity: Severity::Error,
-                        category: Category::Tasks,
-                        entity: format!("task {name}"),
-                        message: format!("could not read resolved-program.toml: {err}"),
-                        hint: None,
-                    });
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        if let Some(resolved) = &resolved {
-            check_resolved_targets_registered(name, resolved, config, &mut findings);
-        }
-
-        // (15) and (16) need the state dir.
-        let state_dir = task_state_root.join(name);
-        if !state_dir.is_dir() {
-            continue;
-        }
-        if let Some(resolved) = &resolved {
-            check_state_cursors(name, &state_dir, resolved, &mut findings);
-        }
-        if let Some(program) = &parsed_program {
-            check_orphan_snapshot_dirs(name, &state_dir, program, &mut findings);
-        }
+        check_one_task(
+            name,
+            &task_def_root,
+            &task_state_root,
+            config,
+            &mut findings,
+        );
     }
 
     findings
+}
+
+/// (10) Reports state directories that have no matching task definition.
+fn check_orphan_state_dirs(
+    task_state_root: &Path,
+    known_task_names: &[String],
+    findings: &mut Vec<Finding>,
+) {
+    if !task_state_root.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs_err::read_dir(task_state_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if path.is_dir() && !known_task_names.iter().any(|n| n == name) {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                category: Category::Tasks,
+                entity: format!("task {name}"),
+                message: format!(
+                    "state directory exists at {} but no task definition",
+                    path.display()
+                ),
+                hint: Some(format!("`rm -rf {}`", path.display())),
+            });
+        }
+    }
+}
+
+/// Runs the per-task definition/state consistency checks (11-16) for one task.
+fn check_one_task(
+    name: &str,
+    task_def_root: &Path,
+    task_state_root: &Path,
+    config: &crate::Config,
+    findings: &mut Vec<Finding>,
+) {
+    let task_dir = task_def_root.join(name);
+    let program_path = task_dir.join("program.cfe");
+    let resolved_path = task_dir.join("resolved-program.toml");
+
+    let program_present = program_path.is_file();
+    if !program_present {
+        findings.push(Finding {
+            severity: Severity::Error,
+            category: Category::Tasks,
+            entity: format!("task {name}"),
+            message: "program.cfe is missing".to_owned(),
+            hint: Some(format!("`cargo-for-each task remove --name {name}`")),
+        });
+    }
+    let resolved_present = resolved_path.is_file();
+    if !resolved_present {
+        findings.push(Finding {
+            severity: Severity::Error,
+            category: Category::Tasks,
+            entity: format!("task {name}"),
+            message: "resolved-program.toml is missing".to_owned(),
+            hint: Some(format!("`cargo-for-each task remove --name {name}`")),
+        });
+    }
+
+    let parsed_program = program_present
+        .then(|| load_task_program(name, &program_path, findings))
+        .flatten();
+    let resolved = resolved_present
+        .then(|| load_task_resolved(name, &resolved_path, findings))
+        .flatten();
+
+    if let Some(resolved) = &resolved {
+        check_resolved_targets_registered(name, resolved, config, findings);
+    }
+
+    // (15) and (16) need the state dir.
+    let state_dir = task_state_root.join(name);
+    if !state_dir.is_dir() {
+        return;
+    }
+    if let Some(resolved) = &resolved {
+        check_state_cursors(name, &state_dir, resolved, findings);
+    }
+    if let Some(program) = &parsed_program {
+        check_orphan_snapshot_dirs(name, &state_dir, program, findings);
+    }
+}
+
+/// (13) Reads and parses a task's `program.cfe`, pushing a finding on failure.
+fn load_task_program(
+    name: &str,
+    program_path: &Path,
+    findings: &mut Vec<Finding>,
+) -> Option<crate::program::Program> {
+    let source = match fs_err::read_to_string(program_path) {
+        Ok(s) => s,
+        Err(err) => {
+            findings.push(Finding {
+                severity: Severity::Error,
+                category: Category::Tasks,
+                entity: format!("task {name}"),
+                message: format!("could not read program.cfe: {err}"),
+                hint: None,
+            });
+            return None;
+        }
+    };
+    match crate::program::parser::parse(&source, "program.cfe") {
+        Ok(prog) => Some(prog),
+        Err(errors) => {
+            let msg = errors
+                .iter()
+                .take(3)
+                .map(|e| e.as_str().to_owned())
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                severity: Severity::Error,
+                category: Category::Tasks,
+                entity: format!("task {name}"),
+                message: format!("program.cfe no longer parses: {msg}"),
+                hint: Some(format!("edit {}", program_path.display())),
+            });
+            None
+        }
+    }
+}
+
+/// (14) Reads and parses a task's `resolved-program.toml`, pushing a finding on
+/// failure.
+fn load_task_resolved(
+    name: &str,
+    resolved_path: &Path,
+    findings: &mut Vec<Finding>,
+) -> Option<ResolvedProgram> {
+    let src = match fs_err::read_to_string(resolved_path) {
+        Ok(s) => s,
+        Err(err) => {
+            findings.push(Finding {
+                severity: Severity::Error,
+                category: Category::Tasks,
+                entity: format!("task {name}"),
+                message: format!("could not read resolved-program.toml: {err}"),
+                hint: None,
+            });
+            return None;
+        }
+    };
+    match toml::from_str::<ResolvedProgram>(&src) {
+        Ok(r) => Some(r),
+        Err(err) => {
+            findings.push(Finding {
+                severity: Severity::Error,
+                category: Category::Tasks,
+                entity: format!("task {name}"),
+                message: format!("resolved-program.toml could not be parsed: {err}"),
+                hint: Some(format!(
+                    "`cargo-for-each task remove --name {name}` and recreate"
+                )),
+            });
+            None
+        }
+    }
 }
 
 /// List the sub-directory names under `<config_dir>/cargo-for-each/tasks/`.
@@ -1479,5 +1546,234 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    // ── collect_snapshot_names ────────────────────────────────────────────────
+
+    #[test]
+    fn collect_snapshot_names_walks_every_nesting() {
+        let src = r#"
+            select workspaces;
+            for workspace {
+                snapshot_metadata "ws_top";
+                if standalone { snapshot_metadata "ws_if"; } else { snapshot_metadata "ws_else"; }
+                with_env_file ".env" { snapshot_metadata "ws_env"; }
+                for crate in workspace {
+                    snapshot_metadata "fc_crate";
+                    if type == lib { snapshot_metadata "fc_if"; }
+                }
+            }
+            select crates;
+            for crate {
+                snapshot_metadata "c_top";
+                if type == lib { snapshot_metadata "c_if"; } else { snapshot_metadata "c_else"; }
+                with_env_file ".env" { snapshot_metadata "c_env"; }
+            }
+        "#;
+        let program = crate::program::parser::parse(src, "<test>").unwrap_or_else(|errs| {
+            panic!(
+                "parse error:\n{}",
+                errs.iter()
+                    .map(|e| e.as_str().to_owned())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+        let names = collect_snapshot_names(&program);
+        let expected: HashSet<String> = [
+            "ws_top", "ws_if", "ws_else", "ws_env", "fc_crate", "fc_if", "c_top", "c_if", "c_else",
+            "c_env",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn collect_snapshot_names_empty_when_no_snapshots() {
+        let program =
+            crate::program::parser::parse(r#"for crate { run "cargo" "build"; }"#, "<test>")
+                .unwrap_or_else(|_| panic!("parse failed"));
+        assert!(collect_snapshot_names(&program).is_empty());
+    }
+
+    // ── cursor_out_of_range ───────────────────────────────────────────────────
+
+    #[test]
+    fn cursor_out_of_range_detects_every_overflow() {
+        use crate::program::resolve::{ResolvedCrateExecution, ResolvedWorkspaceExecution};
+
+        let resolved = ResolvedProgram {
+            workspace_executions: vec![ResolvedWorkspaceExecution {
+                manifest_dir: PathBuf::from("/ws"),
+                dependencies: vec![],
+                member_crates: vec![ResolvedCrateExecution {
+                    manifest_dir: PathBuf::from("/ws/m0"),
+                    dependencies: vec![],
+                }],
+            }],
+            crate_executions: vec![ResolvedCrateExecution {
+                manifest_dir: PathBuf::from("/c0"),
+                dependencies: vec![],
+            }],
+        };
+        let cur = |segs: &[CursorSegment]| {
+            let mut c = ProgramCursor::new();
+            for s in segs {
+                c = c.with(*s);
+            }
+            c
+        };
+
+        // In-range workspace / member / crate cursors are fine.
+        assert_eq!(
+            cursor_out_of_range(&cur(&[CursorSegment::WorkspaceIteration(0)]), &resolved),
+            None,
+        );
+        assert_eq!(
+            cursor_out_of_range(
+                &cur(&[
+                    CursorSegment::WorkspaceIteration(0),
+                    CursorSegment::CrateIteration(0),
+                ]),
+                &resolved,
+            ),
+            None,
+        );
+        assert_eq!(
+            cursor_out_of_range(&cur(&[CursorSegment::CrateIteration(0)]), &resolved),
+            None,
+        );
+
+        // Workspace index past the end.
+        assert!(
+            cursor_out_of_range(&cur(&[CursorSegment::WorkspaceIteration(1)]), &resolved).is_some()
+        );
+        // Member index past the workspace's member list.
+        assert!(
+            cursor_out_of_range(
+                &cur(&[
+                    CursorSegment::WorkspaceIteration(0),
+                    CursorSegment::CrateIteration(5),
+                ]),
+                &resolved,
+            )
+            .is_some()
+        );
+        // Standalone crate index past the end.
+        assert!(
+            cursor_out_of_range(&cur(&[CursorSegment::CrateIteration(3)]), &resolved).is_some()
+        );
+        // An empty cursor, or one whose first segment is neither iteration kind,
+        // is not "out of range".
+        assert_eq!(cursor_out_of_range(&cur(&[]), &resolved), None);
+        assert_eq!(
+            cursor_out_of_range(&cur(&[CursorSegment::Statement(0)]), &resolved),
+            None,
+        );
+    }
+
+    // ── check_standalone_drift / check_member_set_drift (pure) ────────────────
+
+    fn ws(manifest_dir: &str, is_standalone: bool) -> Workspace {
+        Workspace {
+            manifest_dir: PathBuf::from(manifest_dir),
+            is_standalone,
+        }
+    }
+
+    fn registered_crate(manifest_dir: &str, workspace_manifest_dir: &str) -> Crate {
+        Crate {
+            manifest_dir: PathBuf::from(manifest_dir),
+            workspace_manifest_dir: PathBuf::from(workspace_manifest_dir),
+            crate_types: std::collections::BTreeSet::new(),
+            target_kinds: std::collections::BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn standalone_drift_flags_only_on_mismatch() {
+        let manifest = PathBuf::from("/ws/Cargo.toml");
+
+        // Stored standalone matches the live single-member set -> no finding.
+        let mut f = Vec::new();
+        check_standalone_drift(
+            &ws("/ws", true),
+            std::slice::from_ref(&manifest),
+            &manifest,
+            &mut f,
+        );
+        assert!(f.is_empty());
+
+        // Stored false but the workspace is actually standalone -> finding.
+        let mut f = Vec::new();
+        check_standalone_drift(
+            &ws("/ws", false),
+            std::slice::from_ref(&manifest),
+            &manifest,
+            &mut f,
+        );
+        assert_eq!(f.len(), 1);
+        assert_eq!(f.first().map(|x| x.severity), Some(Severity::Error));
+
+        // Stored standalone but there are two members -> finding.
+        let mut f = Vec::new();
+        check_standalone_drift(
+            &ws("/ws", true),
+            &[
+                PathBuf::from("/ws/a/Cargo.toml"),
+                PathBuf::from("/ws/b/Cargo.toml"),
+            ],
+            &manifest,
+            &mut f,
+        );
+        assert_eq!(f.len(), 1);
+
+        // A single member that isn't the workspace manifest is not standalone;
+        // stored false agrees -> no finding.
+        let mut f = Vec::new();
+        check_standalone_drift(
+            &ws("/ws", false),
+            std::slice::from_ref(&PathBuf::from("/ws/only/Cargo.toml")),
+            &manifest,
+            &mut f,
+        );
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn member_set_drift_flags_missing_and_unregistered() {
+        let config = Config {
+            workspaces: vec![ws("/ws", false)],
+            crates: vec![registered_crate("/ws/m0", "/ws")],
+        };
+
+        // Registered member present on disk -> no finding.
+        let mut f = Vec::new();
+        let present: HashSet<PathBuf> = [PathBuf::from("/ws/m0")].into_iter().collect();
+        check_member_set_drift(&ws("/ws", false), &config, &present, &mut f);
+        assert!(f.is_empty());
+
+        // Registered member missing from disk -> "no longer a member".
+        let mut f = Vec::new();
+        check_member_set_drift(&ws("/ws", false), &config, &HashSet::new(), &mut f);
+        assert_eq!(f.len(), 1);
+        assert!(
+            f.first()
+                .is_some_and(|x| x.message.contains("no longer a member"))
+        );
+
+        // A live member that isn't registered -> "is not registered".
+        let mut f = Vec::new();
+        let extra: HashSet<PathBuf> = [PathBuf::from("/ws/m0"), PathBuf::from("/ws/m1")]
+            .into_iter()
+            .collect();
+        check_member_set_drift(&ws("/ws", false), &config, &extra, &mut f);
+        assert_eq!(f.len(), 1);
+        assert!(
+            f.first()
+                .is_some_and(|x| x.message.contains("is not registered"))
+        );
     }
 }
