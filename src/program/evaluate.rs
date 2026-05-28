@@ -839,4 +839,161 @@ mod tests {
         );
         assert_eq!(result.unwrap_or_else(|e| panic!("{e}")), false);
     }
+
+    // ── runtime detail ───────────────────────────────────────────────────────
+
+    #[test]
+    fn common_runtime_detail_git_config_not_set() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        // No git repo -> the actual value is reported as "(not set)".
+        let detail = common_condition_runtime_detail(
+            &CommonCondition::GitConfigEquals {
+                key: "user.name".to_owned(),
+                value: "whatever".to_owned(),
+            },
+            temp.path(),
+        );
+        assert_eq!(
+            detail.as_deref(),
+            Some("actual git_config.user.name = (not set)")
+        );
+    }
+
+    #[test]
+    fn common_runtime_detail_git_config_set() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = temp.path();
+        let repo = git2::Repository::init(dir).unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut cfg = repo.config().unwrap_or_else(|e| panic!("{e}"));
+            cfg.set_str("user.name", "Alice")
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let detail = common_condition_runtime_detail(
+            &CommonCondition::GitConfigEquals {
+                key: "user.name".to_owned(),
+                value: "whatever".to_owned(),
+            },
+            dir,
+        );
+        assert_eq!(
+            detail.as_deref(),
+            Some(r#"actual git_config.user.name = "Alice""#)
+        );
+    }
+
+    #[test]
+    fn common_runtime_detail_none_for_plain_conditions() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            common_condition_runtime_detail(&CommonCondition::WorkingDirectoryClean, temp.path()),
+            None,
+        );
+        assert_eq!(
+            common_condition_runtime_detail(
+                &CommonCondition::FileExists("x".to_owned()),
+                temp.path()
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn common_runtime_detail_recurses_through_not_and_or() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = temp.path();
+        let git = |key: &str| CommonCondition::GitConfigEquals {
+            key: key.to_owned(),
+            value: "x".to_owned(),
+        };
+
+        // Not recurses into its inner condition.
+        assert_eq!(
+            common_condition_runtime_detail(&CommonCondition::Not(Box::new(git("a.b"))), dir)
+                .as_deref(),
+            Some("actual git_config.a.b = (not set)"),
+        );
+
+        // And/Or filter out detail-less operands and join the rest.
+        let mixed = CommonCondition::And(AtLeastTwo::from_pair(
+            git("a.b"),
+            CommonCondition::WorkingDirectoryClean,
+        ));
+        assert_eq!(
+            common_condition_runtime_detail(&mixed, dir).as_deref(),
+            Some("actual git_config.a.b = (not set)"),
+        );
+
+        let both = CommonCondition::Or(AtLeastTwo::from_pair(git("a.b"), git("c.d")));
+        assert_eq!(
+            common_condition_runtime_detail(&both, dir).as_deref(),
+            Some("actual git_config.a.b = (not set) || actual git_config.c.d = (not set)"),
+        );
+
+        // No interesting operand -> None.
+        let plain = CommonCondition::And(AtLeastTwo::from_pair(
+            CommonCondition::WorkingDirectoryClean,
+            CommonCondition::FileExists("x".to_owned()),
+        ));
+        assert_eq!(common_condition_runtime_detail(&plain, dir), None);
+    }
+
+    #[test]
+    fn workspace_runtime_detail_delegates_to_common() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = temp.path();
+        let git = WorkspaceCondition::Common(CommonCondition::GitConfigEquals {
+            key: "user.email".to_owned(),
+            value: "x".to_owned(),
+        });
+        assert_eq!(
+            workspace_condition_runtime_detail(&git, dir).as_deref(),
+            Some("actual git_config.user.email = (not set)"),
+        );
+        assert_eq!(
+            workspace_condition_runtime_detail(&WorkspaceCondition::Standalone, dir),
+            None,
+        );
+        assert_eq!(
+            workspace_condition_runtime_detail(
+                &WorkspaceCondition::Not(Box::new(git.clone())),
+                dir,
+            )
+            .as_deref(),
+            Some("actual git_config.user.email = (not set)"),
+        );
+        let or = WorkspaceCondition::Or(AtLeastTwo::from_pair(git, WorkspaceCondition::HasMembers));
+        assert_eq!(
+            workspace_condition_runtime_detail(&or, dir).as_deref(),
+            Some("actual git_config.user.email = (not set)"),
+        );
+    }
+
+    #[test]
+    fn crate_runtime_detail_delegates_to_common() {
+        let temp = tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = temp.path();
+        let git = CrateCondition::Common(CommonCondition::GitConfigEquals {
+            key: "core.editor".to_owned(),
+            value: "x".to_owned(),
+        });
+        assert_eq!(
+            crate_condition_runtime_detail(&git, dir).as_deref(),
+            Some("actual git_config.core.editor = (not set)"),
+        );
+        assert_eq!(
+            crate_condition_runtime_detail(&CrateCondition::Standalone, dir),
+            None,
+        );
+        assert_eq!(
+            crate_condition_runtime_detail(&CrateCondition::Not(Box::new(git.clone())), dir)
+                .as_deref(),
+            Some("actual git_config.core.editor = (not set)"),
+        );
+        let and = CrateCondition::And(AtLeastTwo::from_pair(git, CrateCondition::Standalone));
+        assert_eq!(
+            crate_condition_runtime_detail(&and, dir).as_deref(),
+            Some("actual git_config.core.editor = (not set)"),
+        );
+    }
 }

@@ -320,7 +320,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use super::{Branch, EmptyBranchesError, NonEmptyBranches};
+    use super::{AtLeastTwo, Branch, CommonCondition, EmptyBranchesError, NonEmptyBranches};
 
     /// Trivial dummy condition / statement types so we can instantiate the
     /// generic [`NonEmptyBranches`] without pulling in the workspace/crate
@@ -401,5 +401,71 @@ mod tests {
         // Deref to slice for iteration.
         let collected: Vec<_> = v.iter().copied().collect();
         assert_eq!(collected, vec![1, 2, 3, 4]);
+    }
+
+    // ── CommonCondition Display ───────────────────────────────────────────────
+
+    #[test]
+    fn common_condition_display_leaf_variants() {
+        assert_eq!(
+            CommonCondition::AskUser("Proceed?".to_owned()).to_string(),
+            r#"ask_user("Proceed?")"#,
+        );
+        assert_eq!(
+            CommonCondition::RunCommand {
+                command: "test".to_owned(),
+                args: vec!["-f".to_owned(), "Cargo.toml".to_owned()],
+            }
+            .to_string(),
+            r#"run "test" "-f" "Cargo.toml""#,
+        );
+        assert_eq!(
+            CommonCondition::RunCommand {
+                command: "true".to_owned(),
+                args: vec![],
+            }
+            .to_string(),
+            r#"run "true""#,
+        );
+        assert_eq!(
+            CommonCondition::FileExists("README.md".to_owned()).to_string(),
+            r#"file_exists("README.md")"#,
+        );
+        assert_eq!(
+            CommonCondition::WorkingDirectoryClean.to_string(),
+            "working_directory_clean",
+        );
+        assert_eq!(
+            CommonCondition::GitConfigEquals {
+                key: "user.name".to_owned(),
+                value: "Alice".to_owned(),
+            }
+            .to_string(),
+            r#"git_config.user.name == "Alice""#,
+        );
+    }
+
+    #[test]
+    fn common_condition_display_nested_not_and_or() {
+        let inner = CommonCondition::Not(Box::new(CommonCondition::WorkingDirectoryClean));
+        assert_eq!(inner.to_string(), "!working_directory_clean");
+
+        let and = CommonCondition::And(AtLeastTwo::from_pair(
+            CommonCondition::FileExists("a".to_owned()),
+            CommonCondition::FileExists("b".to_owned()),
+        ));
+        assert_eq!(and.to_string(), r#"(file_exists("a") && file_exists("b"))"#);
+
+        // Three-operand Or, with a nested And and a negation to exercise recursion.
+        let mut operands =
+            AtLeastTwo::from_pair(CommonCondition::WorkingDirectoryClean, and.clone());
+        operands.push(CommonCondition::Not(Box::new(CommonCondition::FileExists(
+            "c".to_owned(),
+        ))));
+        let or = CommonCondition::Or(operands);
+        assert_eq!(
+            or.to_string(),
+            r#"(working_directory_clean || (file_exists("a") && file_exists("b")) || !file_exists("c"))"#,
+        );
     }
 }

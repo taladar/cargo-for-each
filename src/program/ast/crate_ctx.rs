@@ -195,3 +195,79 @@ pub type CrateBranch = Branch<CrateCondition, CrateStatement>;
 
 /// Type alias for a crate if-block used in the crate context.
 pub type CrateIfBlock = IfBlock<CrateCondition, CrateStatement>;
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::{AtLeastTwo, CommonCondition, CrateCondition, CrateTypeFilter, TargetKindFilter};
+
+    #[test]
+    fn crate_type_filter_display() {
+        let cases = [
+            (CrateTypeFilter::Bin, "bin"),
+            (CrateTypeFilter::Lib, "lib"),
+            (CrateTypeFilter::ProcMacro, "proc_macro"),
+            (CrateTypeFilter::CDyLib, "cdylib"),
+            (CrateTypeFilter::DyLib, "dylib"),
+            (CrateTypeFilter::RLib, "rlib"),
+            (CrateTypeFilter::StaticLib, "staticlib"),
+        ];
+        for (filter, expected) in cases {
+            assert_eq!(filter.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn target_kind_filter_display() {
+        let cases = [
+            (TargetKindFilter::Bench, "bench"),
+            (TargetKindFilter::Test, "test"),
+            (TargetKindFilter::Example, "example"),
+            (TargetKindFilter::CustomBuild, "custom_build"),
+        ];
+        for (filter, expected) in cases {
+            assert_eq!(filter.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn crate_condition_display_leaf_variants() {
+        assert_eq!(
+            CrateCondition::Common(CommonCondition::WorkingDirectoryClean).to_string(),
+            "working_directory_clean",
+        );
+        assert_eq!(
+            CrateCondition::CrateType(CrateTypeFilter::Bin).to_string(),
+            "type == bin",
+        );
+        assert_eq!(
+            CrateCondition::TargetKind(TargetKindFilter::Test).to_string(),
+            "target_kind == test",
+        );
+        assert_eq!(CrateCondition::Standalone.to_string(), "standalone");
+    }
+
+    #[test]
+    fn crate_condition_display_nested_not_and_or() {
+        assert_eq!(
+            CrateCondition::Not(Box::new(CrateCondition::Standalone)).to_string(),
+            "!standalone",
+        );
+
+        let and = CrateCondition::And(AtLeastTwo::from_pair(
+            CrateCondition::Standalone,
+            CrateCondition::CrateType(CrateTypeFilter::Lib),
+        ));
+        assert_eq!(and.to_string(), "(standalone && type == lib)");
+
+        let mut operands =
+            AtLeastTwo::from_pair(CrateCondition::TargetKind(TargetKindFilter::Bench), and);
+        operands.push(CrateCondition::Not(Box::new(CrateCondition::Standalone)));
+        let or = CrateCondition::Or(operands);
+        assert_eq!(
+            or.to_string(),
+            "(target_kind == bench || (standalone && type == lib) || !standalone)",
+        );
+    }
+}

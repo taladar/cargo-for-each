@@ -128,3 +128,48 @@ pub type WorkspaceBranch = Branch<WorkspaceCondition, WorkspaceStatement>;
 
 /// Type alias for a workspace if-block used in the workspace context.
 pub type WorkspaceIfBlock = IfBlock<WorkspaceCondition, WorkspaceStatement>;
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::{AtLeastTwo, CommonCondition, WorkspaceCondition};
+
+    #[test]
+    fn workspace_condition_display_leaf_variants() {
+        assert_eq!(
+            WorkspaceCondition::Common(CommonCondition::FileExists("Cargo.toml".to_owned()))
+                .to_string(),
+            r#"file_exists("Cargo.toml")"#,
+        );
+        assert_eq!(WorkspaceCondition::Standalone.to_string(), "standalone");
+        assert_eq!(WorkspaceCondition::HasMembers.to_string(), "has_members");
+    }
+
+    #[test]
+    fn workspace_condition_display_nested_not_and_or() {
+        assert_eq!(
+            WorkspaceCondition::Not(Box::new(WorkspaceCondition::HasMembers)).to_string(),
+            "!has_members",
+        );
+
+        let and = WorkspaceCondition::And(AtLeastTwo::from_pair(
+            WorkspaceCondition::Standalone,
+            WorkspaceCondition::HasMembers,
+        ));
+        assert_eq!(and.to_string(), "(standalone && has_members)");
+
+        let mut operands = AtLeastTwo::from_pair(
+            WorkspaceCondition::Common(CommonCondition::WorkingDirectoryClean),
+            and,
+        );
+        operands.push(WorkspaceCondition::Not(Box::new(
+            WorkspaceCondition::Standalone,
+        )));
+        let or = WorkspaceCondition::Or(operands);
+        assert_eq!(
+            or.to_string(),
+            "(working_directory_clean || (standalone && has_members) || !standalone)",
+        );
+    }
+}

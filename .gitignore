@@ -3,6 +3,7 @@
 .env
 tarpaulin-report.html
 tarpaulin-report.json
+lcov.info
 /target
 bom.json
 bom.xml
