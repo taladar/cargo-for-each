@@ -361,6 +361,27 @@ pub struct RemoveParameters {
     pub manifest_path: PathBuf,
 }
 
+/// Resolves a user-supplied `Cargo.toml` path to its canonical path and the
+/// canonical containing directory (config entries are keyed by the directory).
+///
+/// # Errors
+///
+/// Returns an error if the path cannot be made absolute or canonicalized, or
+/// if the canonical manifest path has no parent directory.
+fn resolve_manifest_dir(manifest_path: PathBuf) -> Result<(PathBuf, PathBuf), crate::error::Error> {
+    let absolute = std::path::absolute(&manifest_path).map_err(|err| {
+        crate::error::Error::CouldNotDetermineAbsoluteManifestPath(manifest_path, err)
+    })?;
+    let canonical = fs_err::canonicalize(&absolute).map_err(|err| {
+        crate::error::Error::CouldNotDetermineCanonicalManifestPath(absolute, err)
+    })?;
+    let manifest_dir = canonical
+        .parent()
+        .ok_or_else(|| crate::error::Error::ManifestPathHasNoParentDir(canonical.clone()))?
+        .to_path_buf();
+    Ok((canonical, manifest_dir))
+}
+
 /// implementation of the remove subcommand
 ///
 /// # Errors
@@ -373,23 +394,9 @@ pub async fn remove_command(
 ) -> Result<(), crate::error::Error> {
     let _lock = crate::ConfigLock::acquire(&environment)?;
     let mut config = crate::Config::load(&environment)?;
-    let manifest_path =
-        std::path::absolute(remove_parameters.manifest_path.clone()).map_err(|err| {
-            crate::error::Error::CouldNotDetermineAbsoluteManifestPath(
-                remove_parameters.manifest_path,
-                err,
-            )
-        })?;
-    let manifest_path = fs_err::canonicalize(manifest_path.clone()).map_err(|err| {
-        crate::error::Error::CouldNotDetermineCanonicalManifestPath(manifest_path, err)
-    })?;
-
     // The user supplies a path to Cargo.toml; config entries store the
     // containing directory, so derive the directory before comparing.
-    let manifest_dir = manifest_path
-        .parent()
-        .ok_or_else(|| crate::error::Error::ManifestPathHasNoParentDir(manifest_path.clone()))?
-        .to_path_buf();
+    let (manifest_path, manifest_dir) = resolve_manifest_dir(remove_parameters.manifest_path)?;
 
     // Filter out the workspace if it matches the manifest_dir
     let initial_workspace_count = config.workspaces.len();

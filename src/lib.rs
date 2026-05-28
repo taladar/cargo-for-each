@@ -1217,6 +1217,51 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_remove_drops_workspace_and_its_crates() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+
+        // A workspace dir with a member crate dir, both with a Cargo.toml on
+        // disk so `remove_command` can canonicalize the supplied path. No
+        // `cargo` invocation is needed: we register the config by hand.
+        let ws_dir = temp_dir.path().join("ws");
+        let member_dir = ws_dir.join("member");
+        fs_err::create_dir_all(&member_dir)?;
+        fs_err::write(ws_dir.join("Cargo.toml"), "[workspace]\n")?;
+        let ws_dir = fs_err::canonicalize(&ws_dir)?;
+        let member_dir = fs_err::canonicalize(&member_dir)?;
+
+        Config {
+            workspaces: vec![Workspace {
+                manifest_dir: ws_dir.clone(),
+                is_standalone: false,
+            }],
+            crates: vec![Crate {
+                manifest_dir: member_dir,
+                workspace_manifest_dir: ws_dir.clone(),
+                crate_types: std::collections::BTreeSet::new(),
+                target_kinds: std::collections::BTreeSet::new(),
+            }],
+        }
+        .save(&environment)?;
+
+        crate::targets::remove_command(
+            RemoveParameters {
+                manifest_path: ws_dir.join("Cargo.toml"),
+            },
+            environment.clone(),
+        )
+        .await?;
+
+        // Both the workspace and the crate that claimed it are gone.
+        let config = Config::load(&environment)?;
+        assert!(config.workspaces.is_empty());
+        assert!(config.crates.is_empty());
+        Ok(())
+    }
+
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_add_rejects_non_cargo_toml_manifest_path()
