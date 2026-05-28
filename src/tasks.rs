@@ -2107,6 +2107,50 @@ async fn run_crate_stmts_to_completion(
     Ok(StepOutcome::Done)
 }
 
+/// Runs every member crate of a `for crate in workspace` block to completion,
+/// in intra-workspace dependency order.
+///
+/// Returns [`StepOutcome::Suspended`] as soon as a member stops at a barrier —
+/// later members (and the workspace statements after the block) must not run,
+/// since they may depend on work the suspended member does after release.
+///
+/// # Errors
+///
+/// Propagates any error from running a member crate.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors run_crate_stmts_to_completion's parameter set"
+)]
+async fn run_for_crate_in_workspace(
+    block: &ForCrateInWorkspaceBlock,
+    cursor: &ProgramCursor,
+    member_crates: &[ResolvedCrateExecution],
+    state_base: &Path,
+    environment: &Environment,
+    config: &Config,
+    extra_env: &[(String, String)],
+    task_name: &str,
+) -> Result<StepOutcome, Error> {
+    for (c_idx, crate_exec) in member_crates.iter().enumerate() {
+        let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
+        let inner = run_crate_stmts_to_completion(
+            &block.statements,
+            &c_prefix,
+            &crate_exec.manifest_dir,
+            state_base,
+            environment,
+            config,
+            extra_env,
+            task_name,
+        )
+        .await?;
+        if matches!(inner, StepOutcome::Suspended) {
+            return Ok(StepOutcome::Suspended);
+        }
+    }
+    Ok(StepOutcome::Done)
+}
+
 /// Runs all workspace statements to completion, including nested `for crate in workspace`.
 ///
 /// Already-completed statements are skipped.
@@ -2204,27 +2248,21 @@ async fn run_workspace_stmts_to_completion(
                 }
             }
             WorkspaceStatement::ForCrateInWorkspace(block) => {
-                // Member crates are already in intra-workspace dependency order.
-                // If any member suspends at a barrier, halt before moving on
-                // to later members or later workspace statements — those may
-                // depend on the work the suspended member would do after the
-                // barrier is released.
-                for (c_idx, crate_exec) in member_crates.iter().enumerate() {
-                    let c_prefix = cursor.clone().with(CursorSegment::CrateIteration(c_idx));
-                    let inner = run_crate_stmts_to_completion(
-                        &block.statements,
-                        &c_prefix,
-                        &crate_exec.manifest_dir,
+                if matches!(
+                    run_for_crate_in_workspace(
+                        block,
+                        &cursor,
+                        member_crates,
                         state_base,
                         environment,
                         config,
                         extra_env,
                         task_name,
                     )
-                    .await?;
-                    if matches!(inner, StepOutcome::Suspended) {
-                        return Ok(StepOutcome::Suspended);
-                    }
+                    .await?,
+                    StepOutcome::Suspended
+                ) {
+                    return Ok(StepOutcome::Suspended);
                 }
             }
             WorkspaceStatement::WaitForContinue(node) => {
@@ -2505,6 +2543,117 @@ pub async fn task_create_command(
     Ok(())
 }
 
+/// Executes the action of a single resolved [`NextStatement`].
+///
+/// # Errors
+///
+/// Propagates errors from the underlying step executor or if-block evaluator.
+#[expect(clippy::print_stdout, reason = "barrier message is part of the UI")]
+async fn execute_next_action(
+    next: NextStatement<'_>,
+    state_base: &Path,
+    environment: &Environment,
+    config: &Config,
+    extra_env: &[(String, String)],
+    task_name: &str,
+) -> Result<(), Error> {
+    match next.action {
+        StatementAction::RunCommand(step) => {
+            execute_run_step(
+                step,
+                &next.cursor,
+                next.manifest_dir,
+                state_base,
+                environment,
+                extra_env,
+            )
+            .await
+        }
+        StatementAction::ManualStep(step) => {
+            execute_manual_step(
+                step,
+                &next.cursor,
+                next.manifest_dir,
+                state_base,
+                environment,
+                extra_env,
+            )
+            .await
+        }
+        StatementAction::EvaluateWorkspaceIf(block) => evaluate_workspace_if_block(
+            block,
+            &next.cursor,
+            next.manifest_dir,
+            state_base,
+            environment,
+            config,
+            extra_env,
+        ),
+        StatementAction::EvaluateCrateIf(block) => evaluate_crate_if_block(
+            block,
+            &next.cursor,
+            next.manifest_dir,
+            state_base,
+            environment,
+            config,
+            extra_env,
+        ),
+        StatementAction::SnapshotMetadata(step) => {
+            execute_snapshot_metadata_step(step, &next.cursor, next.manifest_dir, state_base).await
+        }
+        StatementAction::WaitForContinue(node) => {
+            let state_dir = state_base.join(next.cursor.to_path());
+            crate::utils::create_user_dir_all(&state_dir)
+                .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
+            // NOTE on a theoretical race: if a concurrent `task continue` writes
+            // the `barrier_released` marker between `find_next_statement`
+            // returning and this `println!` firing, the message tells the user
+            // to release a barrier that has already been released. The next
+            // `task run` resumes past the barrier correctly — only the message
+            // is misleading. The window is one mkdir plus a println, and the
+            // triggering scenarios are contrived for single-user usage.
+            // Deliberately unfixed; do not flag.
+            println!(
+                "Wait barrier reached at {}: \"{}\". Release with `cargo-for-each task continue --name {} --cursor {}`.",
+                next.cursor.to_path_string(),
+                node.description,
+                task_name,
+                next.cursor.to_path_string()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Prints the set of `wait_for_continue` barriers currently blocking progress.
+#[expect(clippy::print_stdout, reason = "This is part of the UI, not logging")]
+fn report_suspension(
+    program: &Program,
+    resolved: &ResolvedProgram,
+    state_base: &Path,
+    task_name: &str,
+) {
+    let barriers = find_waiting_barriers(program, resolved, state_base);
+    if barriers.is_empty() {
+        // No barrier surfaced on disk, but find_next reported the tree as
+        // blocked — fall back to a generic message.
+        println!(
+            "No statement is currently executable; execution is suspended at one or more `wait_for_continue` barriers."
+        );
+    } else {
+        println!(
+            "Execution is suspended at {} `wait_for_continue` barrier(s):",
+            barriers.len()
+        );
+        for (cursor, description) in &barriers {
+            let cursor_str = cursor.to_path_string();
+            println!(
+                "  {cursor_str}: \"{description}\" — release with `cargo-for-each task continue --name {task_name} --cursor {cursor_str}`"
+            );
+        }
+    }
+}
+
 /// Finds and executes the next uncompleted statement in a task.
 ///
 /// # Errors
@@ -2528,108 +2677,18 @@ pub async fn run_single_step_command(
                 next.manifest_dir.display()
             );
             let extra_env = load_env_vars_from_files(&next.env_file_paths, next.manifest_dir)?;
-            match next.action {
-                StatementAction::RunCommand(step) => {
-                    execute_run_step(
-                        step,
-                        &next.cursor,
-                        next.manifest_dir,
-                        &state_base,
-                        &environment,
-                        &extra_env,
-                    )
-                    .await?;
-                }
-                StatementAction::ManualStep(step) => {
-                    execute_manual_step(
-                        step,
-                        &next.cursor,
-                        next.manifest_dir,
-                        &state_base,
-                        &environment,
-                        &extra_env,
-                    )
-                    .await?;
-                }
-                StatementAction::EvaluateWorkspaceIf(block) => {
-                    evaluate_workspace_if_block(
-                        block,
-                        &next.cursor,
-                        next.manifest_dir,
-                        &state_base,
-                        &environment,
-                        &config,
-                        &extra_env,
-                    )?;
-                }
-                StatementAction::EvaluateCrateIf(block) => {
-                    evaluate_crate_if_block(
-                        block,
-                        &next.cursor,
-                        next.manifest_dir,
-                        &state_base,
-                        &environment,
-                        &config,
-                        &extra_env,
-                    )?;
-                }
-                StatementAction::SnapshotMetadata(step) => {
-                    execute_snapshot_metadata_step(
-                        step,
-                        &next.cursor,
-                        next.manifest_dir,
-                        &state_base,
-                    )
-                    .await?;
-                }
-                StatementAction::WaitForContinue(node) => {
-                    let state_dir = state_base.join(next.cursor.to_path());
-                    crate::utils::create_user_dir_all(&state_dir)
-                        .map_err(|e| Error::CouldNotCreateStateDir(state_dir.clone(), e))?;
-                    // NOTE on a theoretical race: if a concurrent
-                    // `task continue` writes the `barrier_released` marker
-                    // between `find_next_statement` returning above and
-                    // this `println!` firing, the message below tells the
-                    // user to release a barrier that has already been
-                    // released. The next `task run` will resume past the
-                    // barrier correctly — only the message is misleading.
-                    // The window is one mkdir syscall plus a println
-                    // (sub-millisecond on local storage), and the
-                    // scenarios that trigger it (two parallel scripts, a
-                    // pre-release wrapper that races the runner) are
-                    // contrived for single-user usage. Deliberately
-                    // unfixed; do not flag.
-                    println!(
-                        "Wait barrier reached at {}: \"{}\". Release with `cargo-for-each task continue --name {} --cursor {}`.",
-                        next.cursor.to_path_string(),
-                        node.description,
-                        params.name,
-                        next.cursor.to_path_string()
-                    );
-                }
-            }
+            execute_next_action(
+                next,
+                &state_base,
+                &environment,
+                &config,
+                &extra_env,
+                &params.name,
+            )
+            .await?;
         }
         NextOutcome::Suspended => {
-            let barriers = find_waiting_barriers(&program, &resolved, &state_base);
-            if barriers.is_empty() {
-                // No barrier surfaced on disk, but find_next reported the
-                // tree as blocked — fall back to a generic message.
-                println!(
-                    "No statement is currently executable; execution is suspended at one or more `wait_for_continue` barriers."
-                );
-            } else {
-                println!(
-                    "Execution is suspended at {} `wait_for_continue` barrier(s):",
-                    barriers.len()
-                );
-                for (cursor, description) in &barriers {
-                    let cursor_str = cursor.to_path_string();
-                    println!(
-                        "  {cursor_str}: \"{description}\" — release with `cargo-for-each task continue --name {} --cursor {cursor_str}`",
-                        params.name
-                    );
-                }
-            }
+            report_suspension(&program, &resolved, &state_base, &params.name);
         }
         NextOutcome::Done => {
             println!("All statements for all targets completed successfully.");
@@ -4091,16 +4150,20 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        CursorTarget, DescribeLine, NextOutcome, StatementAction, StepOutcome,
-        build_crate_stmts_describe, build_workspace_stmts_describe, crate_stmt_label,
-        cursor_targets_wait_for_continue, dir_path, evaluate_crate_if_block,
-        evaluate_workspace_if_block, expand_interpolations, find_last_completed_crate_stmt,
-        find_last_completed_workspace_stmt, find_next_in_crate_stmts, find_next_in_workspace_stmts,
-        find_next_statement, find_waiting_barriers, is_crate_stmt_completed, is_run_completed,
-        is_workspace_stmt_completed, manifest_hex_key, parse_env_file_content,
-        program_has_interactive_steps, resolve_interpolation, run_crate_if_block,
-        run_crate_stmts_to_completion, run_workspace_if_block, run_workspace_stmts_to_completion,
-        task_list_command, validate_task_name, workspace_stmt_label,
+        ContinueBarrierParameters, CursorTarget, DescribeLine, DescribeTaskParameters, NextOutcome,
+        RewindSingleStepParameters, RewindSingleTargetParameters, RunSingleStepParameters,
+        RunSingleTargetParameters, StatementAction, StepOutcome, build_crate_stmts_describe,
+        build_workspace_stmts_describe, crate_stmt_label, cursor_targets_wait_for_continue,
+        dir_path, evaluate_crate_if_block, evaluate_workspace_if_block, expand_interpolations,
+        find_last_completed_crate_stmt, find_last_completed_workspace_stmt,
+        find_next_in_crate_stmts, find_next_in_workspace_stmts, find_next_statement,
+        find_waiting_barriers, is_crate_stmt_completed, is_run_completed,
+        is_workspace_stmt_completed, manifest_hex_key, named_dir_path, parse_env_file_content,
+        program_has_interactive_steps, release_wait_barrier_command, resolve_interpolation,
+        rewind_single_step_command, rewind_single_target_command, run_crate_if_block,
+        run_crate_stmts_to_completion, run_single_step_command, run_single_target_command,
+        run_workspace_if_block, run_workspace_stmts_to_completion, state_dir_for_task,
+        task_describe_command, task_list_command, validate_task_name, workspace_stmt_label,
     };
     use crate::error::Error;
     use crate::program::ast::common::{
@@ -6532,6 +6595,405 @@ not_a_pair
                 line("    ", &c1_run, super::ICON_PENDING, r#"run "c""#),
             ],
         );
+        Ok(())
+    }
+
+    // ── command handlers (via task fixtures) ──────────────────────────────────
+
+    /// Writes a task definition (`program.cfe` + `resolved-program.toml`) so the
+    /// `load_task_data`-based command handlers can run against it.
+    fn write_task_fixture(
+        env: &Environment,
+        name: &str,
+        cfe_src: &str,
+        resolved: &ResolvedProgram,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let task_dir = named_dir_path(name, env)?;
+        crate::utils::create_user_dir_all(&task_dir)?;
+        crate::utils::write_user_file(task_dir.join("program.cfe"), cfe_src)?;
+        crate::utils::write_user_file(
+            task_dir.join("resolved-program.toml"),
+            toml::to_string(resolved)?,
+        )?;
+        Ok(())
+    }
+
+    /// A `ResolvedProgram` with a single standalone crate at `manifest_dir`.
+    fn resolved_one_crate_at(manifest_dir: &Path) -> ResolvedProgram {
+        ResolvedProgram {
+            workspace_executions: vec![],
+            crate_executions: vec![ResolvedCrateExecution {
+                manifest_dir: manifest_dir.to_path_buf(),
+                dependencies: vec![],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn run_single_step_creates_waiting_barrier() -> TestResult {
+        let temp = tempdir()?;
+        let env = crate::Environment::mock(&temp)?;
+        write_task_fixture(
+            &env,
+            "t",
+            r#"for crate { wait_for_continue "hold"; }"#,
+            &resolved_one_crate_at(&PathBuf::from("/tmp")),
+        )?;
+        run_single_step_command(
+            RunSingleStepParameters {
+                name: "t".to_owned(),
+            },
+            env.clone(),
+        )
+        .await?;
+
+        // The barrier's state dir now exists (pending -> waiting transition).
+        let state_base = state_dir_for_task("t", &env)?;
+        let barrier = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        assert!(state_base.join(barrier.to_path()).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_single_step_evaluates_crate_if() -> TestResult {
+        let temp = tempdir()?;
+        let env = crate::Environment::mock(&temp)?;
+        write_task_fixture(
+            &env,
+            "t",
+            r#"for crate { if type == lib { run "true"; } }"#,
+            &resolved_one_crate_at(&PathBuf::from("/tmp")),
+        )?;
+        run_single_step_command(
+            RunSingleStepParameters {
+                name: "t".to_owned(),
+            },
+            env.clone(),
+        )
+        .await?;
+
+        // With an empty config the crate is not a lib, so no branch matches.
+        let state_base = state_dir_for_task("t", &env)?;
+        let if_cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        let chosen =
+            fs_err::read_to_string(state_base.join(if_cursor.to_path()).join("chosen_branch"))?;
+        assert_eq!(chosen.trim(), "none");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_single_step_runs_command_to_completion() -> TestResult {
+        let temp = tempdir()?;
+        let env = crate::Environment::mock(&temp)?;
+        write_task_fixture(
+            &env,
+            "t",
+            r#"for crate { run "true"; }"#,
+            &resolved_one_crate_at(temp.path()),
+        )?;
+        run_single_step_command(
+            RunSingleStepParameters {
+                name: "t".to_owned(),
+            },
+            env.clone(),
+        )
+        .await?;
+
+        // `true` exits 0, so the run statement is recorded as completed.
+        let state_base = state_dir_for_task("t", &env)?;
+        let run_cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        assert!(is_run_completed(&state_base.join(run_cursor.to_path()))?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_single_step_reports_done_and_suspended() -> TestResult {
+        let temp = tempdir()?;
+        let env = crate::Environment::mock(&temp)?;
+        // Program: a run followed by a barrier.
+        write_task_fixture(
+            &env,
+            "t",
+            r#"for crate { run "true"; wait_for_continue "hold"; }"#,
+            &resolved_one_crate_at(temp.path()),
+        )?;
+        let state_base = state_dir_for_task("t", &env)?;
+
+        // Mark the run completed and put the barrier into the waiting state, so
+        // find_next reports Suspended (exercises report_suspension).
+        let run_cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        let run_dir = state_base.join(run_cursor.to_path());
+        crate::utils::create_user_dir_all(&run_dir)?;
+        crate::utils::write_user_file(run_dir.join("exit_status"), "0")?;
+        let barrier_cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(1));
+        crate::utils::create_user_dir_all(state_base.join(barrier_cursor.to_path()))?;
+
+        // Suspended path: returns Ok after printing the barrier list.
+        run_single_step_command(
+            RunSingleStepParameters {
+                name: "t".to_owned(),
+            },
+            env.clone(),
+        )
+        .await?;
+
+        // Done path: release the barrier, then everything is complete.
+        crate::utils::write_user_file(
+            state_base
+                .join(barrier_cursor.to_path())
+                .join("barrier_released"),
+            "",
+        )?;
+        run_single_step_command(
+            RunSingleStepParameters {
+                name: "t".to_owned(),
+            },
+            env,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_single_target_runs_crate_through_all_arms() -> TestResult {
+        let temp = tempdir()?;
+        let env = crate::Environment::mock(&temp)?;
+        fs_err::write(temp.path().join("vars.env"), "K=V\n")?;
+        // Exercises run_crate_stmts_to_completion's Run, WithEnvFile, If and
+        // WaitForContinue arms in one pass; the trailing barrier suspends.
+        write_task_fixture(
+            &env,
+            "t",
+            r#"for crate { run "true"; with_env_file "vars.env" { run "true"; } if type == lib { run "true"; } wait_for_continue "x"; }"#,
+            &resolved_one_crate_at(temp.path()),
+        )?;
+        run_single_target_command(
+            RunSingleTargetParameters {
+                name: "t".to_owned(),
+            },
+            env.clone(),
+        )
+        .await?;
+
+        let state_base = state_dir_for_task("t", &env)?;
+        let c0 = ProgramCursor::new().with(CursorSegment::CrateIteration(0));
+        // First run completed.
+        assert!(is_run_completed(
+            &state_base.join(c0.clone().with(CursorSegment::Statement(0)).to_path())
+        )?);
+        // Nested with_env_file run completed.
+        let env_run = c0
+            .clone()
+            .with(CursorSegment::Statement(1))
+            .with(CursorSegment::WithEnvFile)
+            .with(CursorSegment::Statement(0));
+        assert!(is_run_completed(&state_base.join(env_run.to_path()))?);
+        // Execution suspended at the trailing barrier.
+        let barrier = c0.with(CursorSegment::Statement(3));
+        assert!(state_base.join(barrier.to_path()).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_single_target_runs_workspace_through_all_arms() -> TestResult {
+        let temp = tempdir()?;
+        let env = crate::Environment::mock(&temp)?;
+        fs_err::write(temp.path().join("vars.env"), "K=V\n")?;
+        let resolved = ResolvedProgram {
+            workspace_executions: vec![ResolvedWorkspaceExecution {
+                manifest_dir: temp.path().to_path_buf(),
+                dependencies: vec![],
+                member_crates: vec![ResolvedCrateExecution {
+                    manifest_dir: temp.path().to_path_buf(),
+                    dependencies: vec![],
+                }],
+            }],
+            crate_executions: vec![],
+        };
+        // Exercises Run, WithEnvFile, If, ForCrateInWorkspace and WaitForContinue.
+        write_task_fixture(
+            &env,
+            "t",
+            r#"for workspace { run "true"; with_env_file "vars.env" { run "true"; } if standalone { run "true"; } for crate in workspace { run "true"; } wait_for_continue "x"; }"#,
+            &resolved,
+        )?;
+        run_single_target_command(
+            RunSingleTargetParameters {
+                name: "t".to_owned(),
+            },
+            env.clone(),
+        )
+        .await?;
+
+        let state_base = state_dir_for_task("t", &env)?;
+        let w0 = ProgramCursor::new().with(CursorSegment::WorkspaceIteration(0));
+        assert!(is_run_completed(
+            &state_base.join(w0.clone().with(CursorSegment::Statement(0)).to_path())
+        )?);
+        // The for-crate member's run completed.
+        let member_run = w0
+            .clone()
+            .with(CursorSegment::Statement(3))
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        assert!(is_run_completed(&state_base.join(member_run.to_path()))?);
+        // Suspended at the trailing barrier.
+        let barrier = w0.with(CursorSegment::Statement(4));
+        assert!(state_base.join(barrier.to_path()).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn release_wait_barrier_writes_marker_and_validates_cursor() -> TestResult {
+        let temp = tempdir()?;
+        let env = crate::Environment::mock(&temp)?;
+        write_task_fixture(
+            &env,
+            "t",
+            r#"for crate { run "true"; wait_for_continue "hold"; }"#,
+            &resolved_one_crate_at(temp.path()),
+        )?;
+        let barrier = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(1));
+
+        release_wait_barrier_command(
+            ContinueBarrierParameters {
+                name: "t".to_owned(),
+                cursor: barrier.to_path_string(),
+            },
+            env.clone(),
+        )
+        .await?;
+        let state_base = state_dir_for_task("t", &env)?;
+        assert!(
+            state_base
+                .join(barrier.to_path())
+                .join("barrier_released")
+                .exists()
+        );
+
+        // Pointing at a non-barrier statement is rejected.
+        let run = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        match release_wait_barrier_command(
+            ContinueBarrierParameters {
+                name: "t".to_owned(),
+                cursor: run.to_path_string(),
+            },
+            env,
+        )
+        .await
+        {
+            Err(Error::CursorNotAtBarrier(_)) => {}
+            other => return Err(format!("expected CursorNotAtBarrier, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_describe_runs_for_a_fixture_task() -> TestResult {
+        let temp = tempdir()?;
+        let env = crate::Environment::mock(&temp)?;
+        write_task_fixture(
+            &env,
+            "t",
+            r#"for crate { run "true"; wait_for_continue "hold"; }"#,
+            &resolved_one_crate_at(temp.path()),
+        )?;
+        // Smoke test: describe walks the program + state and prints without error.
+        task_describe_command(
+            DescribeTaskParameters {
+                name: "t".to_owned(),
+            },
+            env,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rewind_single_step_removes_last_completed_state() -> TestResult {
+        let temp = tempdir()?;
+        let env = crate::Environment::mock(&temp)?;
+        write_task_fixture(
+            &env,
+            "t",
+            r#"for crate { run "true"; }"#,
+            &resolved_one_crate_at(temp.path()),
+        )?;
+        let state_base = state_dir_for_task("t", &env)?;
+        let run_cursor = ProgramCursor::new()
+            .with(CursorSegment::CrateIteration(0))
+            .with(CursorSegment::Statement(0));
+        let run_dir = state_base.join(run_cursor.to_path());
+        crate::utils::create_user_dir_all(&run_dir)?;
+        crate::utils::write_user_file(run_dir.join("exit_status"), "0")?;
+
+        rewind_single_step_command(
+            RewindSingleStepParameters {
+                name: "t".to_owned(),
+            },
+            env.clone(),
+        )
+        .await?;
+        assert!(!run_dir.exists());
+
+        // Nothing left to rewind -> still Ok.
+        rewind_single_step_command(
+            RewindSingleStepParameters {
+                name: "t".to_owned(),
+            },
+            env,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rewind_single_target_removes_last_completed_target() -> TestResult {
+        let temp = tempdir()?;
+        let env = crate::Environment::mock(&temp)?;
+        write_task_fixture(
+            &env,
+            "t",
+            r#"for crate { run "true"; }"#,
+            &resolved_one_crate_at(temp.path()),
+        )?;
+        let state_base = state_dir_for_task("t", &env)?;
+        let c0 = ProgramCursor::new().with(CursorSegment::CrateIteration(0));
+        let run_dir = state_base.join(c0.clone().with(CursorSegment::Statement(0)).to_path());
+        crate::utils::create_user_dir_all(&run_dir)?;
+        crate::utils::write_user_file(run_dir.join("exit_status"), "0")?;
+
+        rewind_single_target_command(
+            RewindSingleTargetParameters {
+                name: "t".to_owned(),
+            },
+            env.clone(),
+        )
+        .await?;
+        // The whole crate-iteration state dir is removed.
+        assert!(!state_base.join(c0.to_path()).exists());
+
+        rewind_single_target_command(
+            RewindSingleTargetParameters {
+                name: "t".to_owned(),
+            },
+            env,
+        )
+        .await?;
         Ok(())
     }
 }
