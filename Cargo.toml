@@ -13,10 +13,10 @@ repository = "https://github.com/taladar/cargo-for-each"
 keywords = ["crates", "workspaces"]
 categories = ["command-line-utilities", "development-tools::cargo-plugins"]
 exclude = [
-  ".env",
-  "push-deploy-branches.sh",
-  "tarpaulin-report.html",
-  "tarpaulin-report.json",
+    ".env",
+    "push-deploy-branches.sh",
+    "tarpaulin-report.html",
+    "tarpaulin-report.json",
 ]
 
 [package.metadata.deb]
@@ -38,21 +38,21 @@ cargo-for-each = { path = "/usr/bin/cargo-for-each" }
 
 [package.metadata.generate-rpm]
 assets = [
-  { source = "target/release/cargo-for-each", dest = "/usr/bin/cargo-for-each", mode = "755" },
+    { source = "target/release/cargo-for-each", dest = "/usr/bin/cargo-for-each", mode = "755" },
 ]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 ariadne = "0.6"
 cargo_metadata = "0.23.1"
-chumsky = "0.12"
-clap = { version = "4.6.0", features = ["cargo", "derive"] }
-clap_complete = "4.6.0"
+chumsky = "0.13"
+clap = { version = "4.6.1", features = ["cargo", "derive"] }
+clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
 dirs = "6.0.0"
 fs-err = "3.3.0"
 futures = "0.3.32"
-git2 = "0.20.4"
+git2 = "0.21.0"
 humantime = "2.3.0"
 log-panics = { version = "2.1.0", features = ["with-backtrace"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -61,13 +61,13 @@ shell-words = "1.1"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["macros", "parsing"] }
-tokio = { version = "1.51.0", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.2"
 tracing = "0.1.44"
-tracing-appender = "0.2.4"
+tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = [
-  "env-filter",
-  "tracing-log"
+    "env-filter",
+    "tracing-log",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
