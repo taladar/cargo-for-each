@@ -1,3 +1,151 @@
+cargo-for-each (0.1.1-1) unstable; urgency=medium
+
+  * Features - config - Allow adding Manifests to config and listing crates and workspaces
+  * Features - config - Do not add crates/workspaces if they already exist in the config
+  * Features - refresh - Add a refresh subcommand that updates crate types and new workspace members
+  * Features - tracing - Add log messages on debug level about add/refresh activity
+  * Features - exec - Add the exec subcommand, the main purpose of this cargo plugin
+  * Features - exec - Add crate type filter to list and exec crates subcommands
+  * Features - config - Store standalone status and workspace manifest in config
+  * Features - standalone - Filter by standalone status
+  * Features - target_sets - Add the ability to abstract target sets
+  * Features - plan - Add plan subcommand to create plans of multiple commands to run
+  * Features - task - Add commands to create/delete tasks from plan and target set
+  * Features - dependencies - Add dependencies inside the task resolved target set
+  * Features - target - Add a target subcommand and move the existing commands there
+  * Features - run - Implement task run
+  * Features - run - Consider dependencies in task run
+  * Features - environment - Get all environment data at the start in preparation for testing
+  * Features - tests - Basic test logic and first example test
+  * Features - tests - Capture test output
+  * Features - tasks - Add list, describe and rewind sub-commands for task
+  * Features - targetsets - Add describe command for target-set
+  * Features - step-position - Introduce StepPosition type for nested step addressing
+  * Features - condition - Introduce Condition type for plan control flow
+  * Features - plans - Introduce IfElseIf step type with conditional branching
+  * Features - plans - Add CLI sub-commands for IfElseIf step management
+  * Features - condition - Add FileExists condition variant
+  * Features - condition - Add WorkingDirectoryClean condition variant
+  * Features - program - Add snapshot_metadata statement and \${} string interpolation
+  * Features - condition - Git config string comparison permission, e.g. to check if the repository has a specific commit message format set in its git config
+  * Features - program - Add with_env_file block to load env vars from a file for nested statements
+  * Features - program - Print each run step command with full arguments before execution
+  * Features - describe - Annotate program listing with cursor, completion status, and branch info
+  * Features - wait_for_continue - Add wait barrier statement and task continue command
+  * Features - task_create - Add --workspace and --crate flags for explicit target selection
+  * Features - crate_types - Add cdylib, dylib, rlib, staticlib, bench, test, example, custom_build crate type filters
+  * Features - execution - Print statement type and condition details during execution
+  * Features - resolve - Soft dev-dep ordering via SCC-aware cycle breaking
+  * Features - check - Add read-only audit subcommand
+  * Features - parser - Accept \\ as backslash escape in string literals
+  * Bug fixes - workspaces - Add test and fix full workflow for workspaces
+  * Bug fixes - target_sets - Do not use dependencies when looking for package definitions
+  * Bug fixes - tasks - Simplistic escape mechanism for command arguments
+  * Bug fixes - targetset - Fix handling of workspace target set
+  * Bug fixes - utils - Use environment.paths for command lookup instead of process PATH
+  * Bug fixes - plans - Return PlanNotFound when plan does not exist in plan-step commands
+  * Bug fixes - target-sets - Store canonical manifest paths to fix dependency resolution
+  * Bug fixes - tasks - Fix infinite loop and wrong error type in run-all-targets
+  * Bug fixes - tasks - Write exit_status file on command launch failure
+  * Bug fixes - tasks - Use wrapper script to capture real exit code from asciinema
+  * Bug fixes - program - Properly capture the output of the git status --porcelain call to evaluate clean working directory
+  * Bug fixes - asciinema - When a step failed or was rewound asciinema failed with an error because the output file already existed
+  * Bug fixes - resolve - Exclude dev-dependencies from intra-workspace crate execution order
+  * Bug fixes - formatting - Fix formatting
+  * Bug fixes - wait_barrier - Include cargo-for-each and task name in suggested continue command
+  * Bug fixes - github - Pin action SHAs and scope contents:write to release jobs
+  * Bug fixes - run - Use POSIX shell quoting for command and args in wrapper script
+  * Bug fixes - file_exists - Restrict path to within enclosing workspace
+  * Bug fixes - perms - Write user state/config files with mode 0o600 and dirs 0o700
+  * Bug fixes - windows - Restore build and tighten executable detection
+  * Bug fixes - clippy - Correct assert_matches path in disallowed-macros
+  * Bug fixes - targets - Canonicalize paths and harden remove/refresh
+  * Bug fixes - snapshots - Canonicalize manifest key, drop cross-workspace fallback
+  * Bug fixes - task-remove - Clean up state dir, return TaskNotFound
+  * Bug fixes - task-continue - Validate cursor targets a wait_for_continue
+  * Bug fixes - run-step - Propagate exit_status read/parse errors
+  * Bug fixes - if-block - Propagate chosen_branch read/parse errors
+  * Bug fixes - run-all - Refuse parallel jobs with interactive steps
+  * Bug fixes - resolve - Propagate canonicalize errors when computing inter-workspace deps
+  * Bug fixes - condition - Surface signal-killed run-condition as an error
+  * Bug fixes - wait_barrier - Use to_path_string for human-readable cursor mention
+  * Bug fixes - wait_barrier - Add `cargo-for-each` prefix to remaining suggestion site
+  * Bug fixes - cursor - Require digits after w/c/s/if prefix in FromStr
+  * Bug fixes - evaluate - Use operator-aware separator in runtime detail
+  * Bug fixes - tasks - Propagate barrier suspension through scope runners
+  * Bug fixes - bin - Support invocation as `cargo for-each` subcommand
+  * Bug fixes - config - Atomic writes + flock around load/modify/save
+  * Bug fixes - targets - Propagate Config::load errors from list_command
+  * Bug fixes - tasks - Validate --name to prevent path traversal
+  * Bug fixes - tasks - Propagate non-NotFound chosen_branch read errors
+  * Bug fixes - parser - Reject duplicate top-level for-workspace / for-crate blocks
+  * Bug fixes - targets - Refresh now handles workspace transitions and orphans
+  * Bug fixes - targets - Remove now errors when nothing matched
+  * Bug fixes - cursor - Reject malformed cursor path strings
+  * Bug fixes - tasks - Distinguish "cursor off the program" from "not a barrier"
+  * Bug fixes - targets - Reject add when manifest path isn't named Cargo.toml
+  * Other - test - Refactor a lot of the non-sensical naming as part of first full test
+  * Refactor Replace TOML plans/target-sets with .cfe program language
+  * Refactor - targets - Split CrateType into CrateType and TargetKind
+  * Refactor - targets - Remove unreachable! from add_command
+  * Refactor - ast - Enforce "if branches non-empty" at the type level
+  * Refactor - tasks - Tighten run-outcome encoding and propagate parse errors
+  * Refactor - ast - Enforce >= 2 operands on And/Or at the type level
+  * Refactor - tasks - Decompose describe/find-next/run engines and add coverage
+  * Refactor - evaluate - Decompose condition evaluators into leaf helpers
+  * Refactor - tasks - Extract shared scheduler phase from run_all_targets_command
+  * Refactor - check - Decompose task/metadata checks and add unit tests
+  * Refactor - targets - Extract manifest-dir resolution from remove_command
+  * Documentation - cfe - Add language reference for .cfe program files
+  * Documentation - readme - Document all CLI commands, concepts, and typical workflow
+  * Documentation - with_env_file - Clarify that absolute paths are accepted
+  * Documentation - wait_barrier - Make empty-body no-op explicit
+  * Documentation - env - Correct XDG env-var names in Environment fields
+  * Documentation - workspace - Correct HasMembers doc — single member counts
+  * Documentation - error - Clarify CommandFailed exit-code semantics
+  * Documentation - error - Explain why IoError omits #[from]
+  * Documentation - ast - Correct CrateStatement::SnapshotMetadata scoping
+  * Documentation - resolve - Correct snapshot ordering claim
+  * Documentation - resolve - Document Standalone fallback for unknown workspaces
+  * Documentation - tasks - Reword is_run_failed to cover empty-status case
+  * Documentation - tasks - Document tri-state wait-barrier model
+  * Documentation - tasks - Document actual subpath layouts for task dirs
+  * Documentation - crate - Drop obsolete cardinality claim on Crate.types
+  * Documentation - parser - Clarify padding's progress invariant
+  * Documentation - cursor - Document per-block reset of s{N} indices
+  * Documentation - parser - Note string_literal consumes surrounding padding
+  * Documentation - targets - Mark list_command output as unstable
+  * Documentation - tasks - Document empty-branch ifs as intentional rewind steps
+  * Documentation Document type vs target_kind split (follow-up to 39d2c07)
+  * Documentation - readme - Correct registered-targets config filename
+  * Documentation - readme - Correct task rewind single-step / single-target semantics
+  * Documentation - readme - Document all three target remove match cases
+  * Documentation - cfe-language - Note file_exists symlink behavior
+  * Documentation - cfe-language - Describe runtime readiness, not iteration order
+  * Documentation - parser - List actual condition productions in doc comments
+  * Documentation - utils - Describe is_executable's actual contract
+  * Documentation - error - Reword FoundNoPackageInCargoMetadataWithCurrentManifestPath
+  * Documentation - readme - Document the three log sinks and what they capture
+  * Documentation - tasks - Explain why the wait-barrier race is unfixed
+  * Documentation - tasks - Document the intentional out-of-scope dep skip
+  * Testing - tasks - Cover command handlers via task fixtures; tidy dispatch
+  * Miscellaneous tasks - init - Initial commit with cargo-generate output
+  * Miscellaneous tasks - code - Code reorg to split it into multiple files
+  * Miscellaneous tasks - dependencies - Update dependencies
+  * Miscellaneous tasks - dependencies - Update dependencies
+  * Miscellaneous tasks - dependencies - Update dependencies
+  * Miscellaneous tasks Apply tombi format and fix clippy::map_unwrap_or
+  * Miscellaneous tasks - targets - Delete unused `Target` struct
+  * Miscellaneous tasks - ast - Delete dead `From<*SelectCondition>` impls
+  * Miscellaneous tasks - ast - Re-export `WaitForContinueNode` and `WithEnvFileBlock`
+  * Miscellaneous tasks - config - Make `config_dir_path`/`config_file` infallible
+  * Miscellaneous tasks - crap - Add cargo-crap config with documented allow-list
+  * Miscellaneous tasks - template - Sync release tooling and rustdoc lints from bin template
+  * Miscellaneous tasks - dependencies - Update dependencies
+  * Miscellaneous tasks - dependencies - Update dependencies
+
+ -- Matthias Hörmann <mhoermann@gmail.com>  Tue, 25 Aug 2026 12:55:42 +0200
+
 cargo-for-each (0.1.0-1) unstable; urgency=medium
 
   * initial release
