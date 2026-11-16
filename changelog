@@ -1,3 +1,11 @@
+cargo-for-each (0.1.2-1) unstable; urgency=medium
+
+  * Miscellaneous tasks Publish GitHub releases only after all assets are uploaded
+  * Miscellaneous tasks - dependencies - Update dependencies
+  * Miscellaneous tasks - dependencies - Update dependencies
+
+ -- Matthias Hörmann <mhoermann@gmail.com>  Mon, 16 Nov 2026 16:19:37 +0100
+
 cargo-for-each (0.1.1-1) unstable; urgency=medium
 
   * Features - config - Allow adding Manifests to config and listing crates and workspaces
