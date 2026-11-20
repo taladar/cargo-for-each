@@ -361,8 +361,54 @@ pub struct RemoveParameters {
     pub manifest_path: PathBuf,
 }
 
+/// Canonicalizes a path that may (partially) no longer exist on disk.
+///
+/// If the full path exists it is canonicalized normally. Otherwise the
+/// deepest existing ancestor is canonicalized and the missing tail is
+/// appended lexically (`.` dropped, `..` popping a component). This lets
+/// `target remove` match config entries whose directories were already
+/// deleted, since those entries were stored in canonical form while they
+/// still existed.
+///
+/// # Errors
+///
+/// Returns the original I/O error if it was anything other than `NotFound`,
+/// or if no ancestor of the path can be canonicalized.
+fn canonicalize_possibly_missing(absolute: &Path) -> Result<PathBuf, std::io::Error> {
+    let not_found_err = match fs_err::canonicalize(absolute) {
+        Ok(canonical) => return Ok(canonical),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => err,
+        Err(err) => return Err(err),
+    };
+    for ancestor in absolute.ancestors().skip(1) {
+        let canonical_ancestor = match fs_err::canonicalize(ancestor) {
+            Ok(canonical) => canonical,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        let Ok(tail) = absolute.strip_prefix(ancestor) else {
+            continue;
+        };
+        let mut result = canonical_ancestor;
+        for component in tail.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    result.pop();
+                }
+                other => result.push(other),
+            }
+        }
+        return Ok(result);
+    }
+    Err(not_found_err)
+}
+
 /// Resolves a user-supplied `Cargo.toml` path to its canonical path and the
 /// canonical containing directory (config entries are keyed by the directory).
+///
+/// The path does not need to exist anymore (see
+/// [`canonicalize_possibly_missing`]), so stale entries can be removed.
 ///
 /// # Errors
 ///
@@ -372,7 +418,7 @@ fn resolve_manifest_dir(manifest_path: PathBuf) -> Result<(PathBuf, PathBuf), cr
     let absolute = std::path::absolute(&manifest_path).map_err(|err| {
         crate::error::Error::CouldNotDetermineAbsoluteManifestPath(manifest_path, err)
     })?;
-    let canonical = fs_err::canonicalize(&absolute).map_err(|err| {
+    let canonical = canonicalize_possibly_missing(&absolute).map_err(|err| {
         crate::error::Error::CouldNotDetermineCanonicalManifestPath(absolute, err)
     })?;
     let manifest_dir = canonical

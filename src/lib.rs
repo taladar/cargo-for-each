@@ -1262,6 +1262,72 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_remove_works_when_directory_already_deleted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let environment = Environment::mock(&temp_dir)?;
+
+        // Register a workspace + member while the directories exist (so the
+        // stored paths are canonical), then delete the whole tree.
+        let ws_dir = temp_dir.path().join("ws");
+        let member_dir = ws_dir.join("member");
+        fs_err::create_dir_all(&member_dir)?;
+        let ws_dir = fs_err::canonicalize(&ws_dir)?;
+        let member_dir = fs_err::canonicalize(&member_dir)?;
+        let keep_dir = fs_err::canonicalize(temp_dir.path())?.join("keep");
+
+        Config {
+            workspaces: vec![
+                Workspace {
+                    manifest_dir: ws_dir.clone(),
+                    is_standalone: false,
+                },
+                Workspace {
+                    manifest_dir: keep_dir.clone(),
+                    is_standalone: true,
+                },
+            ],
+            crates: vec![Crate {
+                manifest_dir: member_dir.clone(),
+                workspace_manifest_dir: ws_dir.clone(),
+                crate_types: std::collections::BTreeSet::new(),
+                target_kinds: std::collections::BTreeSet::new(),
+            }],
+        }
+        .save(&environment)?;
+        fs_err::remove_dir_all(&ws_dir)?;
+
+        // Removing the (deleted) member by its manifest path works, also via
+        // a non-normalized path through the deleted directory.
+        crate::targets::remove_command(
+            RemoveParameters {
+                manifest_path: ws_dir.join("member/../member/./Cargo.toml"),
+            },
+            environment.clone(),
+        )
+        .await?;
+        let config = Config::load(&environment)?;
+        assert!(config.crates.is_empty());
+        assert_eq!(config.workspaces.len(), 2);
+
+        // Removing the (deleted) workspace works too and leaves others alone.
+        crate::targets::remove_command(
+            RemoveParameters {
+                manifest_path: ws_dir.join("Cargo.toml"),
+            },
+            environment.clone(),
+        )
+        .await?;
+        let config = Config::load(&environment)?;
+        assert_eq!(config.workspaces.len(), 1);
+        assert_eq!(
+            config.workspaces.first().map(|w| &w.manifest_dir),
+            Some(&keep_dir)
+        );
+        Ok(())
+    }
+
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_add_rejects_non_cargo_toml_manifest_path()
