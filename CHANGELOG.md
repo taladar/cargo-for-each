@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 - 2026-11-20 23:37:13Z
+
+### 🐛 Bug Fixes
+
+- *(targets)* Allow removing targets whose directory no longer exists
+
 ## 0.1.2 - 2026-11-16 15:19:37Z
 
 ### ⚙️ Miscellaneous Tasks
